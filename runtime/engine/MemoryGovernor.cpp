@@ -327,28 +327,39 @@ void MemoryGovernor::release(uint64_t bytes) noexcept {
 MemoryReclaimDirective MemoryPressurePolicy::update(
     const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
     bool requestWaiting) noexcept {
-  if (snapshot.pressure == MemoryPressure::Normal) {
-    nextReclaimMilliseconds_ = 0.0;
-    return {};
-  }
   if (snapshot.pressure == MemoryPressure::Critical) {
     return {true, true, std::numeric_limits<uint64_t>::max()};
+  }
+
+  // Comprobar si el presupuesto de Metal del motor está ajustado (< 1 GiB de margen)
+  // o si hay una solicitud esperando memoria. Si es así, se debe desalojar memoria
+  // ociosa y prefijos antiguos para asegurar que la solicitud activa disponga de espacio.
+  constexpr uint64_t kEngineTargetMargin = 1ULL << 30; // 1 GiB
+  const bool engineLowHeadroom = snapshot.headroomBytes < kEngineTargetMargin;
+
+  if (snapshot.pressure == MemoryPressure::Normal && !requestWaiting && !engineLowHeadroom) {
+    nextReclaimMilliseconds_ = 0.0;
+    return {};
   }
   if (nowMilliseconds < nextReclaimMilliseconds_)
     return {true, false, 0};
   // The host samples every 500 ms. Allow counters to settle between batches,
   // but keep responding if another application continues consuming memory.
-  nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
+  nextReclaimMilliseconds_ = nowMilliseconds + 500.0;
 
   // Missing telemetry pauses allocation, but is not evidence that live
   // cache must be discarded. Empty backing can still be returned.
   if (!snapshot.hostMeasurementValid &&
-      snapshot.systemPressure == MemoryPressure::Normal)
+      snapshot.systemPressure == MemoryPressure::Normal &&
+      !engineLowHeadroom && !requestWaiting)
     return {true, false, 0};
 
-  uint64_t desired = snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes
-      ? kHostRecoveryMarginBytes - snapshot.hostHeadroomBytes
-      : 0;
+  uint64_t desired = 0;
+  if (engineLowHeadroom) {
+    desired = kEngineTargetMargin - snapshot.headroomBytes;
+  } else if (snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes) {
+    desired = kHostRecoveryMarginBytes - snapshot.hostHeadroomBytes;
+  }
   // Recovering the last stretch to the watermark is worth far less than the
   // resume point it would otherwise discard, so a pass with nothing waiting
   // keeps that publication and takes the rest. A waiting request outranks it.
