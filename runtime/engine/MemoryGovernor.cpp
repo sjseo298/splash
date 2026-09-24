@@ -70,14 +70,11 @@ std::optional<uint64_t> queryHostAvailableMemory() noexcept {
 }
 
 bool ignoreHostPressure() noexcept {
-  static const bool ignore = [] {
-    const char *val = std::getenv("SPLASH_IGNORE_HOST_PRESSURE");
-    return val && (std::strcmp(val, "1") == 0 ||
-                   std::strcmp(val, "true") == 0 ||
-                   std::strcmp(val, "yes") == 0 ||
-                   std::strcmp(val, "on") == 0);
-  }();
-  return ignore;
+  const char *val = std::getenv("SPLASH_IGNORE_HOST_PRESSURE");
+  return val && (std::strcmp(val, "1") == 0 ||
+                 std::strcmp(val, "true") == 0 ||
+                 std::strcmp(val, "yes") == 0 ||
+                 std::strcmp(val, "on") == 0);
 }
 
 std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {
