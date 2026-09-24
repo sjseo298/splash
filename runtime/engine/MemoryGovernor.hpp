@@ -26,6 +26,7 @@ struct HostMemoryPages {
     const HostMemoryPages &pages, uint64_t pageSize,
     uint64_t physicalMemoryBytes) noexcept;
 [[nodiscard]] std::optional<uint64_t> queryHostAvailableMemory() noexcept;
+[[nodiscard]] bool ignoreHostPressure() noexcept;
 
 enum class MemoryPressure : uint8_t {
   Normal,

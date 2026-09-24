@@ -1882,6 +1882,12 @@ def parse_args(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host", action="append", default=[])
     parser.add_argument("--api-key", default=os.environ.get("SPLASH_API_KEY"))
+    parser.add_argument(
+        "--ignore-host-memory-pressure",
+        action="store_true",
+        default=os.environ.get("SPLASH_IGNORE_HOST_PRESSURE") in ("1", "true", "yes", "on"),
+        help="guarantee model context ignoring dynamic macOS host memory pressure",
+    )
     parser.add_argument("--no-webui", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
@@ -1915,6 +1921,8 @@ def parse_args(argv=None):
 
 
 def _native_command(args):
+    if getattr(args, "ignore_host_memory_pressure", False):
+        os.environ["SPLASH_IGNORE_HOST_PRESSURE"] = "1"
     command = [
         args.binary,
         "serve-native",

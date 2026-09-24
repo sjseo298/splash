@@ -314,8 +314,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
        hostAvailableMemory, hostReserveBytes] {
         if (cancelled && cancelled())
           throw metal::MetalBackendError("Metal operation cancelled");
-        requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
-            pressure ? pressure() : MemoryPressure::Normal);
+        if (!engine::ignoreHostPressure()) {
+          requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
+              pressure ? pressure() : MemoryPressure::Normal);
+        }
       });
   try {
     const uint64_t modelBytes = packedModelFileBytes(config.modelRoot);
@@ -333,8 +335,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     }
     // Fail before opening the package when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
-    requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
-        config.memoryPressure ? config.memoryPressure() : MemoryPressure::Normal);
+    if (!engine::ignoreHostPressure()) {
+      requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
+          config.memoryPressure ? config.memoryPressure() : MemoryPressure::Normal);
+    }
   } catch (const RuntimeResourcesError &) {
     throw;
   } catch (const metal::MetalAllocationError &error) {

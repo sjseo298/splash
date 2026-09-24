@@ -69,6 +69,17 @@ std::optional<uint64_t> queryHostAvailableMemory() noexcept {
       pageSize, physicalMemoryBytes);
 }
 
+bool ignoreHostPressure() noexcept {
+  static const bool ignore = [] {
+    const char *val = std::getenv("SPLASH_IGNORE_HOST_PRESSURE");
+    return val && (std::strcmp(val, "1") == 0 ||
+                   std::strcmp(val, "true") == 0 ||
+                   std::strcmp(val, "yes") == 0 ||
+                   std::strcmp(val, "on") == 0);
+  }();
+  return ignore;
+}
+
 std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {
   uint32_t level = 0;
   size_t size = sizeof(level);
@@ -147,11 +158,13 @@ MemoryGovernor::MemoryGovernor(
         "existing Metal allocations exceed memory governor limit",
         metal::AllocationFailure::EngineBudget);
   }
-  std::optional<uint64_t> hostAvailable = hostAvailableMemory_();
-  if (!hostAvailable || *hostAvailable <= hostReserveBytes_) {
-    throw metal::MetalAllocationError(
-        "host available memory does not satisfy the system reserve",
-        metal::AllocationFailure::HostPressure);
+  if (!ignoreHostPressure()) {
+    std::optional<uint64_t> hostAvailable = hostAvailableMemory_();
+    if (!hostAvailable || *hostAvailable <= hostReserveBytes_) {
+      throw metal::MetalAllocationError(
+          "host available memory does not satisfy the system reserve",
+          metal::AllocationFailure::HostPressure);
+    }
   }
 }
 
@@ -207,9 +220,9 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
       hostAvailable, reservedBytes_);
   bool engineFits = !overflows && observed <= limitBytes_ &&
                     requested <= limitBytes_ - observed;
-  bool hostFits =
+  bool hostFits = ignoreHostPressure() ||
       hostHeadroomBytes(hostAvailable, requested) >= kHostWarningMarginBytes;
-  if (!engineFits || !hostFits || hostConstrained_ ||
+  if (!engineFits || (!ignoreHostPressure() && (!hostFits || hostConstrained_)) ||
       pressure == MemoryPressure::Critical) {
     if (failure)
       *failure = !engineFits ? metal::AllocationFailure::EngineBudget
@@ -259,9 +272,9 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   uint64_t hostHeadroom = hostHeadroomBytes(hostAvailable, reservedBytes_);
   MemoryPressure effectivePressure = updateEffectivePressure(
       hostAvailable, reservedBytes_);
-  bool hostGrowthAllowed = effectivePressure != MemoryPressure::Critical &&
-      !hostConstrained_ && hostHeadroom >= kHostWarningMarginBytes;
-  bool growthAllowed = hostGrowthAllowed && used < limitBytes_;
+  bool hostGrowthAllowed = ignoreHostPressure() || (effectivePressure != MemoryPressure::Critical &&
+      !hostConstrained_ && hostHeadroom >= kHostWarningMarginBytes);
+  bool growthAllowed = (ignoreHostPressure() || hostGrowthAllowed) && used < limitBytes_;
   return {
       limitBytes_,
       observed,
@@ -282,6 +295,10 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
 MemoryPressure MemoryGovernor::updateEffectivePressure(
     const std::optional<uint64_t> &hostAvailable,
     uint64_t reservedBytes) const noexcept {
+  if (ignoreHostPressure()) {
+    hostConstrained_ = false;
+    return systemPressure_ == MemoryPressure::Critical ? MemoryPressure::Critical : MemoryPressure::Normal;
+  }
   uint64_t hostHeadroom = hostHeadroomBytes(hostAvailable, reservedBytes);
 
   // Availability controls growth and paced reclaim. Only the system's
