@@ -1958,53 +1958,80 @@ void testPhysicalPressureRetryIsBackedOffWithoutProgress() {
           "backed-off resource requests did not recover cleanly");
 }
 
-void testRecoveryDrainDoesNotConsumeResourceWaitBudget() {
-  for (bool expireRequest : {false, true}) {
-    Backing backing(2);
-    KvPool pool(backing);
-    engine::Cache resources(pool, CacheNamespace{});
-    Executor executor(2);
-    executor.decodeFinishes = false;
-    Events events;
-    engine::Engine engine({}, resources, executor, events);
-    for (uint64_t id : {250, 251}) {
-      auto value = request(id, std::vector<uint32_t>(24, id));
-      value.maxNewTokens = 4;
-      value.deadlineMilliseconds = expireRequest ? 30000 : 1000000;
-      engine.submit(std::move(value));
-    }
-    for (double now = 1; now <= 5; ++now)
-      require(engine.tick(now), "drain fixture made no progress");
-    require(executor.suspensions == 1, "drain fixture did not preempt a lane");
-    executor.holdDecodeUntil = std::make_shared<bool>(false);
-    require(engine.tick(6) && engine.commandInFlight(),
-            "resident peer did not start its command");
-    static_cast<void>(engine.tick(30006));
-    require(executor.resumeAttempts == 0,
-            "recovery retried while a resident peer was still running");
-    if (expireRequest) {
-      require(!events.failures.empty() &&
-                  std::all_of(events.failures.begin(), events.failures.end(),
-                              [](const auto &code) { return code == "deadline_exceeded"; }),
-              "draining suppressed the request deadline");
-    } else {
-      require(events.failedCount == 0 && engine.nextWakeupMilliseconds() > 30006,
-              "deliberate drain consumed the resource wait limit");
-      const auto wait = engine.resourceWaitSnapshot(30006);
-      require(wait.draining && wait.suspended == 1 && wait.memory == 1 &&
-                  wait.oldestWaitMilliseconds >= 30000,
-              "draining hid the elapsed resource wait from diagnostics");
-    }
-    *executor.holdDecodeUntil = true;
-    for (double now = 30007; now < 30100 && !engine.idle(); ++now)
-      static_cast<void>(engine.tick(now));
-    require(engine.idle() && resources.snapshot().activeRequests == 0,
-            "drain fixture did not release its resources");
-    if (!expireRequest)
-      require(events.completedCount == 2 && events.failedCount == 0 &&
-                  executor.resumptions == 1,
-              "suspended work did not resume after its peer completed");
+void testRecoveryDrainHonorsRequestDeadline() {
+  Backing backing(2);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  EngineConfig config;
+  config.resourceWaitTimeoutMilliseconds = 1'000'000.0;
+  engine::Engine engine(config, resources, executor, events);
+  for (uint64_t id : {250, 251}) {
+    auto value = request(id, std::vector<uint32_t>(24, id));
+    value.maxNewTokens = 4;
+    value.deadlineMilliseconds = 30000;
+    engine.submit(std::move(value));
   }
+  for (double now = 1; now <= 5; ++now)
+    require(engine.tick(now), "drain fixture made no progress");
+  require(executor.suspensions == 1, "drain fixture did not preempt a lane");
+  executor.holdDecodeUntil = std::make_shared<bool>(false);
+  require(engine.tick(6) && engine.commandInFlight(),
+          "resident peer did not start its command");
+  static_cast<void>(engine.tick(30006));
+  require(executor.resumeAttempts == 0,
+          "recovery retried while a resident peer was still running");
+  require(!events.failures.empty() &&
+              std::all_of(events.failures.begin(), events.failures.end(),
+                          [](const auto &code) {
+                            return code == "deadline_exceeded";
+                          }),
+          "draining suppressed the request deadline");
+  *executor.holdDecodeUntil = true;
+  for (double now = 30007; now < 30100 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && resources.snapshot().activeRequests == 0 &&
+              events.completedCount + events.failedCount == 2,
+          "drain fixture did not release its resources");
+}
+
+void testRecoveryDrainStalledRequestTimesOut() {
+  Backing backing(2);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  EngineConfig config;
+  config.resourceWaitTimeoutMilliseconds = 100.0;
+  engine::Engine engine(config, resources, executor, events);
+  for (uint64_t id : {253, 254}) {
+    auto value = request(id, std::vector<uint32_t>(24, id));
+    value.maxNewTokens = 4;
+    value.deadlineMilliseconds = 1'000'000;
+    engine.submit(std::move(value));
+  }
+  for (double now = 1; now <= 5; ++now)
+    require(engine.tick(now), "drain-timeout fixture made no progress");
+  require(executor.suspensions == 1,
+          "drain-timeout fixture did not preempt a lane");
+  executor.holdDecodeUntil = std::make_shared<bool>(false);
+  require(engine.tick(6) && engine.commandInFlight(),
+          "resident peer did not start its command");
+  static_cast<void>(engine.tick(150));
+  require(events.failures == std::vector<std::string>{"resource_timeout"} &&
+              events.failureDetails.size() == 1 &&
+              events.failureDetails.front().second && engine.commandInFlight(),
+          "suspended request stayed pending instead of timing out during drain");
+  *executor.holdDecodeUntil = true;
+  for (double now = 151; now < 220 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && events.completedCount == 1 &&
+              events.failedCount == 1 &&
+              resources.snapshot().activeRequests == 0,
+          "drain-timeout fixture leaked resources or terminal accounting");
 }
 
 void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
@@ -3373,7 +3400,8 @@ int main() {
     testGrowthYieldsLowerPriorityResidentOutsideBatch();
     testPrefillGrowthPreservesAnActiveDecodePeer();
     testPhysicalKvPressureSuspendsInsteadOfKillingActiveWork();
-    testRecoveryDrainDoesNotConsumeResourceWaitBudget();
+    testRecoveryDrainHonorsRequestDeadline();
+    testRecoveryDrainStalledRequestTimesOut();
     testPhysicalPressureRetryIsBackedOffWithoutProgress();
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();
     testLongDecodePreemptionPlansTheCurrentReplayBoundary();

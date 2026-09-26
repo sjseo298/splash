@@ -164,14 +164,10 @@ bool Engine::tick(double now) {
   model_.checkHealth();
   nextHealthCheckMilliseconds_ = now + kHealthCheckIntervalMilliseconds;
   bool progressed = scheduler_.expireDeadlines(now);
-  const bool draining = drainingForRecovery();
   for (auto &[_, active] : requests_) {
-    // Admission is deliberately paused while resident peers finish. Start a
-    // fresh resource wait only if admission still fails after that drain.
-    if (draining) {
-      active.resourceWait.deadlineMilliseconds = 0.0;
-      continue;
-    }
+    // Admission is deliberately paused while resident peers finish. Keep the
+    // original memory wait budget active so a suspended lane cannot stall
+    // indefinitely behind a long-running peer.
     if (!active.finalized && active.resourceWait.deadlineMilliseconds > 0.0 &&
         now >= active.resourceWait.deadlineMilliseconds) {
       finishFailure(active, {"resource_timeout", "memory did not become available within the resource wait limit", true});
@@ -254,7 +250,7 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
       continue;
     if (!result || active.request.deadlineMilliseconds < *result)
       result = active.request.deadlineMilliseconds;
-    if (!draining && active.resourceWait.deadlineMilliseconds > 0.0 &&
+    if (active.resourceWait.deadlineMilliseconds > 0.0 &&
         (!result || active.resourceWait.deadlineMilliseconds < *result))
       result = active.resourceWait.deadlineMilliseconds;
     if (draining || active.resourceWait.retryMilliseconds <= 0.0)
