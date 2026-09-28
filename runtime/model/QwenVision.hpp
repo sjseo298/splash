@@ -1,6 +1,7 @@
 #pragma once
 
 #include "WeightStore.hpp"
+#include "VisionLoader.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
@@ -21,11 +22,13 @@ struct QwenVisionWeights final {
   std::string manifestFingerprintSha256;
 };
 
-inline constexpr std::string_view kVisionMagic = "MDFV0001";
-
+// The packed vision/model.bin of directory.
 [[nodiscard]] QwenVisionWeights
 loadQwenVisionWeights(metal::MetalBackend &backend,
                       const std::filesystem::path &directory,
                       ops::VisionLayout layout = {});
+// The same layout, prepared from an upstream source.
+[[nodiscard]] QwenVisionWeights
+loadQwenVisionWeights(metal::MetalBackend &backend, const VisionLoader &source);
 
 } // namespace splash::model

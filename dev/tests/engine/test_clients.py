@@ -2,12 +2,14 @@ import http.server
 import io
 import json
 import os
+import secrets
 import signal
 import subprocess
 import tempfile
 import threading
 import tomllib
 import unittest
+from contextlib import contextmanager
 from itertools import product
 from pathlib import Path
 from unittest import mock
@@ -16,8 +18,47 @@ import yaml
 
 from install import clients, launcher
 
+MODEL = "incoai/Qwen3.6-35B-A3B-Splash"
+
 
 class ClientTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.runtime = Path(directory.name)
+        # Pi's default models.json is in the home directory; no launch here
+        # touches the developer's.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.home = Path(home.name)
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": home.name}))
+        self.pi_models = self.home / ".pi/agent/models.json"
+
+    def command(
+        self,
+        name,
+        context=102400,
+        model=MODEL,
+        env=None,
+        client_args=(),
+        client_version=None,
+        input_modalities=None,
+    ):
+        return clients.command(
+            name,
+            f"/bin/{name}",
+            "http://127.0.0.1:8000/",
+            model,
+            context,
+            self.runtime,
+            {} if env is None else env,
+            client_args=client_args,
+            client_version=client_version,
+            input_modalities=["text", "image", "pdf"]
+            if input_modalities is None
+            else input_modalities,
+        )
+
     def test_server_key_reaches_every_provider_without_entering_argv(self):
         for name in clients.INSTALL_URLS:
             with self.subTest(client=name):
@@ -35,6 +76,14 @@ class ClientTests(unittest.TestCase):
                         config["provider"]["splash"]["options"]["apiKey"],
                         "test-server-key",
                     )
+                elif name == "pi":
+                    # Pi reads the key from the environment for each request.
+                    self.assertEqual(env["SPLASH_API_KEY"], "test-server-key")
+                    self.assertNotIn("test-server-key", self.pi_models.read_text())
+                    config = json.loads(self.pi_models.read_text())
+                    self.assertEqual(
+                        config["providers"]["splash"]["apiKey"], "$SPLASH_API_KEY"
+                    )
                 else:
                     self.assertEqual(env["OPENAI_API_KEY"], "test-server-key")
                     profile = Path(env["HERMES_HOME"]) / "config.yaml"
@@ -43,32 +92,6 @@ class ClientTests(unittest.TestCase):
                         "test-server-key",
                     )
                     self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
-
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.runtime = Path(directory.name)
-
-    def command(
-        self,
-        name,
-        context=102400,
-        model="incoai/Qwen3.6-35B-A3B-Splash",
-        env=None,
-        client_args=(),
-        client_version=None,
-    ):
-        return clients.command(
-            name,
-            f"/bin/{name}",
-            "http://127.0.0.1:8000/",
-            model,
-            context,
-            self.runtime,
-            {} if env is None else env,
-            client_args=client_args,
-            client_version=client_version,
-        )
 
     def test_missing_clients_have_actionable_install_message(self):
         for name in clients.INSTALL_URLS:
@@ -91,10 +114,34 @@ class ClientTests(unittest.TestCase):
 
     def test_model_is_required(self):
         for model in (None, "", 123):
-            with self.assertRaisesRegex(clients.ClientError, "model"):
+            with (
+                self.subTest(model=model),
+                self.assertRaisesRegex(clients.ClientError, "model"),
+            ):
                 self.command("codex", model=model)
 
-    def test_claude_routes_all_model_aliases_without_disabling_compaction(self):
+    def test_unknown_client_is_rejected(self):
+        with self.assertRaisesRegex(clients.ClientError, "Unknown coding client"):
+            self.command("aider")
+
+    def test_default_environment_is_a_copy_of_the_process_environment(self):
+        with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "process-key"}):
+            before = dict(os.environ)
+            _, env = clients.command(
+                "codex",
+                "/bin/codex",
+                "http://127.0.0.1:8000",
+                MODEL,
+                102400,
+                self.runtime,
+                input_modalities=["text"],
+            )
+            self.assertEqual(dict(os.environ), before)
+        self.assertEqual(env, before)
+
+    def test_claude_launch_selects_the_local_server_for_every_model_alias(self):
+        # A shell configured for a cloud provider keeps its unrelated
+        # settings, and compaction stays on with the served window.
         command, env = self.command(
             "claude",
             env={
@@ -111,24 +158,294 @@ class ClientTests(unittest.TestCase):
                 "--disallowedTools",
                 "WebSearch",
                 "--model",
-                "incoai/Qwen3.6-35B-A3B-Splash",
+                MODEL,
                 "--permission-mode",
                 "default",
             ],
         )
-        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8000")
-        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local")
-        self.assertNotIn("ANTHROPIC_API_KEY", env)
-        self.assertEqual(env["CLAUDE_CODE_USE_VERTEX"], "0")
-        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/custom/claude")
-        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "102400")
-        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "102400")
-        self.assertNotIn("DISABLE_COMPACT", env)
-        for alias in ("OPUS", "SONNET", "HAIKU"):
-            self.assertEqual(
-                env[f"ANTHROPIC_DEFAULT_{alias}_MODEL"],
-                "incoai/Qwen3.6-35B-A3B-Splash",
+        self.assertEqual(
+            env,
+            {
+                "CLAUDE_CONFIG_DIR": "/custom/claude",
+                "PATH": "/bin",
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:8000",
+                "ANTHROPIC_AUTH_TOKEN": "local",
+                "ANTHROPIC_MODEL": MODEL,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": MODEL,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": MODEL,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": MODEL,
+                "ANTHROPIC_SMALL_FAST_MODEL": MODEL,
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "102400",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "102400",
+                "CLAUDE_CODE_USE_BEDROCK": "0",
+                "CLAUDE_CODE_USE_VERTEX": "0",
+                "CLAUDE_CODE_USE_FOUNDRY": "0",
+            },
+        )
+
+    def test_opencode_launch_registers_the_served_model_for_every_agent(self):
+        argv, env = self.command("opencode", env={"PATH": "/bin"})
+        self.assertEqual(argv, ["/bin/opencode"])
+        self.assertEqual(env.keys(), {"PATH", "OPENCODE_CONFIG_CONTENT"})
+        self.assertEqual(env["PATH"], "/bin")
+        served = f"splash/{MODEL}"
+        self.assertEqual(
+            json.loads(env["OPENCODE_CONFIG_CONTENT"]),
+            {
+                "model": served,
+                "small_model": served,
+                "agent": {
+                    name: {"model": served}
+                    for name in (
+                        "build",
+                        "plan",
+                        "general",
+                        "explore",
+                        "title",
+                        "compaction",
+                    )
+                },
+                "provider": {
+                    "splash": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": "Splash",
+                        "options": {
+                            "baseURL": "http://127.0.0.1:8000/v1",
+                            "apiKey": "local",
+                        },
+                        "models": {
+                            MODEL: {
+                                "name": MODEL,
+                                "reasoning": True,
+                                # Efforts are offered, none is selected.
+                                "variants": {
+                                    "none": {"reasoningEffort": "none"},
+                                    "low": {"reasoningEffort": "low"},
+                                    "medium": {"reasoningEffort": "medium"},
+                                    "high": {"reasoningEffort": "high"},
+                                    "xhigh": {"reasoningEffort": "xhigh"},
+                                },
+                                "attachment": True,
+                                "modalities": {
+                                    "input": ["text", "image", "pdf"],
+                                    "output": ["text"],
+                                },
+                                "limit": {
+                                    "context": 102400,
+                                    "input": 76800,
+                                    "output": 25600,
+                                },
+                            }
+                        },
+                    }
+                },
+            },
+        )
+
+    def test_codex_launch_passes_the_connection_as_root_config_overrides(self):
+        argv, env = self.command("codex", env={"PATH": "/bin"})
+        self.assertEqual(
+            argv,
+            [
+                "/bin/codex",
+                "-c",
+                f'model="{MODEL}"',
+                "-c",
+                'web_search="disabled"',
+                "-c",
+                'model_provider="splash"',
+                "-c",
+                'model_providers.splash={name="Splash",'
+                'base_url="http://127.0.0.1:8000/v1",'
+                'env_key="SPLASH_API_KEY",wire_api="responses"}',
+                "-c",
+                "model_context_window=102400",
+                "-c",
+                "model_auto_compact_token_limit=92160",
+            ],
+        )
+        self.assertEqual(env, {"PATH": "/bin", "SPLASH_API_KEY": "local"})
+        self.assertEqual(
+            tomllib.loads("\n".join(argv[2::2])),
+            {
+                "model": MODEL,
+                "web_search": "disabled",
+                "model_provider": "splash",
+                "model_providers": {
+                    "splash": {
+                        "name": "Splash",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "env_key": "SPLASH_API_KEY",
+                        "wire_api": "responses",
+                    }
+                },
+                "model_context_window": 102400,
+                "model_auto_compact_token_limit": 92160,
+            },
+        )
+        self.assertEqual(list(self.runtime.iterdir()), [])
+
+    def test_hermes_launch_writes_a_private_profile(self):
+        argv, env = self.command("hermes", env={"PATH": "/bin"})
+        home = self.runtime / "hermes"
+        self.assertEqual(
+            argv,
+            ["/bin/hermes", "chat", "--provider", "custom", "--model", MODEL],
+        )
+        self.assertEqual(
+            env,
+            {
+                "PATH": "/bin",
+                "HERMES_HOME": str(home),
+                "CUSTOM_BASE_URL": "http://127.0.0.1:8000/v1",
+                "OPENAI_BASE_URL": "http://127.0.0.1:8000/v1",
+                "OPENAI_API_KEY": "local",
+            },
+        )
+        self.assertEqual(
+            yaml.safe_load((home / "config.yaml").read_text()),
+            {
+                "model": {
+                    "default": MODEL,
+                    "provider": "custom",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "api_key": "local",
+                    "api_mode": "chat_completions",
+                    "supports_vision": True,
+                    "context_length": 102400,
+                    "max_tokens": 25600,
+                }
+            },
+        )
+        self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+        self.assertEqual({path.name for path in home.iterdir()}, {"config.yaml"})
+
+    def test_pi_launch_adds_the_served_model_to_the_users_pi_models(self):
+        argv, env = self.command("pi", env={"PATH": "/bin"})
+        self.assertEqual(argv, ["/bin/pi", "--provider", "splash", "--model", MODEL])
+        self.assertEqual(env, {"PATH": "/bin"})
+        self.assertEqual(
+            json.loads(self.pi_models.read_text()),
+            {
+                "providers": {
+                    "splash": {
+                        "baseUrl": "http://127.0.0.1:8000/v1",
+                        "api": "openai-completions",
+                        "apiKey": "local",
+                        "models": [
+                            {
+                                "id": MODEL,
+                                "reasoning": True,
+                                "thinkingLevelMap": {"off": "none"},
+                                "input": ["text", "image"],
+                                "contextWindow": 102400,
+                                "maxTokens": 25600,
+                            }
+                        ],
+                    }
+                }
+            },
+        )
+        agent = self.pi_models.parent
+        self.assertEqual(agent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.pi_models.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([path.name for path in agent.iterdir()], ["models.json"])
+        self.assertEqual(list(self.runtime.iterdir()), [])
+
+    def test_pi_names_a_provider_per_port(self):
+        self.command("pi")
+        argv, _ = clients.command(
+            "pi",
+            "/bin/pi",
+            "http://127.0.0.1:8001/",
+            MODEL,
+            102400,
+            self.runtime,
+            {},
+            input_modalities=["text"],
+        )
+        self.assertEqual(argv[:3], ["/bin/pi", "--provider", "splash-8001"])
+        providers = json.loads(self.pi_models.read_text())["providers"]
+        self.assertEqual(
+            {name: provider["baseUrl"] for name, provider in providers.items()},
+            {
+                "splash": "http://127.0.0.1:8000/v1",
+                "splash-8001": "http://127.0.0.1:8001/v1",
+            },
+        )
+
+    def test_pi_models_follow_the_agent_directory_setting(self):
+        self.command("pi", env={"PI_CODING_AGENT_DIR": "~/custom agent"})
+        path = self.home / "custom agent/models.json"
+        self.assertEqual(
+            json.loads(path.read_text())["providers"]["splash"]["models"][0]["id"],
+            MODEL,
+        )
+        self.assertFalse(self.pi_models.exists())
+
+    def test_pi_update_replaces_only_the_splash_provider(self):
+        agent = self.pi_models.parent
+        agent.mkdir(parents=True)
+        other = {"baseUrl": "http://other/v1", "models": [{"id": "keep"}]}
+        self.pi_models.write_text(
+            json.dumps(
+                {
+                    "providers": {"other": other, "splash": {"baseUrl": "stale"}},
+                    "future": {"keep": True},
+                }
             )
+        )
+        for name in ("settings.json", "auth.json"):
+            (agent / name).write_text('{"keep": true}')
+        self.command("pi")
+        self.command("pi", context=262144, model="incoai/Qwen3.8-27B-Splash")
+        config = json.loads(self.pi_models.read_text())
+        self.assertEqual(config["providers"]["other"], other)
+        self.assertEqual(config["future"], {"keep": True})
+        splash = config["providers"]["splash"]
+        self.assertEqual(splash["baseUrl"], "http://127.0.0.1:8000/v1")
+        self.assertEqual(
+            [(m["id"], m["contextWindow"], m["maxTokens"]) for m in splash["models"]],
+            [("incoai/Qwen3.8-27B-Splash", 262144, 32768)],
+        )
+        for name in ("settings.json", "auth.json"):
+            self.assertEqual((agent / name).read_text(), '{"keep": true}')
+        self.assertEqual(
+            {path.name for path in agent.iterdir()},
+            {"models.json", "settings.json", "auth.json"},
+        )
+
+    def test_invalid_pi_models_are_not_overwritten(self):
+        self.pi_models.parent.mkdir(parents=True)
+        for models in (
+            b"broken",
+            b"[]",
+            b"null",
+            b'{"providers": []}',
+            b'{"providers": null}',
+            # Pi strips comments; rewriting the file would drop them.
+            b'{"providers": {}} // mine\n',
+            b"\xff",
+        ):
+            self.pi_models.write_bytes(models)
+            with (
+                self.subTest(models=models),
+                self.assertRaisesRegex(clients.ClientError, "Invalid Pi models.json"),
+            ):
+                self.command("pi")
+            self.assertEqual(self.pi_models.read_bytes(), models)
+
+    def test_pi_updates_a_symlinked_models_file_in_place(self):
+        dotfiles = self.home / "dotfiles"
+        dotfiles.mkdir()
+        (dotfiles / "models.json").write_text('{"providers": {}}')
+        self.pi_models.parent.mkdir(parents=True)
+        self.pi_models.symlink_to(dotfiles / "models.json")
+        self.command("pi")
+        self.assertTrue(self.pi_models.is_symlink())
+        config = json.loads((dotfiles / "models.json").read_text())
+        self.assertEqual(config["providers"]["splash"]["models"][0]["id"], MODEL)
+        self.assertEqual([path.name for path in dotfiles.iterdir()], ["models.json"])
 
     def test_opencode_preserves_unrelated_inline_config(self):
         user = {
@@ -148,39 +465,11 @@ class ClientTests(unittest.TestCase):
         provider = config["provider"]["splash"]
         self.assertEqual(provider["options"]["baseURL"], "http://127.0.0.1:8000/v1")
         self.assertEqual(
-            provider["models"]["incoai/Qwen3.6-35B-A3B-Splash"]["limit"]["context"],
+            provider["models"][MODEL]["limit"]["context"],
             102400,
         )
 
-    def test_opencode_exposes_request_efforts_without_selecting_a_default(self):
-        for model in (
-            "incoai/Qwen3.6-35B-A3B-Splash",
-            "incoai/Qwen3.8-27B-Splash",
-            "community/custom-model",
-        ):
-            with self.subTest(model=model):
-                argv, env = self.command("opencode", model=model)
-                config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-                model_config = config["provider"]["splash"]["models"][model]
-                self.assertEqual(
-                    model_config["variants"],
-                    {
-                        "none": {"reasoningEffort": "none"},
-                        "low": {"reasoningEffort": "low"},
-                        "medium": {"reasoningEffort": "medium"},
-                        "high": {"reasoningEffort": "high"},
-                        "xhigh": {"reasoningEffort": "xhigh"},
-                    },
-                )
-                self.assertEqual(argv, ["/bin/opencode"])
-                self.assertNotIn("variant", config)
-                self.assertNotIn("reasoningEffort", model_config)
-                self.assertNotIn("options", model_config)
-                for agent in config["agent"].values():
-                    self.assertNotIn("variant", agent)
-
     def test_opencode_preserves_inline_variant_definitions_and_selection(self):
-        model = "incoai/Qwen3.6-35B-A3B-Splash"
         variants = {
             "low": {"reasoningEffort": "low", "temperature": 0.2},
             "xhigh": {"disabled": True},
@@ -188,14 +477,14 @@ class ClientTests(unittest.TestCase):
         }
         user = {
             "agent": {"build": {"variant": "brief", "prompt": "Custom prompt"}},
-            "provider": {"splash": {"models": {model: {"variants": variants}}}},
+            "provider": {"splash": {"models": {MODEL: {"variants": variants}}}},
         }
         original = {"OPENCODE_CONFIG_CONTENT": json.dumps(user)}
         before = dict(original)
         args = ["run", "--variant", "none", "A prompt"]
         argv, env = self.command("opencode", env=original, client_args=args)
         config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-        configured = config["provider"]["splash"]["models"][model]["variants"]
+        configured = config["provider"]["splash"]["models"][MODEL]["variants"]
         self.assertEqual(configured["none"], {"reasoningEffort": "none"})
         self.assertEqual(configured["medium"], {"reasoningEffort": "medium"})
         self.assertEqual(configured["high"], {"reasoningEffort": "high"})
@@ -226,26 +515,60 @@ class ClientTests(unittest.TestCase):
         )
         agents = json.loads(env["OPENCODE_CONFIG_CONTENT"])["agent"]
         for name in ("build", "plan", "general", "explore", "title", "compaction"):
-            self.assertEqual(
-                agents[name]["model"],
-                "splash/incoai/Qwen3.6-35B-A3B-Splash",
-            )
+            self.assertEqual(agents[name]["model"], f"splash/{MODEL}")
         self.assertEqual(agents["build"]["variant"], "off")
         self.assertEqual(agents["compaction"]["temperature"], 0.2)
         self.assertEqual(agents["reviewer"], user["agent"]["reviewer"])
 
     def test_opencode_reports_shared_input_output_budget(self):
-        for context in (4096, 102400, 262144):
+        # The output allowance is a quarter of the window, from 1 to 32768.
+        for context, output in ((3, 1), (4096, 1024), (262144, 32768)):
             with self.subTest(context=context):
                 _, env = self.command("opencode", context=context)
                 config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-                limits = config["provider"]["splash"]["models"][
-                    "incoai/Qwen3.6-35B-A3B-Splash"
-                ]["limit"]
-                self.assertEqual(limits["context"], context)
-                self.assertEqual(limits["input"] + limits["output"], context)
-                self.assertEqual(limits["output"], min(32768, context // 4))
+                self.assertEqual(
+                    config["provider"]["splash"]["models"][MODEL]["limit"],
+                    {"context": context, "input": context - output, "output": output},
+                )
                 self.assertNotIn("compaction", config)
+
+    def test_clients_offer_the_served_input_modalities(self):
+        for modalities in (["text", "image", "pdf"], ["text"]):
+            vision = "image" in modalities
+            with self.subTest(modalities=modalities):
+                _, env = self.command("opencode", input_modalities=modalities)
+                model = json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"][
+                    "splash"
+                ]["models"][MODEL]
+                self.assertIs(model["attachment"], vision)
+                self.assertEqual(
+                    model["modalities"], {"input": modalities, "output": ["text"]}
+                )
+                _, env = self.command("hermes", input_modalities=modalities)
+                profile = Path(env["HERMES_HOME"]) / "config.yaml"
+                config = yaml.safe_load(profile.read_text())
+                self.assertIs(config["model"]["supports_vision"], vision)
+                # Pi's schema has no PDF input.
+                self.command("pi", input_modalities=modalities)
+                config = json.loads(self.pi_models.read_text())
+                self.assertEqual(
+                    config["providers"]["splash"]["models"][0]["input"],
+                    ["text", "image"] if vision else ["text"],
+                )
+        # Claude Code and Codex configurations declare no input modalities.
+        for name in ("claude", "codex"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self.command(name, input_modalities=["text", "image", "pdf"]),
+                    self.command(name, input_modalities=["text"]),
+                )
+
+    def test_server_without_text_input_modalities_predates_the_launcher(self):
+        for name in clients.INSTALL_URLS:
+            for modalities in ([], ["image"], "text", [None], ["text", 3]):
+                with self.subTest(name=name, modalities=modalities):
+                    with self.assertRaisesRegex(clients.ClientError, "restart it"):
+                        self.command(name, input_modalities=modalities)
 
     def test_opencode_preserves_user_compaction_preferences(self):
         compaction = {"auto": True, "reserved": 12000, "prune": False}
@@ -258,9 +581,47 @@ class ClientTests(unittest.TestCase):
         )
 
     def test_invalid_opencode_inline_config_is_not_discarded(self):
-        for value in ("invalid", "[]", "null", '{"provider":[]}'):
-            with self.subTest(value=value), self.assertRaises(clients.ClientError):
+        # Every object the launcher reads or extends must be one.
+        for config in (
+            "invalid",
+            "[]",
+            "null",
+            '"text"',
+            {"agent": []},
+            {"agent": None},
+            {"agent": {"plan": "custom"}},
+            {"agent": {"compaction": []}},
+            {"provider": []},
+            {"provider": {"splash": []}},
+            {"provider": {"splash": {"models": 1}}},
+            {"provider": {"splash": {"models": {MODEL: []}}}},
+            {"provider": {"splash": {"models": {MODEL: {"variants": None}}}}},
+        ):
+            value = config if isinstance(config, str) else json.dumps(config)
+            with (
+                self.subTest(config=value),
+                self.assertRaisesRegex(clients.ClientError, "OPENCODE_CONFIG_CONTENT"),
+            ):
                 self.command("opencode", env={"OPENCODE_CONFIG_CONTENT": value})
+
+    def test_opencode_accepts_any_value_outside_the_entries_it_extends(self):
+        user = {"agent": {"reviewer": "custom"}, "provider": {"other": []}}
+        _, env = self.command(
+            "opencode", env={"OPENCODE_CONFIG_CONTENT": json.dumps(user)}
+        )
+        config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(config["agent"]["reviewer"], "custom")
+        self.assertEqual(config["provider"]["other"], [])
+        # The served provider replaces a user's splash entry as a whole.
+        user = {"provider": {"splash": {"models": {"other-model": []}, "npm": 1}}}
+        _, env = self.command(
+            "opencode", env={"OPENCODE_CONFIG_CONTENT": json.dumps(user)}
+        )
+        _, default = self.command("opencode")
+        self.assertEqual(
+            json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"]["splash"],
+            json.loads(default["OPENCODE_CONFIG_CONTENT"])["provider"]["splash"],
+        )
 
     def test_opencode_two_requests_a_private_server_for_the_inline_config(self):
         # OpenCode 2 loads OPENCODE_CONFIG_CONTENT inside its server process;
@@ -355,33 +716,11 @@ class ClientTests(unittest.TestCase):
             ):
                 self.assertIsNone(clients.probe_major_version("/bin/opencode"))
 
-    def test_codex_uses_responses_and_actual_context_without_replacing_prompt(self):
-        argv, env = self.command("codex")
-        settings = tomllib.loads(
-            "\n".join(argv[i + 1] for i, value in enumerate(argv) if value == "-c")
-        )
-        self.assertEqual(settings["model_context_window"], 102400)
-        self.assertEqual(settings["model_auto_compact_token_limit"], 92160)
-        self.assertEqual(settings["model_provider"], "splash")
-        provider = settings["model_providers"]["splash"]
-        self.assertEqual(provider["wire_api"], "responses")
-        self.assertEqual(provider["base_url"], "http://127.0.0.1:8000/v1")
-        self.assertEqual(env[provider["env_key"]], "local")
-        self.assertNotIn("model_catalog_json", settings)
-        self.assertNotIn("model_instructions_file", settings)
-        self.assertNotIn("model_reasoning_effort", settings)
-        self.assertEqual(list(self.runtime.iterdir()), [])
-        self.assertEqual(settings["web_search"], "disabled")
-
     def test_hermes_profile_preserves_preferences_and_sessions_on_model_change(self):
         _, env = self.command("hermes")
         home = Path(env["HERMES_HOME"])
         path = home / "config.yaml"
         config = yaml.safe_load(path.read_text())
-        self.assertEqual(config["model"]["context_length"], 102400)
-        self.assertEqual(config["model"]["max_tokens"], 25600)
-        self.assertEqual(config["model"]["base_url"], "http://127.0.0.1:8000/v1")
-        self.assertTrue(config["model"]["supports_vision"])
         config["display"] = {"interface": "tui"}
         config["mcp_servers"] = {"test": {"command": "test-server"}}
         path.write_text(yaml.safe_dump(config))
@@ -402,10 +741,51 @@ class ClientTests(unittest.TestCase):
         home = self.runtime / "hermes"
         home.mkdir()
         path = home / "config.yaml"
-        path.write_text("model: broken\n")
-        with self.assertRaises(clients.ClientError):
+        for profile in (
+            b"model: broken\n",
+            b"model: false\n",
+            b"- a list\n",
+            b"model: [\n",
+            b"created: 2026-13-01\n",
+            b"\xff\n",
+        ):
+            path.write_bytes(profile)
+            with (
+                self.subTest(profile=profile),
+                self.assertRaisesRegex(clients.ClientError, "Invalid Hermes profile"),
+            ):
+                self.command("hermes")
+            self.assertEqual(path.read_bytes(), profile)
+
+    def test_empty_hermes_profile_is_configured_from_scratch(self):
+        home = self.runtime / "hermes"
+        home.mkdir()
+        path = home / "config.yaml"
+        for profile, kept in (
+            ("", {}),
+            ("~\n", {}),
+            ("model:\n", {}),
+            ("display: {interface: tui}\n", {"display": {"interface": "tui"}}),
+        ):
+            path.write_text(profile)
+            with self.subTest(profile=profile):
+                self.command("hermes")
+                configured = yaml.safe_load(path.read_text())
+                self.assertEqual(configured.pop("model")["default"], MODEL)
+                self.assertEqual(configured, kept)
+
+    def test_failed_profile_replacement_keeps_the_previous_profile(self):
+        home = self.runtime / "hermes"
+        home.mkdir()
+        path = home / "config.yaml"
+        path.write_text("display: {interface: tui}\n")
+        with (
+            mock.patch.object(Path, "replace", side_effect=OSError("disk full")),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
             self.command("hermes")
-        self.assertEqual(path.read_text(), "model: broken\n")
+        self.assertEqual(path.read_text(), "display: {interface: tui}\n")
+        self.assertEqual(list(home.iterdir()), [path])
 
     def test_no_client_filters_tools_bypasses_permissions_or_changes_cwd(self):
         cwd = Path.cwd()
@@ -414,20 +794,16 @@ class ClientTests(unittest.TestCase):
             with self.subTest(name=name):
                 argv, env = self.command(name, env=original)
                 self.assertEqual(env["USER_SETTING"], "keep")
-                self.assertFalse(
-                    any(
-                        word in " ".join(argv)
-                        for word in (
-                            "--tools",
-                            "--toolsets",
-                            "skip-permissions",
-                            "bypassPermissions",
-                            "--bare",
-                            "--safe-mode",
-                            "--system-prompt",
-                        )
-                    )
-                )
+                for word in (
+                    "--tools",
+                    "--toolsets",
+                    "skip-permissions",
+                    "bypassPermissions",
+                    "--bare",
+                    "--safe-mode",
+                    "--system-prompt",
+                ):
+                    self.assertNotIn(word, " ".join(argv))
         self.assertEqual(Path.cwd(), cwd)
         self.assertEqual(original, {"PATH": "/bin", "USER_SETTING": "keep"})
 
@@ -492,30 +868,39 @@ class ClientTests(unittest.TestCase):
             self.command("codex", client_args=["exec", "-c"])
 
     def test_other_clients_preserve_passthrough_arguments(self):
-        for name in ("claude", "opencode", "hermes"):
+        for name in ("claude", "opencode", "hermes", "pi"):
             with self.subTest(name=name):
                 args = ["--help", "--", "literal"]
                 argv, _ = self.command(name, client_args=args)
                 self.assertEqual(argv[-len(args) :], args)
 
-    def test_claude_hides_only_hosted_search_and_preserves_user_restrictions(self):
-        args = ["--disallowedTools", "Bash", "mcp__private__write", "--print", "hello"]
-        argv, _ = self.command("claude", client_args=args)
-        self.assertEqual(
-            argv[1:5],
-            [
-                "--disallowedTools",
-                "WebSearch",
-                "--model",
-                "incoai/Qwen3.6-35B-A3B-Splash",
-            ],
-        )
-        self.assertEqual(argv[-len(args) :], args)
-        self.assertNotIn("WebFetch", argv)
-        self.assertIn("--permission-mode", argv)
-
 
 class ClientLifecycleTests(unittest.TestCase):
+    @contextmanager
+    def ready_server(self, client, context=102400, model=None):
+        """Serve model from a ready server; yields the patched exec."""
+        if model is None:
+            model = {
+                "id": MODEL,
+                "owned_by": "splash",
+                "input_modalities": ["text", "image", "pdf"],
+            }
+        status = {"ready": True, "maximum_context_tokens": context}
+        with (
+            tempfile.TemporaryDirectory() as runtime,
+            mock.patch.object(launcher, "PROFILES_DIR", Path(runtime)),
+            mock.patch.object(
+                clients, "find_executable", return_value=f"/bin/{client}"
+            ),
+            mock.patch.object(launcher, "_running_status", return_value=status),
+            mock.patch.object(
+                launcher, "_request_json", return_value={"data": [model]}
+            ),
+            mock.patch.object(launcher.os, "execvpe") as execute,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            yield execute
+
     def test_clients_accept_arguments_with_or_without_separator(self):
         payloads = (
             [],
@@ -577,28 +962,7 @@ class ClientLifecycleTests(unittest.TestCase):
         for context, separator in product((102400, 262144), ([], ["--"])):
             with (
                 self.subTest(context=context, separator=separator),
-                mock.patch.object(
-                    clients, "find_executable", return_value="/bin/codex"
-                ),
-                mock.patch.object(
-                    launcher,
-                    "_running_status",
-                    return_value={"ready": True, "maximum_context_tokens": context},
-                ),
-                mock.patch.object(
-                    launcher,
-                    "_request_json",
-                    return_value={
-                        "data": [
-                            {
-                                "id": "incoai/Qwen3.6-35B-A3B-Splash",
-                                "owned_by": "splash",
-                            }
-                        ]
-                    },
-                ),
-                mock.patch.object(launcher.os, "execvpe") as execute,
-                mock.patch("sys.stdout", io.StringIO()),
+                self.ready_server("codex", context=context) as execute,
             ):
                 launcher.main(
                     [
@@ -611,7 +975,7 @@ class ClientLifecycleTests(unittest.TestCase):
                     ]
                 )
             argv = execute.call_args.args[1]
-            self.assertEqual(argv[1:3], ["-c", 'model="incoai/Qwen3.6-35B-A3B-Splash"'])
+            self.assertEqual(argv[1:3], ["-c", f'model="{MODEL}"'])
             self.assertIn(f"model_context_window={context}", argv)
             self.assertLess(
                 argv.index('model_reasoning_effort="low"'), argv.index("exec")
@@ -627,34 +991,38 @@ class ClientLifecycleTests(unittest.TestCase):
             with (
                 self.subTest(version=version),
                 mock.patch.object(
-                    clients, "find_executable", return_value="/bin/opencode"
-                ),
-                mock.patch.object(
                     clients, "probe_major_version", return_value=version
                 ) as probe,
-                mock.patch.object(
-                    launcher,
-                    "_running_status",
-                    return_value={"ready": True, "maximum_context_tokens": 102400},
-                ),
-                mock.patch.object(
-                    launcher,
-                    "_request_json",
-                    return_value={
-                        "data": [
-                            {
-                                "id": "incoai/Qwen3.6-35B-A3B-Splash",
-                                "owned_by": "splash",
-                            }
-                        ]
-                    },
-                ),
-                mock.patch.object(launcher.os, "execvpe") as execute,
-                mock.patch("sys.stdout", io.StringIO()),
+                self.ready_server("opencode") as execute,
             ):
                 launcher.main(["opencode"])
             self.assertEqual(execute.call_args.args[1], expected)
             probe.assert_called_once_with("/bin/opencode")
+
+    def test_launcher_configures_clients_from_the_served_input_modalities(self):
+        for reported in (["text", "image", "pdf"], ["text"], None):
+            model = {"id": MODEL, "owned_by": "splash"}
+            if reported is not None:
+                model["input_modalities"] = reported
+            with (
+                self.subTest(modalities=reported),
+                mock.patch.object(clients, "probe_major_version", return_value=1),
+                self.ready_server("opencode", model=model) as execute,
+                mock.patch("sys.stderr", io.StringIO()) as error,
+            ):
+                result = launcher.main(["opencode"])
+            if reported is None:
+                # A server started by an older Splash reports only vision.
+                self.assertEqual(result, 1)
+                self.assertIn(
+                    "restart it with this version of Splash", error.getvalue()
+                )
+                execute.assert_not_called()
+                continue
+            config = json.loads(execute.call_args.args[2]["OPENCODE_CONFIG_CONTENT"])
+            served = config["provider"]["splash"]["models"][model["id"]]
+            self.assertIs(served["attachment"], "image" in reported)
+            self.assertEqual(served["modalities"]["input"], reported)
 
     def test_unready_server_never_probes_or_launches(self):
         with (
@@ -669,37 +1037,42 @@ class ClientLifecycleTests(unittest.TestCase):
         execute.assert_not_called()
 
     def test_version_probe_is_scoped_to_opencode(self):
-        # hermes is excluded here, not from the guarantee: its launch writes a
-        # real profile into the runtime directory, which tests must not touch.
-        for name in ("claude", "codex"):
+        for name in ("claude", "codex", "hermes"):
             with (
                 self.subTest(name=name),
-                mock.patch.object(
-                    clients, "find_executable", return_value=f"/bin/{name}"
-                ),
                 mock.patch.object(clients, "probe_major_version") as probe,
-                mock.patch.object(
-                    launcher,
-                    "_running_status",
-                    return_value={"ready": True, "maximum_context_tokens": 102400},
-                ),
-                mock.patch.object(
-                    launcher,
-                    "_request_json",
-                    return_value={
-                        "data": [
-                            {
-                                "id": "incoai/Qwen3.6-35B-A3B-Splash",
-                                "owned_by": "splash",
-                            }
-                        ]
-                    },
-                ),
-                mock.patch.object(launcher.os, "execvpe"),
-                mock.patch("sys.stdout", io.StringIO()),
+                self.ready_server(name) as execute,
             ):
                 launcher.main([name])
+            execute.assert_called_once()
             probe.assert_not_called()
+
+    def test_source_checkout_keeps_hermes_sessions_out_of_build(self):
+        # make clean removes build/, and a Hermes home there with it.
+        self.assertFalse(launcher.paths.PACKAGED)
+        model = {"id": MODEL, "owned_by": "splash", "input_modalities": ["text"]}
+        status = {"ready": True, "maximum_context_tokens": 102400}
+        for port in (launcher.PORT, launcher.PORT + 1):
+            with (
+                self.subTest(port=port),
+                mock.patch.dict(os.environ, {"SPLASH_PORT": str(port)}),
+                mock.patch.object(
+                    clients, "find_executable", return_value="/bin/hermes"
+                ),
+                # The launcher's own home; nothing is written into the checkout.
+                mock.patch.object(clients, "_write_hermes_profile") as write,
+                mock.patch.object(launcher, "_running_status", return_value=status),
+                mock.patch.object(
+                    launcher, "_request_json", return_value={"data": [model]}
+                ),
+                mock.patch.object(launcher.os, "execvpe") as execute,
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                launcher.main(["hermes"])
+            home = Path(execute.call_args.args[2]["HERMES_HOME"])
+            write.assert_called_once_with(home, mock.ANY)
+            self.assertTrue(home.is_relative_to(launcher.ROOT))
+            self.assertFalse(home.is_relative_to(launcher.ROOT / "build"))
 
     def test_unready_server_never_launches_or_downloads(self):
         for payload in ([], ["--help"]):
@@ -786,6 +1159,7 @@ class InstalledOpenCodeTests(unittest.TestCase):
                 environment,
                 client_version=version,
                 client_args=query[1:],
+                input_modalities=["text", "image", "pdf"],
             )
             try:
                 run([binary, "service", "start"], environment)
@@ -847,6 +1221,7 @@ class InstalledCodexTests(unittest.TestCase):
                 131072,
                 work / "runtime",
                 environment,
+                input_modalities=["text", "image", "pdf"],
                 client_args=[
                     "exec",
                     "--ignore-user-config",
@@ -937,6 +1312,7 @@ class InstalledCodexTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
+            (work / "codex").mkdir()
             (work / "state").mkdir()
             (work / "logs").mkdir()
             subprocess.run(["git", "init", "-q", str(work)], check=True)
@@ -950,10 +1326,11 @@ class InstalledCodexTests(unittest.TestCase):
             base_url = f"http://127.0.0.1:{server.server_port}"
             env = {
                 key: os.environ[key]
-                for key in ("PATH", "HOME", "CODEX_HOME", "TMPDIR")
+                for key in ("PATH", "HOME", "TMPDIR")
                 if key in os.environ
             }
             env.update(
+                CODEX_HOME=str(work / "codex"),
                 HTTP_PROXY=base_url,
                 HTTPS_PROXY=base_url,
                 ALL_PROXY=base_url,
@@ -1006,10 +1383,11 @@ class InstalledCodexTests(unittest.TestCase):
                         "codex",
                         os.environ["SPLASH_CODEX_BINARY"],
                         base_url,
-                        "incoai/Qwen3.6-35B-A3B-Splash",
+                        MODEL,
                         102400,
                         work / "runtime",
                         env,
+                        input_modalities=["text", "image", "pdf"],
                         client_args=args,
                     )
                     with (
@@ -1047,13 +1425,128 @@ class InstalledCodexTests(unittest.TestCase):
                     for path, authorization, body in requests:
                         self.assertEqual(path, "/v1/responses")
                         self.assertEqual(authorization, "Bearer local")
-                        self.assertEqual(body["model"], "incoai/Qwen3.6-35B-A3B-Splash")
+                        self.assertEqual(body["model"], MODEL)
                         self.assertFalse(
                             any(
                                 tool["type"].startswith("web_search")
                                 for tool in body.get("tools", [])
                             )
                         )
+
+
+@unittest.skipUnless(
+    os.environ.get("SPLASH_PI_BINARY"), "set SPLASH_PI_BINARY for Pi HTTP test"
+)
+class InstalledPiTests(unittest.TestCase):
+    def test_text_tools_and_session_resume_against_splash_http(self):
+        from dev.tests.agent_real import events, executed_commands
+        from dev.tests.test_server import (
+            FakeRuntime,
+            FakeTokenizer,
+            Harness,
+            Plan,
+            _byte_backend,
+        )
+
+        # The installed client and production HTTP adapter are real; the
+        # controlled runtime answers with one tool call, then plain text.
+        tokenizer = FakeTokenizer()
+        tokenizer.fragments[5] = (
+            "<tool_call>\n<function=bash>\n<parameter=command>\n"
+            "printf 'pi-tool-ok'\n</parameter>\n</function>\n</tool_call>\n"
+        )
+        tokenizer.backend_tokenizer = _byte_backend(tokenizer.fragments)
+        runtime = FakeRuntime(Plan([[5]]), Plan([[4]]), Plan([[26, 4]]))
+        # A key Pi would run as a command or expand if it were saved.
+        api_key = "!test-$" + secrets.token_hex(16)
+        harness = Harness(
+            runtime,
+            tokenizer=tokenizer,
+            max_context=131072,
+            timeout=60,
+            api_key=api_key,
+        )
+        self.addCleanup(harness.close)
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            environment = {
+                key: os.environ[key] for key in ("PATH", "TMPDIR") if key in os.environ
+            }
+            environment.update(
+                HOME=directory,
+                PI_CODING_AGENT_DIR=str(work / "pi"),
+                PI_OFFLINE="1",
+                PI_TELEMETRY="0",
+                SPLASH_API_KEY=api_key,
+            )
+            argv, environment = clients.command(
+                "pi",
+                os.environ["SPLASH_PI_BINARY"],
+                f"http://127.0.0.1:{harness.server.server_port}",
+                "test-model",
+                131072,
+                work / "runtime",
+                environment,
+                input_modalities=["text", "image", "pdf"],
+                client_args=[
+                    "--print",
+                    "--mode",
+                    "json",
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "--no-themes",
+                    "--no-context-files",
+                    "--thinking",
+                    "off",
+                ],
+            )
+            self.assertNotIn(api_key, (work / "pi/models.json").read_text())
+            session = None
+            for thinking in ("off", "low"):
+                result = subprocess.run(
+                    [
+                        *argv[:-1],
+                        thinking,
+                        *(["--session", session] if session else []),
+                    ],
+                    input="Reply briefly.\n",
+                    cwd=work,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                parsed = events(result.stdout)
+                header = next(e for e in parsed if e.get("type") == "session")
+                if session:
+                    self.assertEqual(header["id"], session)
+                session = header["id"]
+                messages = [
+                    e["message"]
+                    for e in parsed
+                    if e.get("type") == "message_end"
+                    and e.get("message", {}).get("role") == "assistant"
+                ]
+                self.assertTrue(messages, output)
+                self.assertEqual(messages[-1]["stopReason"], "stop", output)
+                self.assertIn(
+                    "plain answer",
+                    [c.get("text", "").strip() for c in messages[-1]["content"]],
+                    output,
+                )
+                if thinking == "off":
+                    self.assertEqual(
+                        executed_commands("pi", parsed), ["printf 'pi-tool-ok'"]
+                    )
+            self.assertEqual(len(runtime.requests), 3)
+            # Thinking off reaches the template as reasoning_effort "none".
+            self.assertEqual(
+                [options["enable_thinking"] for _, options in tokenizer.templates],
+                [False, False, True],
+            )
 
 
 if __name__ == "__main__":

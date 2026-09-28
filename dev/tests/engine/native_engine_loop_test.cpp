@@ -1,14 +1,17 @@
+#include "AllocationFailure.hpp"
 #include "TestImmediateTicket.hpp"
 #include "engine/Cache.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "metal/CommandWatchdog.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -135,9 +138,16 @@ public:
     return results;
   }
   std::vector<ModelStepResult>
-  decode(const BatchPlan &, std::span<const ModelBatchItem> items) {
+  decode(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
     std::vector<ModelStepResult> results;
     for (const auto &item : items) {
+      // A constrained request asks for its initial mask before any token.
+      if (plan.cohort == BatchCohort::Constrained &&
+          plan.decodeStage == DecodeStage::RequestInitialMask) {
+        results.push_back({item.requestId, 0, {}, false,
+                           DecodeStage::ApplyInitialMask, 0, 0});
+        continue;
+      }
       results.push_back({item.requestId,
                          0,
                          std::vector<uint32_t>(stepTokens, 42),
@@ -166,7 +176,14 @@ public:
     return std::make_shared<State>();
   }
   uint64_t reclaimIdleState() noexcept override { return 0; }
-  void provideMask(uint64_t, std::span<const uint32_t>) override {}
+  void provideMask(uint64_t, std::span<const uint32_t> words) override {
+    // As in the model, a mask row must permit some token.
+    if (std::none_of(words.begin(), words.end(),
+                     [](uint32_t word) { return word != 0; }))
+      throw std::invalid_argument("token mask row permits no vocabulary token");
+    ++providedMasks;
+  }
+  uint32_t providedMasks = 0;
   void end(uint64_t id) override { requests_.erase(id); }
   uint32_t restored() const noexcept { return restored_; }
   bool holdsSlot(uint64_t id) const { return requests_.contains(id); }
@@ -693,6 +710,76 @@ void testControlFailureUsesExecutionBoundary() {
   }
 }
 
+// Every path that stops the engine keeps its reason for the exit log, not
+// only the ones that report through engineError().
+void testEngineFailureNamesItsReason() {
+  {
+    Backing backing(8);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    const std::system_error closed(EPIPE, std::generic_category(),
+                                   "write(native output)");
+    bool outputClosed = false;
+    engine::NativeRuntime loop(
+        {}, resources, executor,
+        [&](std::span<const uint8_t>) {
+          if (outputClosed)
+            throw closed;
+        },
+        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
+    loop.announceReady();
+    outputClosed = true;
+    auto status = protocol::serializeMessage(
+        protocol::Message{protocol::StatusRequestFrame{77}});
+    require(status && !loop.receive(*status.value) && !loop.engineHealthy() &&
+                loop.connectionMustClose(),
+            "a failed output write did not stop the engine");
+    require(loop.engineFailure() ==
+                std::string("output_write_failed: ") + closed.what(),
+            "a failed output write left the engine failure unnamed");
+  }
+  {
+    Backing backing(8);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    std::vector<uint8_t> output;
+    engine::NativeRuntime loop(
+        {}, resources, executor,
+        [&](std::span<const uint8_t> bytes) {
+          output.insert(output.end(), bytes.begin(), bytes.end());
+        },
+        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
+    loop.announceReady();
+    auto frame = protocol::serializeMessage(protocol::Message{request(1)});
+    require(static_cast<bool>(frame), "request wire failed");
+    // A header and one payload byte: the parser's first allocation is the
+    // payload buffer, and it fails.
+    allocationFailureAfter = 0;
+    const bool received = loop.receive(std::span<const uint8_t>(
+        frame.value->data(), protocol::kFrameHeaderBytes + 1));
+    allocationFailureAfter = -1;
+    uint32_t errors = 0;
+    for (const auto &message : decodeMessages(output)) {
+      if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+        require(error->failureClass ==
+                        protocol::FailureClass::EngineUnhealthy &&
+                    error->code == "allocation_failure",
+                "an inbound allocation failure lost its classification");
+        ++errors;
+      }
+    }
+    require(!received && errors == 1 && !loop.engineHealthy() &&
+                loop.connectionMustClose(),
+            "an inbound allocation failure did not stop the engine");
+    require(loop.engineFailure() ==
+                "allocation_failure: allocation failed while receiving frame "
+                "payload",
+            "an inbound allocation failure left the engine failure unnamed");
+  }
+}
+
 void testInvalidPromptTokensStayRequestScoped() {
   Backing backing(32);
   KvPool pool(backing);
@@ -736,6 +823,85 @@ void testInvalidPromptTokensStayRequestScoped() {
   require(errors == 2 && done == 1 && loop.engineHealthy() &&
               loop.snapshot().submitted == 1,
           "invalid tokens reached admission or prevented subsequent completion");
+}
+
+// The feature bits Ready announces for an engine admitting images of up to
+// `maxImagePatches` patches.
+uint64_t announcedFeatures(uint32_t maxImagePatches) {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  std::vector<uint8_t> output;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.engine.maxImagePatches = maxImagePatches;
+  engine::NativeRuntime loop(
+      config, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  loop.announceReady();
+  const auto announced = decodeMessages(output);
+  const auto *ready = announced.size() == 1
+                          ? std::get_if<protocol::ReadyEvent>(&announced.front())
+                          : nullptr;
+  require(ready, "announceReady did not send exactly one Ready event");
+  return ready->featureBits;
+}
+
+void testReadyAnnouncesVisionWhenImagesAreAdmitted() {
+  require(announcedFeatures(ops::kMaximumImagePatches) ==
+              (protocol::kNativeFeatureBits | protocol::FeatureVision),
+          "Ready did not announce vision for an engine that admits images");
+  require(announcedFeatures(0) == protocol::kNativeFeatureBits,
+          "Ready announced vision for an engine serving without it");
+}
+
+// Without vision an image request fails by itself and the engine keeps
+// serving.
+void testImageRequestWithoutVisionStaysRequestScoped() {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  std::vector<uint8_t> output;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.engine.maxImagePatches = 0;
+  engine::NativeRuntime loop(
+      config, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  loop.announceReady();
+  auto image = request(9);
+  image.imageSpans = {{8, 16, 8, 8, 1, 2}};
+  image.imagePixels.assign(image.imageSpans[0].pixelBytes(), 1);
+  for (const protocol::RequestFrame &frame : {image, request(1)}) {
+    const auto wire = protocol::serializeMessage(protocol::Message{frame});
+    require(wire && loop.receive(*wire.value),
+            "image request closed the native connection");
+  }
+  runUntilIdle(loop);
+  uint32_t errors = 0, done = 0;
+  for (const auto &message : decodeMessages(output)) {
+    if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+      require(error->requestId == 9 && error->code == "invalid_request" &&
+                  error->failureClass == protocol::FailureClass::RequestError &&
+                  error->message == "this model is serving without vision",
+              "image request did not produce its own vision error");
+      ++errors;
+    }
+    done += std::holds_alternative<protocol::DoneEvent>(message);
+  }
+  require(errors == 1 && done == 1 && loop.engineHealthy() &&
+              loop.snapshot().submitted == 1,
+          "image request reached admission or stopped the engine");
 }
 
 void testStepTokensFitTheWire() {
@@ -786,6 +952,8 @@ void testStepTokensFitTheWire() {
       require(!streamed && !completion && encodeErrors == 1 &&
                   !loop.engineHealthy() && loop.connectionMustClose(),
               "an unencodable event was not reported as an engine error");
+      require(loop.engineFailure().starts_with("protocol_encode_failed: "),
+              "an unencodable event left the engine failure unnamed");
     }
   }
 }
@@ -994,6 +1162,117 @@ void testInvalidScoreFailsOneRequestAndKeepsTheBatch() {
           "the failed step published its KV block");
 }
 
+// A constrained request's initial token mask crosses the native protocol.
+// Only the response to the pending mask request, with one row of the
+// configured width, reaches the model. Any other response fails that
+// request alone, and one that arrives after the request ended is ignored.
+void testConstrainedMaskExchange() {
+  enum class Reply {
+    Valid,
+    WrongMaskId,
+    WrongWordCount,
+    EmptyRow,
+    Malformed,
+    AfterCancel
+  };
+  for (Reply reply : {Reply::Valid, Reply::WrongMaskId, Reply::WrongWordCount,
+                      Reply::EmptyRow, Reply::Malformed, Reply::AfterCancel}) {
+    Backing backing(32);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    std::vector<uint8_t> output;
+    engine::NativeLoopConfig config;
+    config.engine.maxContext = 1024;
+    config.maskWordsPerToken = 2;
+    engine::NativeRuntime loop(
+        config, resources, executor,
+        [&](std::span<const uint8_t> bytes) {
+          output.insert(output.end(), bytes.begin(), bytes.end());
+        },
+        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+        {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+    loop.announceReady();
+    const auto send = [&](protocol::Message message) {
+      auto wire = protocol::serializeMessage(message);
+      require(wire && loop.receive(*wire.value),
+              "mask exchange message closed the connection");
+    };
+    auto constrained = request(7);
+    constrained.priority = protocol::RequestPriority::Background;
+    constrained.cohort = protocol::Cohort::Constrained;
+    constrained.constraint = protocol::ConstraintMode::TokenMask;
+    send(constrained);
+    while (loop.tick()) {
+    }
+    std::optional<protocol::MaskRequestEvent> asked;
+    for (const auto &message : decodeMessages(output)) {
+      if (const auto *event = std::get_if<protocol::MaskRequestEvent>(&message))
+        asked = *event;
+    }
+    require(asked && asked->requestId == 7 && asked->maskRequestId &&
+                asked->wordsPerMask == 2 && asked->simulationTokens.empty(),
+            "constrained request did not ask for one initial mask row");
+
+    protocol::MaskResponseFrame response{7, asked->maskRequestId, {1, 0}};
+    if (reply == Reply::WrongMaskId)
+      ++response.maskRequestId;
+    if (reply == Reply::WrongWordCount)
+      response.maskWords.push_back(0);
+    if (reply == Reply::EmptyRow)
+      response.maskWords = {0, 0};
+    if (reply == Reply::AfterCancel) {
+      send(protocol::CancelFrame{7});
+      runUntilIdle(loop);
+    }
+    if (reply == Reply::Malformed) {
+      // The frame claims one more mask word than it carries.
+      auto wire = protocol::serializeMessage(protocol::Message{response});
+      require(static_cast<bool>(wire), "mask response encoding failed");
+      ++(*wire.value)[protocol::kFrameHeaderBytes + 16];
+      require(loop.receive(*wire.value),
+              "malformed mask response closed the connection");
+    } else {
+      send(response);
+    }
+    runUntilIdle(loop);
+
+    std::optional<protocol::FinishReason> done;
+    std::vector<std::string> errors;
+    uint32_t maskRequests = 0;
+    for (const auto &message : decodeMessages(output)) {
+      if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
+        done = event->reason;
+      if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+        require(error->requestId == 7 &&
+                    error->failureClass == protocol::FailureClass::RequestError,
+                "mask response failure was not the request's own error");
+        errors.push_back(error->code);
+      }
+      maskRequests += std::holds_alternative<protocol::MaskRequestEvent>(message);
+    }
+    require(maskRequests == 1 && loop.engineHealthy() &&
+                !loop.connectionMustClose() && !executor.holdsSlot(7),
+            "mask exchange stopped the engine or kept the request's slot");
+    if (reply == Reply::Valid) {
+      require(done == protocol::FinishReason::Stop && errors.empty() &&
+                  executor.providedMasks == 1,
+              "valid initial mask did not let the request finish");
+    } else if (reply == Reply::AfterCancel) {
+      require(done == protocol::FinishReason::Cancelled && errors.empty() &&
+                  executor.providedMasks == 0,
+              "mask response after cancellation was not ignored");
+    } else {
+      const std::string expected = reply == Reply::Malformed
+                                       ? "invalid_payload_length"
+                                       : "invalid_mask_response";
+      require(!done && errors == std::vector<std::string>{expected} &&
+                  executor.providedMasks == 0,
+              "mismatched mask response did not fail only its request");
+    }
+  }
+}
+
 } // namespace
 
 int main() {
@@ -1006,11 +1285,15 @@ int main() {
     testCommandWatchdogAndPendingHealthWake();
     testDuplicateLiveRequestClosesWithoutAmbiguousError();
     testControlFailureUsesExecutionBoundary();
+    testEngineFailureNamesItsReason();
     testInvalidPromptTokensStayRequestScoped();
+    testReadyAnnouncesVisionWhenImagesAreAdmitted();
+    testImageRequestWithoutVisionStaysRequestScoped();
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();
     testCancelledScoreReturnsEmptyLogits();
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
+    testConstrainedMaskExchange();
     std::cout << "native KV-first loop tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

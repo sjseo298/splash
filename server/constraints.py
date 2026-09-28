@@ -114,6 +114,14 @@ def validate_tokenizer(tokenizer):
         )
 
 
+def _grammar_error(error):
+    # A compiler panic carries a backtrace rather than a reason, and the lines
+    # after the first echo the grammar source with every schema it holds.
+    if error.startswith("panic"):
+        return APIError(400, "tool or output schema is too large to compile")
+    return APIError(400, f"unsupported output schema: {error.splitlines()[0]}")
+
+
 class ConstraintFactory:
     DEFAULT_CACHE_SIZE = 32
     DEFAULT_CACHE_SOURCE_BYTES = 8 * 1024 * 1024
@@ -181,10 +189,10 @@ class ConstraintFactory:
         try:
             error = LLMatcher.validate_grammar(grammar, self.tokenizer)
             if error:
-                raise APIError(400, f"unsupported output schema: {error}")
+                raise _grammar_error(error)
             matcher = LLMatcher(self.tokenizer, grammar, log_level=0)
             if matcher.is_error():
-                raise APIError(400, f"unsupported output schema: {matcher.get_error()}")
+                raise _grammar_error(matcher.get_error())
             size = len(grammar.encode())
             # Oversized grammars remain usable without displacing the cache.
             # This bounds source bytes; LLGuidance bounds compiler complexity.

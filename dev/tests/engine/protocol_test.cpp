@@ -366,9 +366,7 @@ std::vector<Message> everyOtherMessage() {
       CancelFrame{91},
       MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}},
       StatusRequestFrame{808},
-      ReadyEvent{1001, 4, 524'288,
-                 FeatureCancellation | FeatureTokenMasks | FeatureStatusJson |
-                     FeatureMultiplexing},
+      ReadyEvent{1001, 4, 524'288, kNativeFeatureBits | FeatureVision},
       StartEvent{91, CacheDisposition::PrefixHit, 2, 4096, 131'072},
       PromptProgressEvent{91, 2048, 123456},
       TokensEvent{91, 17, {10, 11, 12}},
@@ -709,6 +707,96 @@ void testMalformedPayloadClassification() {
   }
 }
 
+// Every rejection of a request's prompt or image spans is that request's own
+// error, from the encoder and from the decoder that guards the native
+// process.
+void testPromptAndImageSpanRejections() {
+  constexpr std::string_view test = "prompt and image span rejections";
+  auto expectIssue = [&](const RequestFrame &invalid, IssueCode code,
+                         const ProtocolLimits &limits = {}) {
+    auto encoded = encodeMessage(Message{invalid}, limits);
+    CHECK(test, !encoded);
+    if (encoded.issue) {
+      CHECK(test, encoded.issue->failureClass == FailureClass::RequestError);
+      CHECK(test, encoded.issue->code == code);
+      CHECK(test, encoded.issue->requestId == invalid.requestId);
+    }
+  };
+  auto expectDecodeIssue = [&](const std::vector<uint8_t> &wire,
+                               IssueCode code,
+                               const ProtocolLimits &limits = {}) {
+    auto decoded = decodeFrame(decodeSingleFrame(wire), limits);
+    CHECK(test, !decoded);
+    if (decoded.issue) {
+      CHECK(test, decoded.issue->failureClass == FailureClass::RequestError);
+      CHECK(test, decoded.issue->code == code);
+      CHECK(test, decoded.issue->requestId == exampleRequest().requestId);
+    }
+  };
+
+  RequestFrame empty = exampleRequest();
+  empty.promptTokens.clear();
+  expectIssue(empty, IssueCode::LimitExceeded);
+  ProtocolLimits fourTokens;
+  fourTokens.maxPromptTokens = 4;
+  expectIssue(exampleRequest(), IssueCode::LimitExceeded, fourTokens);
+
+  const RequestFrame image = exampleImageRequest();
+  auto withSpan = [&](auto change) {
+    RequestFrame result = image;
+    change(result.imageSpans[0]);
+    result.imagePixels.resize(result.imageSpans[0].pixelBytes());
+    return result;
+  };
+  expectIssue(withSpan([](ImageSpanFrame &span) { span.gridHeight = 3; }),
+              IssueCode::InvalidCount);
+  expectIssue(withSpan([](ImageSpanFrame &span) {
+                span.gridHeight = span.gridWidth = span.tokens = 0;
+              }),
+              IssueCode::InvalidCount);
+  ProtocolLimits onePatch;
+  onePatch.maxImagePatches = 1;
+  expectIssue(image, IssueCode::InvalidCount, onePatch);
+  expectIssue(withSpan([](ImageSpanFrame &span) { span.tokens = 2; }),
+              IssueCode::InvalidCount);
+  expectIssue(withSpan([](ImageSpanFrame &span) { span.offset = 3; }),
+              IssueCode::InvalidCount);
+  RequestFrame overlapping = image;
+  overlapping.imageSpans.push_back(image.imageSpans[0]);
+  overlapping.imagePixels.resize(2 * image.imagePixels.size());
+  expectIssue(overlapping, IssueCode::InvalidCount);
+  RequestFrame shortPixels = image;
+  shortPixels.imagePixels.pop_back();
+  expectIssue(shortPixels, IssueCode::InvalidCount);
+  RequestFrame twoImages = overlapping;
+  twoImages.imageSpans[0].offset = 0;
+  ProtocolLimits oneImage;
+  oneImage.maxImageSpans = 1;
+  CHECK(test, encodeMessage(Message{twoImages}));
+  expectIssue(twoImages, IssueCode::LimitExceeded, oneImage);
+
+  auto serialized = serializeMessage(Message{exampleRequest()});
+  auto imageWire = serializeMessage(Message{image});
+  CHECK(test, serialized && imageWire);
+  if (!serialized || !imageWire)
+    return;
+  // Only the fixed fields and the prompt tokens: drop the tokens.
+  auto emptyWire = *serialized.value;
+  emptyWire.resize(kFrameHeaderBytes + 64);
+  storeU32(emptyWire, kFrameHeaderBytes + 31, 0);
+  storeU64(emptyWire, 12, 64);
+  expectDecodeIssue(emptyWire, IssueCode::LimitExceeded);
+  const size_t spanOffset =
+      kFrameHeaderBytes + 64 + image.promptTokens.size() * 4;
+  auto tokensWire = *imageWire.value;
+  storeU32(tokensWire, spanOffset + 4, 2);
+  expectDecodeIssue(tokensWire, IssueCode::InvalidCount);
+  expectDecodeIssue(*imageWire.value, IssueCode::InvalidCount, onePatch);
+  auto outsideWire = *imageWire.value;
+  storeU32(outsideWire, spanOffset, 3);
+  expectDecodeIssue(outsideWire, IssueCode::InvalidCount);
+}
+
 std::string jsonOfExactSize(size_t bytes) {
   if (bytes < 8)
     throw std::invalid_argument("JSON size is too small");
@@ -936,6 +1024,7 @@ int main() {
     testHeaderFailures();
     testTruncationAtEveryBoundary();
     testMalformedPayloadClassification();
+    testPromptAndImageSpanRejections();
     testBoundedArbitraryStatusJson();
     testFailureTaxonomyAndCapacityEvent();
     testOverflowLimitsAndOuterTruncation();

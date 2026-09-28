@@ -7,44 +7,43 @@
 #include <sys/sysctl.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
 namespace splash::engine {
 
+namespace {
+
+// What compressing the anonymous pages frees: the share the compressor does
+// not keep at its ratio of held to own pages, at most half of them.
+uint64_t compressionSavings(const HostMemoryPages &pages) noexcept {
+  if (!pages.compressor || pages.compressed / 2 >= pages.compressor) return pages.anonymous / 2;
+  if (pages.compressed <= pages.compressor) return 0;
+  return pages.anonymous -
+         static_cast<uint64_t>(static_cast<unsigned __int128>(pages.anonymous) * pages.compressor / pages.compressed);
+}
+
+} // namespace
+
 uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
-                                     uint64_t pageSize,
-                                     uint64_t physicalMemoryBytes) noexcept {
-  if (!pageSize || !physicalMemoryBytes) return 0;
+                                     uint64_t pageSize, bool compression) noexcept {
+  // free_count includes the speculative pages, which external_page_count
+  // also counts; wired file pages are in neither.
+  if (!pageSize || statistics.speculative > statistics.free) return 0;
   const uint64_t maximum = std::numeric_limits<uint64_t>::max();
-  uint64_t usedPages = 0;
-  for (uint64_t pages : {statistics.active, statistics.inactive,
-                        statistics.speculative, statistics.wired,
-                        statistics.compressor}) {
-    if (pages > maximum - usedPages) return 0;
-    usedPages += pages;
+  uint64_t pages = statistics.free - statistics.speculative;
+  for (uint64_t reclaimable : {statistics.fileBacked, statistics.purgeable,
+                               compression ? compressionSavings(statistics) : 0}) {
+    if (reclaimable > maximum - pages) return 0;
+    pages += reclaimable;
   }
-  // Mach's external_page_count excludes wired pages. Unlike free_count,
-  // these used-page categories do not already include speculative pages.
-  if (statistics.fileBacked > usedPages) return 0;
-  usedPages -= statistics.fileBacked;
-  if (statistics.purgeable > usedPages) return 0;
-  usedPages -= statistics.purgeable;
-  if (usedPages > maximum / pageSize) return 0;
-  const uint64_t usedBytes = usedPages * pageSize;
-  return usedBytes < physicalMemoryBytes ? physicalMemoryBytes - usedBytes : 0;
+  return pages <= maximum / pageSize ? pages * pageSize : 0;
 }
 
 std::optional<uint64_t> queryHostAvailableMemory() noexcept {
-  // Physical capacity is immutable; don't add a sysctl to every allocation.
-  static const uint64_t physicalMemoryBytes = [] {
-    uint64_t bytes = 0;
-    size_t size = sizeof(bytes);
-    return sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) == 0 &&
-                   size == sizeof(bytes) ? bytes : uint64_t{0};
-  }();
-  if (!physicalMemoryBytes) return std::nullopt;
   mach_port_t host = mach_host_self();
   vm_size_t pageSize = 0;
   vm_statistics64_data_t statistics{};
@@ -59,14 +58,14 @@ std::optional<uint64_t> queryHostAvailableMemory() noexcept {
   if (statisticsResult != KERN_SUCCESS || !pageSize) return std::nullopt;
 
   return estimateHostAvailableMemory(
-      {.active = statistics.active_count,
-       .inactive = statistics.inactive_count,
+      {.free = statistics.free_count,
        .speculative = statistics.speculative_count,
-       .wired = statistics.wire_count,
-       .compressor = statistics.compressor_page_count,
        .fileBacked = statistics.external_page_count,
-       .purgeable = statistics.purgeable_count},
-      pageSize, physicalMemoryBytes);
+       .purgeable = statistics.purgeable_count,
+       .anonymous = statistics.internal_page_count,
+       .compressor = statistics.compressor_page_count,
+       .compressed = statistics.total_uncompressed_pages_in_compressor},
+      pageSize, querySystemMemoryPressure().value_or(MemoryPressure::Critical) != MemoryPressure::Critical);
 }
 
 bool ignoreHostPressure() noexcept {
@@ -136,10 +135,12 @@ MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend,
 MemoryGovernor::MemoryGovernor(
     metal::MetalBackend &backend, uint64_t limitBytes,
     uint64_t hostReserveBytes,
-    HostAvailableMemoryProvider hostAvailableMemory)
+    HostAvailableMemoryProvider hostAvailableMemory,
+    uint64_t untrackedReserveBytes)
     : backend_(backend), limitBytes_(limitBytes),
       hostReserveBytes_(hostReserveBytes),
-      hostAvailableMemory_(std::move(hostAvailableMemory)) {
+      hostAvailableMemory_(std::move(hostAvailableMemory)),
+      untrackedReserveBytes_(untrackedReserveBytes) {
   if (!limitBytes_) {
     throw std::invalid_argument("memory governor limit must be positive");
   }
@@ -170,12 +171,14 @@ MemoryGovernor::observedResidentBytes(bool refreshDevice) const noexcept {
   metal::MetalMemoryStats memory = refreshDevice
       ? backend_.refreshMemoryStats()
       : backend_.memoryStats();
+  // The backend's buffers are charged in full, the rest of the device's
+  // footprint only where it exceeds the untracked reserve.
   uint64_t accounted = memory.allocatedBytes;
-  if (memory.sparseResidentBytes <=
-      std::numeric_limits<uint64_t>::max() - accounted) {
-    accounted += memory.sparseResidentBytes;
-  } else {
-    accounted = std::numeric_limits<uint64_t>::max();
+  for (const uint64_t bytes :
+       {memory.sparseResidentBytes, untrackedReserveBytes_}) {
+    accounted = bytes <= std::numeric_limits<uint64_t>::max() - accounted
+        ? accounted + bytes
+        : std::numeric_limits<uint64_t>::max();
   }
   return std::max(accounted, memory.deviceCurrentAllocatedBytes);
 }
@@ -219,6 +222,11 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
                     requested <= limitBytes_ - observed;
   bool hostFits = ignoreHostPressure() ||
       hostHeadroomBytes(hostAvailable, requested) >= kHostWarningMarginBytes;
+  // A request that only the host headroom refuses waits for host memory
+  // while the idle headroom may still clear the margin. Hold host pressure
+  // so the paced reclaim frees toward the recovery margin for it.
+  if (engineFits && !hostFits)
+    hostConstrained_ = true;
   if (!engineFits || (!ignoreHostPressure() && (!hostFits || hostConstrained_)) ||
       pressure == MemoryPressure::Critical) {
     if (failure)
@@ -256,6 +264,13 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
+void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
+  if (outcome == ReclaimOutcome::Untargeted)
+    return;
+  std::lock_guard lock(mutex_);
+  reclaimExhausted_ = outcome == ReclaimOutcome::Exhausted;
+}
+
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   std::lock_guard lock(mutex_);
   uint64_t observed = observedResidentBytes();
@@ -269,9 +284,11 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   uint64_t hostHeadroom = hostHeadroomBytes(hostAvailable, reservedBytes_);
   MemoryPressure effectivePressure = updateEffectivePressure(
       hostAvailable, reservedBytes_);
-  bool hostGrowthAllowed = ignoreHostPressure() || (effectivePressure != MemoryPressure::Critical &&
-      !hostConstrained_ && hostHeadroom >= kHostWarningMarginBytes);
-  bool growthAllowed = (ignoreHostPressure() || hostGrowthAllowed) && used < limitBytes_;
+  bool hostGrowthAllowed = ignoreHostPressure() ||
+      (effectivePressure != MemoryPressure::Critical &&
+       !hostConstrained_ && hostHeadroom >= kHostWarningMarginBytes);
+  bool growthAllowed = (effectivePressure != MemoryPressure::Critical) &&
+                       hostGrowthAllowed && used < limitBytes_;
   return {
       limitBytes_,
       observed,
@@ -303,6 +320,7 @@ MemoryPressure MemoryGovernor::updateEffectivePressure(
   hostConstrained_ = !hostAvailable ||
       hostHeadroom < kHostWarningMarginBytes ||
       (hostConstrained_ && hostHeadroom < kHostRecoveryMarginBytes);
+  reclaimExhausted_ = reclaimExhausted_ && hostConstrained_;
   MemoryPressure next = MemoryPressure::Normal;
   if (systemPressure_ == MemoryPressure::Critical) {
     next = MemoryPressure::Critical;
@@ -339,10 +357,11 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
     return {};
   }
   if (nowMilliseconds < nextReclaimMilliseconds_)
-    return {true, false, 0};
+    return continued_.value_or(MemoryReclaimDirective{true, false, 0});
   // The host samples every 500 ms. Allow counters to settle between batches,
   // but keep responding if another application continues consuming memory.
   nextReclaimMilliseconds_ = nowMilliseconds + 500.0;
+  continued_.reset();
 
   // Missing telemetry pauses allocation, but is not evidence that live
   // cache must be discarded. Empty backing can still be returned.
@@ -362,6 +381,16 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // keeps that publication and takes the rest. A waiting request outranks it.
   return {true, false, std::min(desired, kHostWarningMarginBytes),
           !requestWaiting};
+}
+
+void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,
+                                     const MemoryReclaimResult &result) noexcept {
+  continued_.reset();
+  // Every critical pass evicts everything again by itself.
+  if (result.outcome != ReclaimOutcome::Pending || directive.evictAllUnpinnedPrefixes)
+    return;
+  continued_ = directive;
+  continued_->targetBytes -= std::min(result.releasedBytes, directive.targetBytes);
 }
 
 } // namespace splash::engine

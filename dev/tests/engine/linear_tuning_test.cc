@@ -1,7 +1,9 @@
+#include "AffineQ4Fixture.hpp"
 #include "tuning/LinearTuning.hpp"
 
+#include "metal/abi/QuantFormat.h"
+
 #include <array>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -14,6 +16,8 @@ namespace {
 using namespace splash;
 using namespace splash::ops;
 using namespace splash::ops::tuning;
+using splash::test::deterministicQ4Projection;
+using splash::test::mix;
 
 void require(bool condition, const char *message) {
   if (!condition) throw std::runtime_error(message);
@@ -35,7 +39,7 @@ void cpuContracts() {
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
              phase == LinearPhase::Prefill ? LinearEpilogue::UpWithGate : LinearEpilogue::GateUp}) {
           const LinearWorkload workload{matrix, rows, phase, epilogue};
-          const auto plans = Q4Linear(device).candidates(workload);
+          const auto plans = Linear(device).candidates(workload);
           const uint64_t bytes = linearTuningFixtureBytes(device, workload);
           const uint64_t base = uint64_t{plans.front().storageRows()} *
               (matrix.inputSize + 2 * matrix.outputSize) * 2;
@@ -71,41 +75,11 @@ void cpuContracts() {
   require(!validMeasurementOptions(options), "insufficient paired samples accepted");
 }
 
-uint32_t mix(uint32_t value) {
-  value ^= value >> 16;
-  value *= 0x7feb352d;
-  value ^= value >> 15;
-  value *= 0x846ca68b;
-  return value ^ (value >> 16);
-}
-uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return uint16_t(bits >> 16);
-}
-
-// Same deterministic StorageN256 Q4 fixture as linear_plan_test's scalar
-// oracle. The tuner must use these supplied packed bytes without copying or
-// modifying them; it owns only activation and comparison scratch.
-Q4Projection projection(metal::MetalBackend &backend, LinearMatrix matrix, uint32_t seed = 29) {
-  const uint64_t parameters = uint64_t{matrix.outputSize} * (matrix.inputSize / 64);
-  Q4Projection result{backend.allocateBuffer(parameters * 32),
-      backend.allocateBuffer(parameters * 2), backend.allocateBuffer(parameters * 2),
-      matrix.outputSize, matrix.inputSize};
-  auto *weights = static_cast<uint8_t *>(result.weights.contents());
-  auto *scales = static_cast<uint16_t *>(result.scales.contents());
-  auto *biases = static_cast<uint16_t *>(result.biases.contents());
-  for (uint64_t i = 0; i < parameters * 32; ++i) weights[i] = mix(uint32_t(i) + seed);
-  for (uint64_t i = 0; i < parameters; ++i) {
-    const float scale = 0.004f + float(mix(uint32_t(i) + seed) % 17) * 0.0001f;
-    scales[i] = bf16(scale);
-    biases[i] = bf16(-7.5f * scale);
-  }
-  return result;
-}
-uint64_t fingerprint(const Q4Projection &projection) {
+// The tuner must use the supplied packed bytes without copying or modifying
+// them; it owns only activation and comparison scratch.
+uint64_t fingerprint(const Projection &projection) {
   uint64_t hash = 14695981039346656037ULL;
-  for (const auto &buffer : {projection.weights, projection.scales, projection.biases}) {
+  for (const auto &buffer : {projection.affine().weights, projection.affine().scales, projection.affine().biases}) {
     const auto *bytes = static_cast<const uint8_t *>(buffer.contents());
     for (uint64_t i = 0; i < buffer.sizeBytes(); ++i)
       hash = (hash ^ bytes[i]) * 1099511628211ULL;
@@ -113,10 +87,34 @@ uint64_t fingerprint(const Q4Projection &projection) {
   return hash;
 }
 
-void gpuControls(metal::MetalBackend &backend, const Q4Projection &projection) {
+// Block-quantized workloads are not tuned, and a block projection never
+// reaches the tuner's reads of affine planes (which would throw
+// std::bad_variant_access instead).
+void blockInputs(metal::MetalBackend &backend, const Projection &projection) {
+  const Projection block(projection.outputSize, projection.inputSize,
+                         BlockWeights{{QuantizedSegment::planes(GGUF_FMT_Q4K, projection.outputSize,
+                                                                projection.inputSize, {}, {}, {})}});
+  const LinearWorkload affine{{projection.outputSize, projection.inputSize}, 8};
+  LinearWorkload blocks = affine;
+  blocks.weightLayout = WeightLayout::Block32;
+  const uint64_t before = backend.submissionCount();
+  const auto admit = [](uint64_t, const std::function<void()> &) -> metal::AllocationResult {
+    throw std::logic_error("invalid tuning input reached admission");
+  };
+  for (const LinearTuningInput &input : {LinearTuningInput{blocks, {{block, std::nullopt}}},
+                                         LinearTuningInput{affine, {{block, std::nullopt}}}}) {
+    const auto result = tuneLinear(backend, admit, input);
+    require(!result.complete && result.failure && result.measurements.empty(),
+            "a block tuning input was accepted");
+    rejects([&] { std::rethrow_exception(result.failure); });
+  }
+  require(backend.submissionCount() == before, "a block tuning input submitted GPU work");
+}
+
+void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
   const LinearWorkload workload{{projection.outputSize, projection.inputSize}, 8};
   const LinearTuningInput input{workload, {{projection, std::nullopt}}};
-  const auto baseline = Q4Linear(backend.capabilities()).plan(workload).configuration();
+  const auto baseline = Linear(backend.capabilities()).plan(workload).configuration();
   const uint64_t before = backend.submissionCount();
   size_t calls = 0;
   auto admit = [&](uint64_t bytes, const std::function<void()> &allocate) {
@@ -175,7 +173,7 @@ void gpuControls(metal::MetalBackend &backend, const Q4Projection &projection) {
   require(backend.healthy(), "admission failure damaged Metal health");
 }
 
-void gpuSweep(metal::MetalBackend &backend, std::span<const Q4Projection> projections,
+void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projections,
               uint32_t rows, LinearPhase phase, LinearEpilogue epilogue) {
   const auto &projection = projections.front();
   const LinearWorkload workload{{projection.outputSize, projection.inputSize}, rows, phase, epilogue};
@@ -186,7 +184,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Q4Projection> projec
         ? std::optional{weights} : std::nullopt});
     weightsBefore.push_back(fingerprint(weights));
   }
-  const auto plans = Q4Linear(backend.capabilities()).candidates(workload);
+  const auto plans = Linear(backend.capabilities()).candidates(workload);
   // A gate/up sweep mixing split-K and sequential plans computes the exact
   // gate and up projections once per representative, outside the timing.
   bool mixed = false;
@@ -250,10 +248,10 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Q4Projection> projec
       "tuning accepted a winner without independent GPU/wall agreement");
 }
 
-void gpuInterruptions(metal::MetalBackend &backend, Q4Projection &projection) {
+void gpuInterruptions(metal::MetalBackend &backend, Projection &projection) {
   const LinearWorkload workload{{projection.outputSize, projection.inputSize}, 8};
   const LinearTuningInput input{workload, {{projection, std::nullopt}}};
-  const auto plans = Q4Linear(backend.capabilities()).candidates(workload);
+  const auto plans = Linear(backend.capabilities()).candidates(workload);
   require(plans.size() > 1, "interruption fixture has no alternative");
   const auto admit = [](uint64_t, const auto &allocate) { allocate(); return true; };
   MeasurementOptions options;
@@ -281,7 +279,7 @@ void gpuInterruptions(metal::MetalBackend &backend, Q4Projection &projection) {
       result.measurements.size() == 1 && result.measurements[0].failure &&
       result.measurements[0].status == MeasurementStatus::RunFailed,
       "run callback failure was lost or retried");
-  auto *scales = static_cast<uint16_t *>(projection.scales.contents());
+  auto *scales = static_cast<uint16_t *>(projection.affine().scales.contents());
   const uint16_t saved = scales[0];
   scales[0] = 0x7fc1;
   const uint64_t beforeInvalid = backend.submissionCount();
@@ -293,11 +291,11 @@ void gpuInterruptions(metal::MetalBackend &backend, Q4Projection &projection) {
 }
 
 void gpuEveryRepresentative(metal::MetalBackend &backend,
-                            const Q4Projection &first, Q4Projection &second) {
+                            const Projection &first, Projection &second) {
   const LinearWorkload workload{{first.outputSize, first.inputSize}, 8};
   const LinearTuningInput input{workload, {{first, {}}, {second, {}}}};
-  const auto plans = Q4Linear(backend.capabilities()).candidates(workload);
-  auto *scales = static_cast<uint16_t *>(second.scales.contents());
+  const auto plans = Linear(backend.capabilities()).candidates(workload);
+  auto *scales = static_cast<uint16_t *>(second.affine().scales.contents());
   const auto saved = scales[0];
   scales[0] = 0x7fc1;
   const auto before = backend.submissionCount();
@@ -315,12 +313,12 @@ void gpuEveryRepresentative(metal::MetalBackend &backend,
 // every prefill sum and GateUp phase. Repetition cannot silently depend on
 // the preceding representative's scratch, output, or residual values.
 void gpuBatchEquivalence(metal::MetalBackend &backend,
-                         std::span<const Q4Projection> projections,
+                         std::span<const Projection> projections,
                          uint32_t rows, LinearPhase phase,
                          LinearEpilogue epilogue, bool selfComparison = false) {
   const LinearWorkload workload{{projections.front().outputSize,
       projections.front().inputSize}, rows, phase, epilogue};
-  Q4Linear linear(backend.capabilities());
+  Linear linear(backend.capabilities());
   const auto plans = linear.candidates(workload);
   const auto &baseline = plans.front();
   uint64_t gateBytes = 0;
@@ -353,7 +351,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
     auto *values = static_cast<uint16_t *>(buffer.contents());
     for (uint64_t i = 0; i < buffer.sizeBytes() / 2; ++i)
       values[i] = i < uint64_t{rows} * width
-          ? bf16(float(int(mix(uint32_t(i) + seed) % 257) - 128) / 257.0f) : 0;
+          ? floatToBf16(float(int(mix(uint32_t(i) + seed) % 257) - 128) / 257.0f) : 0;
   };
   fill(buffers.input, workload.matrix.inputSize, 1949);
   if (buffers.residual) fill(buffers.residual, workload.matrix.outputSize, 7919);
@@ -372,7 +370,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
     for (uint32_t i = 0; i < repetitions; ++i) {
       const auto &projection = projections[(first + i) % projections.size()];
       if (phase == LinearPhase::Prefill)
-        linear.addPrefillSums(graph, buffers.input, buffers.sums, workload.matrix, rows);
+        linear.addPrefillSums(graph, buffers.input, buffers.sums, projection, rows);
       linear.add(graph, buffers, projection, plan,
           epilogue == LinearEpilogue::GateUp ? &projection : nullptr);
     }
@@ -447,9 +445,11 @@ int main(int argc, char **argv) {
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
-    std::array small{projection(backend, {512, 256}), projection(backend, {512, 256}, 131),
-                    projection(backend, {512, 256}, 233)};
+    std::array small{deterministicQ4Projection(backend, {512, 256}, 29),
+                     deterministicQ4Projection(backend, {512, 256}, 131),
+                     deterministicQ4Projection(backend, {512, 256}, 233)};
     gpuControls(backend, small[0]);
+    blockInputs(backend, small[0]);
     for (uint32_t rows : {8U, 16U, 24U, 32U}) {
       gpuSweep(backend, small, rows, LinearPhase::Decode, LinearEpilogue::None);
       gpuSweep(backend, small, rows, LinearPhase::Decode, LinearEpilogue::Residual);
@@ -457,23 +457,25 @@ int main(int argc, char **argv) {
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                LinearEpilogue::UpWithGate})
       gpuSweep(backend, small, 33, LinearPhase::Prefill, epilogue);
-    std::array gate{projection(backend, {10240, 256}), projection(backend, {10240, 256}, 131)};
+    std::array gate{deterministicQ4Projection(backend, {10240, 256}, 29),
+                    deterministicQ4Projection(backend, {10240, 256}, 131)};
     for (uint32_t rows : {8U, 16U, 24U, 32U})
       gpuSweep(backend, gate, rows, LinearPhase::Decode, LinearEpilogue::GateUp);
     // K % 1024 == 0 lists the split-K tiles beside the sequential ones (and
     // selects one as the baseline on a GPU with two or more cores), so every
     // qualification crosses the bitwise class and runs the derived bound.
-    std::array split{projection(backend, {512, 1024}), projection(backend, {512, 1024}, 131)};
+    std::array split{deterministicQ4Projection(backend, {512, 1024}, 29),
+                     deterministicQ4Projection(backend, {512, 1024}, 131)};
     bool mixedClasses = false;
-    for (const auto &plan : Q4Linear(backend.capabilities()).candidates({{512, 1024}, 8}))
+    for (const auto &plan : Linear(backend.capabilities()).candidates({{512, 1024}, 8}))
       mixedClasses |= plan.partialSums() > 1;
     require(mixedClasses, "split-K candidates are missing for a K % 1024 == 0 workload");
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                LinearEpilogue::GateUp})
       gpuSweep(backend, split, 8, LinearPhase::Decode, epilogue);
-    std::vector<Q4Projection> maximum;
+    std::vector<Projection> maximum;
     for (uint32_t i = 0; i < kMaximumLinearTuningRepresentatives; ++i)
-      maximum.push_back(projection(backend, {512, 256}, 1009 + i));
+      maximum.push_back(deterministicQ4Projection(backend, {512, 256}, 1009 + i));
     gpuSweep(backend, maximum, 8, LinearPhase::Decode, LinearEpilogue::None);
     gpuInterruptions(backend, small[0]);
     gpuEveryRepresentative(backend, small[0], small[1]);

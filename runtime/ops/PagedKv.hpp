@@ -186,9 +186,11 @@ enum class ScaleType : uint32_t { None = 0, Float32 = 2 };
 enum class KeyLayout : uint32_t { TokenMajor = 1 };
 enum class ValueLayout : uint32_t { DimensionMajor = 1 };
 
-// Stable metadata for rejecting incompatible cached blocks before any block is
-// read. modelArtifactSha256 is the digest of the exact packed target artifact
-// set; geometry/layout fields remain explicit so format changes cannot alias.
+// Identity of the KV page format and of the target it belongs to:
+// modelArtifactSha256 is the digest of the exact packed target artifact set;
+// geometry/layout fields remain explicit so format changes cannot alias. Its
+// fields enter the runtime cache namespace and the status report
+// (RuntimeResources.mm, Status.cpp); nothing stores or compares the struct.
 struct alignas(8) LayoutGuard final {
   uint32_t quantization = 0;
   uint32_t scaleType = 0;

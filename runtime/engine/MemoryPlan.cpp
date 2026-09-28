@@ -73,7 +73,6 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
   if (!targetKvLayout.valid()) return "invalid_target_kv_layout";
   if (!footprint.targetWeightsBytes) return "target_weight_bytes_required";
   if (!footprint.draftWeightsBytes) return "draft_weight_bytes_required";
-  if (!footprint.visionWeightsBytes) return "vision_weight_bytes_required";
   if (!footprint.activeStateCellBytes) {
     return "active_state_cell_bytes_required";
   }
@@ -97,7 +96,7 @@ uint64_t ModelMemoryProfile::fixedRuntimeBytes() const {
            footprint.targetWeightsBytes, footprint.draftWeightsBytes,
            footprint.visionWeightsBytes, footprint.sharedPrefillBytes,
            footprint.sharedDecodeBytes, footprint.pipelineReserveBytes,
-           footprint.runtimeOverheadReserveBytes}) {
+           footprint.runtimeOverheadReserveBytes, footprint.kvStagingBytes}) {
     if (!checkedAdd(result, value, result)) {
       throw std::overflow_error("fixed runtime cost overflow");
     }
@@ -136,7 +135,8 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << "\"shared_decode_bytes\":" << model.footprint.sharedDecodeBytes << ','
       << "\"pipeline_reserve_bytes\":" << model.footprint.pipelineReserveBytes
       << ',' << "\"runtime_overhead_reserve_bytes\":"
-      << model.footprint.runtimeOverheadReserveBytes << "}}";
+      << model.footprint.runtimeOverheadReserveBytes << ','
+      << "\"kv_staging_bytes\":" << model.footprint.kvStagingBytes << "}}";
   return out.str();
 }
 
@@ -157,7 +157,8 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << "\"shared_decode_bytes\":" << sharedDecodeBytes << ','
       << "\"pipeline_reserve_bytes\":" << pipelineReserveBytes << ','
       << "\"runtime_overhead_reserve_bytes\":" << runtimeOverheadReserveBytes
-      << ',' << "\"fixed_runtime_bytes\":" << fixedRuntimeBytes << ','
+      << ',' << "\"kv_staging_bytes\":" << kvStagingBytes << ','
+      << "\"fixed_runtime_bytes\":" << fixedRuntimeBytes << ','
       << "\"dynamic_budget_bytes\":" << dynamicBudgetBytes << ','
       << "\"kv_page_tokens\":" << kvPageTokens << ','
       << "\"kv_page_bytes\":" << kvPageBytes << ','
@@ -197,6 +198,7 @@ std::string EngineMemoryBreakdown::describe() const {
       << "pipeline reserve: " << bytesAndMiB(pipelineReserveBytes) << '\n'
       << "allocator/runtime reserve: "
       << bytesAndMiB(runtimeOverheadReserveBytes) << '\n'
+      << "disk tier KV staging: " << bytesAndMiB(kvStagingBytes) << '\n'
       << "fixed runtime: " << bytesAndMiB(fixedRuntimeBytes) << '\n'
       << "elastic state/KV budget: " << bytesAndMiB(dynamicBudgetBytes) << '\n'
       << "KV page: " << kvPageTokens << " tokens, "
@@ -251,6 +253,15 @@ uint32_t EngineMemoryPlan::maximumContextTokens() const noexcept {
       std::min<uint64_t>(model_.maximumContextTokens, logicalCapacity));
 }
 
+uint32_t EngineMemoryPlan::contextTokensWithin(uint64_t memoryBytes) const {
+  if (!memoryBytes)
+    return 0;
+  const uint64_t configured = breakdown_.configuredMemoryLimitBytes;
+  const EngineMemoryPlanResult within = evaluateEngineMemoryPlan(
+      device_, model_, configured ? std::min(configured, memoryBytes) : memoryBytes);
+  return within.plan ? within.plan->maximumContextTokens() : 0;
+}
+
 std::string EngineMemoryPlan::toStatusJson() const {
   std::ostringstream out;
   out << '{' << "\"valid\":true,"
@@ -278,6 +289,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.pipelineReserveBytes = model.footprint.pipelineReserveBytes;
   breakdown.runtimeOverheadReserveBytes =
       model.footprint.runtimeOverheadReserveBytes;
+  breakdown.kvStagingBytes = model.footprint.kvStagingBytes;
   breakdown.kvPageTokens = kv::kPageTokens;
   breakdown.kvSparseMappingBatchPages =
       model.targetKvLayout.sparseMappingBatchPages();

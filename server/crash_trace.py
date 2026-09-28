@@ -4,6 +4,8 @@
 The ring keeps the newest MAX_TRACE_ENTRIES frames within MAX_TRACE_BYTES of a
 process generation, so the trace of a long-lived engine starts wherever the
 ring did: earlier frames, and whatever engine state they built up, are gone.
+A frame larger than MAX_TRACE_BYTES leaves only a marker with its header, size
+and digest; a trace that lost engine input that way cannot be replayed.
 A replay feeds the recorded client-to-engine frames back at their recorded
 offsets, re-stamping each request's absolute deadline from replay time, since
 the recorded wall-clock deadline has usually elapsed by then.
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import selectors
@@ -48,6 +51,25 @@ class _TraceEntry:
     monotonic_ns: int
     direction: str
     frame: bytes
+    # A frame over MAX_TRACE_BYTES keeps only its header, size and digest.
+    omitted_bytes: int = 0
+    sha256: str = ""
+
+    def as_dict(self, started_ns: int) -> dict:
+        item = {
+            "offset_micros": max(0, (self.monotonic_ns - started_ns) // 1000),
+            "direction": self.direction,
+        }
+        encoded = base64.b64encode(self.frame).decode("ascii")
+        if self.omitted_bytes:
+            item.update(
+                header_base64=encoded,
+                omitted_bytes=self.omitted_bytes,
+                sha256=self.sha256,
+            )
+        else:
+            item["frame_base64"] = encoded
+        return item
 
 
 class CrashTraceRing:
@@ -90,12 +112,16 @@ class CrashTraceRing:
         if not self.active:
             return
         encoded = bytes(frame)
+        omitted, digest = 0, ""
         if len(encoded) > MAX_TRACE_BYTES:
-            return
+            omitted, digest = len(encoded), hashlib.sha256(encoded).hexdigest()
+            encoded = encoded[: wire.FRAME_HEADER_BYTES]
         with self._lock:
             if generation != self._generation:
                 return
-            self._entries.append(_TraceEntry(time.monotonic_ns(), direction, encoded))
+            self._entries.append(
+                _TraceEntry(time.monotonic_ns(), direction, encoded, omitted, digest)
+            )
             self._bytes += len(encoded)
             while (
                 len(self._entries) > MAX_TRACE_ENTRIES or self._bytes > MAX_TRACE_BYTES
@@ -103,7 +129,8 @@ class CrashTraceRing:
                 self._bytes -= len(self._entries.popleft().frame)
 
     def record_frame(self, generation: int, direction: str, frame: wire.Frame) -> None:
-        self.record_bytes(generation, direction, wire.serialize_frame(frame))
+        if self.active:
+            self.record_bytes(generation, direction, wire.serialize_frame(frame))
 
     def dump(
         self,
@@ -138,14 +165,8 @@ class CrashTraceRing:
                 if last_status is not None
                 else None
             ),
-            "frames": [
-                {
-                    "offset_micros": max(0, (entry.monotonic_ns - started_ns) // 1000),
-                    "direction": entry.direction,
-                    "frame_base64": base64.b64encode(entry.frame).decode("ascii"),
-                }
-                for entry in entries
-            ],
+            "frames": [entry.as_dict(started_ns) for entry in entries],
+            "omitted_frames": sum(entry.omitted_bytes > 0 for entry in entries),
         }
         try:
             DEFAULT_TRACE_DIRECTORY.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -217,6 +238,11 @@ def replay(path: Path) -> int:
     for item in document["frames"]:
         if not isinstance(item, dict) or item.get("direction") != "client_to_engine":
             continue
+        if "omitted_bytes" in item:
+            raise ValueError(
+                "crash trace omits a client-to-engine frame too large to record; "
+                "it cannot be replayed"
+            )
         offset = item.get("offset_micros")
         encoded = item.get("frame_base64")
         if type(offset) is not int or offset < 0 or not isinstance(encoded, str):

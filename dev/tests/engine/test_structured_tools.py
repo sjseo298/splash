@@ -119,6 +119,26 @@ class StructuredToolGrammarTest(unittest.TestCase):
             OTHER_CALL, choice={"type": "function", "function": {"name": "lookup"}}
         )
 
+    def test_none_keeps_the_tools_but_lets_no_call_start(self):
+        # The prompt renders the tools as for any choice; only output changes.
+        tools, none = tool_schema.normalize_tools(TOOLS, "none", True)
+        self.assertEqual((tools, none.schemas, none.required), (TOOLS, {}, False))
+        self.assert_complete(ANSWER, choice="none")
+        for text in (CALL, ANSWER + CALL, "plain answer"):
+            with self.subTest(text=text):
+                self.assert_not_complete(text, choice="none")
+        grammar = tool_schema.tool_grammar(none, False)
+        for text, complete in (("plain answer", True), ("see " + CALL, False)):
+            with self.subTest(text=text):
+                matcher = LLMatcher(self.guidance, grammar)
+                tokens = self.tokenizer.encode(text).ids
+                accepted = (
+                    matcher.validate_tokens(tokens) == len(tokens)
+                    and matcher.consume_tokens(tokens)
+                    and matcher.is_accepting()
+                )
+                self.assertEqual(accepted, complete)
+
     def test_parallel_false_excludes_a_second_call(self):
         for choice in ("auto", "required"):
             with self.subTest(choice=choice):
@@ -161,6 +181,24 @@ class StructuredToolGrammarTest(unittest.TestCase):
                     "Reason through this. </think>" + text, thinking=True
                 )
                 self.assert_not_complete(text, thinking=True)
+
+    def test_thinking_cannot_spell_its_close_in_text(self):
+        # The reasoning splitter ends thinking at the first decoded
+        # "</think>", so an ordinary-token spelling must not stay in thinking.
+        close = self.tokenizer.token_to_id("</think>")
+        with mock.patch.object(tool_schema, "THINK_END_TOKEN_ID", close):
+            grammars = {
+                "json": tool_schema.json_grammar(SCHEMA, True),
+                "tools": tool_schema.tool_grammar(policy(), True, SCHEMA),
+            }
+        tokens = [*b"Reason. </think> More.", close, *ANSWER.encode()]
+        for name, grammar in grammars.items():
+            with self.subTest(grammar=name):
+                self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
+                matcher = LLMatcher(self.guidance, grammar)
+                self.assertEqual(
+                    matcher.validate_tokens(tokens), len(b"Reason. </think")
+                )
 
     def test_truncated_json_and_tool_prefixes_remain_nonterminal(self):
         for text in ('{"answer":', CALL.partition("</parameter>")[0]):

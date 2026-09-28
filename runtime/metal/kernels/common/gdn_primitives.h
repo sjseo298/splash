@@ -36,30 +36,59 @@ inline bfloat gdn_conv_carry(device const bfloat *packed,
 // The gates of one (token, value head): beta = sigmoid(b) and
 // decay = exp(a_scale * softplus(bf16(a + dt_bias))), the softplus rounded to
 // bf16 as the reference does.
-inline void gdn_write_gates(device const bfloat *packed_row,
-                            device const bfloat *dt_bias,
-                            device const float *a_scale, uint b_offset,
-                            uint a_offset, uint head, device bfloat &beta,
-                            device float &decay) {
+struct GdnGates {
+  bfloat beta;
+  float decay;
+};
+
+inline GdnGates gdn_gates(device const bfloat *packed_row,
+                          device const bfloat *dt_bias,
+                          device const float *a_scale, uint b_offset,
+                          uint a_offset, uint head) {
   float b = float(packed_row[b_offset + head]);
-  beta = bfloat(1.0f / (1.0f + fast::exp2(-1.44269504089f * b)));
+  GdnGates gates;
+  gates.beta = bfloat(1.0f / (1.0f + fast::exp2(-1.44269504089f * b)));
   bfloat x = bfloat(float(packed_row[a_offset + head]) + float(dt_bias[head]));
   float xf = float(x);
   bfloat softplus =
       bfloat(max(xf, 0.0f) +
              fast::log2(1.0f + fast::exp2(-1.44269504089f * abs(xf))) *
                  0.69314718056f);
-  decay = fast::exp(a_scale[head] * float(softplus));
+  gates.decay = fast::exp(a_scale[head] * float(softplus));
+  return gates;
+}
+
+inline void gdn_write_gates(device const bfloat *packed_row,
+                            device const bfloat *dt_bias,
+                            device const float *a_scale, uint b_offset,
+                            uint a_offset, uint head, device bfloat &beta,
+                            device float &decay) {
+  const GdnGates gates =
+      gdn_gates(packed_row, dt_bias, a_scale, b_offset, a_offset, head);
+  beta = gates.beta;
+  decay = gates.decay;
+}
+
+// The position of value head `head` among the GDN output's head blocks: the
+// head itself, or with `tiled` llama.cpp's GGUF order, which puts value head
+// j of every key head next to each other (GDNGatePrefillParams).
+template <uint KeyHeads, uint ValueHeads>
+inline uint gdn_output_head(uint head, bool tiled) {
+  constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
+  return tiled ? (head % HeadsPerKey) * KeyHeads + head / HeadsPerKey : head;
 }
 
 // Gated RMSNorm of the recurrent rows, one task per (token, value head) and
-// one lane per dimension. Decode walks a lane's rows persistently; prefill
-// dispatches one task per threadgroup.
-template <uint ValueHeads, uint HeadDim, uint ConvDim, uint Simdgroups = 8>
+// one lane per dimension, stored at the head's output position. Prefill
+// dispatches one task per threadgroup; decode runs gdn_decode_gate, which
+// reproduces these rows bitwise. The norm weights are read in their stored
+// type W: bfloat in the packed formats, float for a GGUF's F32 norms.
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
+          uint Simdgroups = 8, class W>
 inline void
 gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
-               device const bfloat *norm_weight, device bfloat *hidden,
-               uint tasks, uint groups, uint packed_width,
+               device const W *norm_weight, device bfloat *hidden,
+               uint tasks, uint groups, uint packed_width, bool tiled,
                threadgroup float *scratch, uint group, uint thread_index,
                uint lane, uint simd_group) {
   constexpr uint ZOffset = ConvDim;
@@ -67,6 +96,10 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
     uint token = task / ValueHeads;
     uint head = task % ValueHeads;
     ulong base = ulong(task) * HeadDim;
+    ulong hidden_base =
+        (ulong(token) * ValueHeads +
+         gdn_output_head<KeyHeads, ValueHeads>(head, tiled)) *
+        HeadDim;
     float value =
         thread_index < HeadDim ? float(recurrent[base + thread_index]) : 0.0f;
     float square_sum = simd_sum(value * value);
@@ -86,7 +119,7 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
       float gate = float(packed[token * packed_width + ZOffset +
                                 head * HeadDim + thread_index]);
       float silu = gate / (1.0f + fast::exp2(-1.44269504089f * gate));
-      hidden[base + thread_index] = bfloat(float(normalized) * silu);
+      hidden[hidden_base + thread_index] = bfloat(float(normalized) * silu);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

@@ -162,6 +162,35 @@ class ConstraintCacheTests(unittest.TestCase):
         self.assertEqual(factory.create("shared"), "shared")
         self.assertEqual(factory.stats()["misses"], 1)
 
+    def test_compiler_errors_are_reported_without_internals(self):
+        from dev.tests.engine.test_structured_tools import StructuredToolGrammarTest
+        from server import tool_schema
+
+        StructuredToolGrammarTest.setUpClass()
+        with mock.patch.object(
+            constraints,
+            "guidance_tokenizer",
+            return_value=StructuredToolGrammarTest.guidance,
+        ):
+            factory = constraints.ConstraintFactory(object())
+        unsatisfiable = {"type": "array", "minItems": 5, "maxItems": 2}
+        # More grammar symbols than the compiler can index make it panic.
+        array = {"type": "array", "maxItems": tool_schema.MAX_GRAMMAR_BOUND}
+        oversized = {"properties": {f"p{i}": array for i in range(1000)}}
+        for schema, reason in (
+            (unsatisfiable, "minItems (5) is greater than maxItems (2)"),
+            (oversized, "tool or output schema is too large to compile"),
+        ):
+            with (
+                self.subTest(reason=reason),
+                self.assertRaises(constraints.APIError) as caught,
+            ):
+                factory.create(tool_schema.json_grammar(schema, False))
+            self.assertEqual(caught.exception.status, 400)
+            self.assertIn(reason, caught.exception.message)
+            self.assertNotIn("\n", caught.exception.message)
+            self.assertNotIn("%llguidance", caught.exception.message)
+
     def test_real_matchers_compile_and_copy_independently_under_concurrency(self):
         from dev.tests.engine.test_structured_tools import StructuredToolGrammarTest
 

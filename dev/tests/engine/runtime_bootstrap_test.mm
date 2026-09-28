@@ -159,40 +159,6 @@ void testInstalledManifestBindsExecutionGeometry() {
   }
 }
 
-void testDescriptorRetainsInspectedManifestDigest() {
-  TemporaryModelRoot root, identicalRoot;
-  std::string manifest = executionManifest();
-  manifest.pop_back();
-  manifest += ",\"artifacts\":[{\"path\":\"target/shared.bin\",\"sha256\":\"" +
-              std::string(64, 'a') + "\"}]}";
-  root.write(manifest);
-  identicalRoot.write(manifest);
-  const auto inspected = model::inspectModelPackage(root.path());
-  const auto originalDigest = inspected.packageManifestSha256;
-  require(std::any_of(originalDigest.begin(), originalDigest.end(),
-                      [](uint8_t byte) { return byte != 0; }),
-          "inspected descriptor omitted its package manifest digest");
-  require(model::inspectModelPackage(root.path()).packageManifestSha256 == originalDigest &&
-              model::inspectModelPackage(identicalRoot.path()).packageManifestSha256 == originalDigest,
-          "identical manifest bytes produced different package digests");
-
-  std::string changedArtifact = manifest;
-  const size_t artifactDigest = changedArtifact.find(std::string(64, 'a'));
-  require(artifactDigest != std::string::npos, "test manifest lost its artifact digest");
-  changedArtifact[artifactDigest] = 'b';
-  root.write(changedArtifact);
-  require(model::inspectModelPackage(root.path()).packageManifestSha256 != originalDigest,
-          "package manifest digest omitted an artifact SHA-256 change");
-  require(inspected.packageManifestSha256 == originalDigest,
-          "rewriting a manifest changed an already inspected descriptor");
-
-  root.write(manifest + "\n");
-  require(model::inspectModelPackage(root.path()).packageManifestSha256 != originalDigest,
-          "package manifest digest did not identify the exact parsed bytes");
-  require(inspected.packageManifestSha256 == originalDigest,
-          "later raw manifest edits changed the loaded descriptor digest");
-}
-
 void testRuntimeCacheNamespaceBindsIdentityOnce() {
   constexpr kv::Layout kvLayout{16, 4, 256};
   const std::string combinedA(64, 'a');
@@ -272,7 +238,10 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
       actual.sharedDecodeBytes + actual.kvResidentBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
   actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes;
-  actual.estimatedWarmupPeakBytes = actual.backendAllocatedBytes;
+  // Model warmup estimates add the pipeline and runtime reserves.
+  actual.estimatedWarmupPeakBytes = actual.backendAllocatedBytes +
+                                    budget.pipelineReserveBytes +
+                                    budget.runtimeOverheadReserveBytes;
   return actual;
 }
 
@@ -399,7 +368,7 @@ public:
           int throwingStep = -1, bool failReadyWrite = false)
       : backing_(16), pool_(backing_),
         resources_(pool_, CacheNamespace{}),
-        executor_(validActual(plan).devicePeakAllocatedBytes, failingStep,
+        executor_(validActual(plan).estimatedWarmupPeakBytes, failingStep,
                   throwingStep),
         loop_(
             loopConfig(), resources_, executor_,
@@ -439,7 +408,7 @@ void testAllNativeWarmupsPrecedeReady() {
   auto report = engine::RuntimeBootstrap::requireWarmupAndAnnounce(
       plan, harness.executor(),
       [&](uint64_t estimate) {
-        require(estimate == actual.devicePeakAllocatedBytes,
+        require(estimate == actual.estimatedWarmupPeakBytes,
                 "bootstrap lost the maximum measured peak");
         actual.estimatedWarmupPeakBytes = estimate;
         return actual;
@@ -765,13 +734,64 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
   }
 }
 
+void testStartupRetryWindowOpensAtFirstFailure() {
+  using namespace std::chrono_literals;
+  RuntimeBootstrapReport failure;
+  failure.resourceFailure = RuntimeResourceFailure::HostCapacity;
+  StartupRetryWindow window(30s);
+  // A cold start fails for the first time after minutes of preparation.
+  const auto first = StartupRetryWindow::Clock::time_point{} + 5min;
+  require(window.retryUntil(failure, first) == first + 30s &&
+              window.retryUntil(failure, first + 29s) == first + 30s &&
+              !window.retryUntil(failure, first + 30s),
+          "the startup retry window did not open at the first failure");
+  // A retry that fails later in startup made progress: a new window opens.
+  // Failing again at that stage or before does not extend it.
+  failure.stage = RuntimeBootstrapStage::MaximumPrefill;
+  require(window.retryUntil(failure, first + 40s) == first + 70s,
+          "progress to a later startup stage did not open a new window");
+  for (auto stage : {RuntimeBootstrapStage::MaximumPrefill,
+                     RuntimeBootstrapStage::ResourceAssembly}) {
+    failure.stage = stage;
+    require(window.retryUntil(failure, first + 50s) == first + 70s,
+            "a failure without progress extended the retry window");
+  }
+  failure.resourceFailure = RuntimeResourceFailure::DriverAllocation;
+  require(StartupRetryWindow(30s).retryUntil(failure, first) == first + 30s,
+          "a driver allocation failure was not retried");
+  for (auto other : {RuntimeResourceFailure::Other,
+                     RuntimeResourceFailure::EngineCapacity}) {
+    failure.resourceFailure = other;
+    require(!StartupRetryWindow(30s).retryUntil(failure, first),
+            "a failure that cannot recover was retried");
+  }
+}
+
+// The disk tier suggestion follows the plan within the host's headroom
+// beyond its reserve and the warning margin; a host with no more than those
+// holds nothing.
+void testMemoryMayNotHoldBeyondHostHeadroom() {
+  const EngineMemoryPlan plan = memoryPlan();
+  const auto &budget = plan.breakdown();
+  const uint64_t held = EngineMemoryPolicy::hostAvailableReserveBytes(
+                            budget.physicalMemoryBytes) +
+                        kHostWarningMarginBytes;
+  const uint64_t available = held + budget.minimumRequiredBytes + 64 * kMiB;
+  const uint32_t fits = plan.contextTokensWithin(available - held);
+  require(fits && fits < plan.maximumContextTokens() &&
+              !memoryMayNotHold(plan, available, fits) &&
+              memoryMayNotHold(plan, available, fits + 1) &&
+              !memoryMayNotHold(plan, 64 * kGiB, plan.maximumContextTokens()) &&
+              memoryMayNotHold(plan, held, 1),
+          "the disk tier suggestion does not follow the host's headroom");
+}
+
 } // namespace
 
 int main() {
   try {
     testWarmupLaneComparisons();
     testInstalledManifestBindsExecutionGeometry();
-    testDescriptorRetainsInspectedManifestDigest();
     testRuntimeCacheNamespaceBindsIdentityOnce();
     testAllNativeWarmupsPrecedeReady();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();
@@ -782,6 +802,8 @@ int main() {
     testEveryWarmupFailureIsFailClosed();
     testWarmupErrorsCannotMasqueradeAsMemoryLimits();
     testExceptionsMemoryAndReadyWriteAreFailClosed();
+    testStartupRetryWindowOpensAtFirstFailure();
+    testMemoryMayNotHoldBeyondHostHeadroom();
     std::cout << "native bootstrap tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

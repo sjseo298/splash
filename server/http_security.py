@@ -47,29 +47,40 @@ def _authority(value):
     return parsed.hostname.lower().rstrip("."), parsed.port
 
 
+def _forbidden(message):
+    return APIError(403, message, "forbidden")
+
+
 def validate_headers(headers, allowed_hosts):
     hosts = headers.get_all("Host", [])
     origins = headers.get_all("Origin", [])
+    if len(hosts) != 1 or len(origins) > 1:
+        raise _forbidden("expected one Host header and at most one Origin header")
     try:
-        if len(hosts) != 1 or len(origins) > 1:
-            raise ValueError("ambiguous authority")
         host, port = _authority(hosts[0])
-        if host not in allowed_hosts:
-            raise ValueError("untrusted authority")
-        if origins:
-            origin = urlsplit(origins[0])
-            if origin.scheme not in ("http", "https") or origin.path:
-                raise ValueError("invalid origin")
-            if origin.query or origin.fragment:
-                raise ValueError("invalid origin")
-            origin_host, origin_port = _authority(origin.netloc)
-            default_port = 443 if origin.scheme == "https" else 80
-            if (origin_host, default_port if origin_port is None else origin_port) != (
-                host,
-                default_port if port is None else port,
-            ):
-                raise ValueError("cross-origin request")
     except ValueError:
-        raise APIError(
-            403, "request authority or origin is not allowed", "forbidden"
-        ) from None
+        raise _forbidden("invalid Host header") from None
+    if host not in allowed_hosts:
+        # Only the bind address, loopback and --allowed-host names are served,
+        # which keeps DNS-rebound pages out. Name the fix for the operator.
+        raise _forbidden(
+            f"Host {host} is not allowed; restart the server with "
+            f"--allowed-host {host} to accept it"
+        )
+    if not origins:
+        return
+    try:
+        origin = urlsplit(origins[0])
+        if origin.scheme not in ("http", "https") or origin.path:
+            raise ValueError("invalid origin")
+        if origin.query or origin.fragment:
+            raise ValueError("invalid origin")
+        origin_host, origin_port = _authority(origin.netloc)
+    except ValueError:
+        raise _forbidden("invalid Origin header") from None
+    default_port = 443 if origin.scheme == "https" else 80
+    if (origin_host, default_port if origin_port is None else origin_port) != (
+        host,
+        default_port if port is None else port,
+    ):
+        raise _forbidden("cross-origin requests are not allowed")

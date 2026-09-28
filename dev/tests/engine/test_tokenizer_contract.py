@@ -67,6 +67,8 @@ class TokenizerContractTests(unittest.TestCase):
         http = mock.Mock()
         with (
             mock.patch.object(server, "parse_args", return_value=args),
+            mock.patch.object(server.signal, "signal"),
+            mock.patch.object(server, "load_thinking_key", return_value=None),
             mock.patch.object(
                 server.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),

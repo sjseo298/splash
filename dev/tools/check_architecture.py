@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import ast
+import posixpath
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm", ".metal"}
-INCLUDE = re.compile(r'^\s*#(?:include|import)\s+["<]([^">]+)[">]', re.MULTILINE)
+INCLUDE = re.compile(r'^\s*#\s*(?:include|import)\s*(["<])([^">]+)[">]', re.MULTILINE)
 OPERATOR_WORKSPACE_POLICY = re.compile(
     r"\b(?:PrefillAttentionWave|prefillAttentionTiles|"
     r"kQ8VerifySplits|kQ8PrefillAttentionTileRows|"
@@ -35,6 +36,29 @@ def production_sources() -> list[Path]:
 
 def relative(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
+
+
+def include_paths(path: Path, text: str) -> list[str]:
+    """Each include of a runtime source as the path below runtime/ the
+    compiler reads: a quoted include beside the including file if it is
+    there, else on -Iruntime."""
+    result = []
+    for delimiter, include in INCLUDE.findall(text):
+        beside = posixpath.normpath((path.parent / include).as_posix())
+        if delimiter == '"' and Path(beside).is_file():
+            include = posixpath.relpath(beside, (ROOT / "runtime").as_posix())
+        result.append(posixpath.normpath(include))
+    return result
+
+
+def imported_module(call: ast.Call) -> str | None:
+    """The module an importlib.import_module or __import__ call names."""
+    name = getattr(call.func, "attr", getattr(call.func, "id", None))
+    if name in ("import_module", "__import__") and call.args:
+        argument = call.args[0]
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            return argument.value
+    return None
 
 
 def check_server_dependencies() -> list[str]:
@@ -63,6 +87,10 @@ def check_server_dependencies() -> list[str]:
                     alias.name.removeprefix("server.").split(".")[0]
                     for alias in node.names
                 )
+            elif isinstance(node, ast.Call) and (module := imported_module(node)):
+                dependencies.add(
+                    module.lstrip(".").removeprefix("server.").split(".")[0]
+                )
         for dependency in sorted(dependencies & blocked):
             errors.append(f"{relative(path)}: imports upper serving layer {dependency}")
     return errors
@@ -78,7 +106,7 @@ def check() -> list[str]:
         if path.exists():
             errors.append(f"obsolete production directory exists: {relative(path)}")
 
-    forbidden_metal_dependencies = ("engine/", "model/")
+    forbidden_metal_dependencies = ("engine/", "model/", "ops/")
     forbidden_model_dependencies = ("engine/",)
     forbidden_operator_dependencies = ("engine/", "model/")
     engine_assembly_sources = {
@@ -92,8 +120,11 @@ def check() -> list[str]:
         "model/ModelFactory.hpp",
         "model/Qwen3_6Moe.hpp",
         "model/Qwen3_8.hpp",
+        "model/QwenHybridLayout.hpp",
         "model/QwenState.hpp",
         "model/QwenTarget.hpp",
+        "model/QwenTargetFiles.hpp",
+        "model/QwenTargetLoader.hpp",
         "model/Runtime.hpp",
         "model/WeightStore.hpp",
     )
@@ -103,19 +134,19 @@ def check() -> list[str]:
     for path in production_sources():
         name = relative(path)
         text = path.read_text(errors="replace")
-        includes = INCLUDE.findall(text)
+        includes = include_paths(path, text)
         for include in includes:
             if include.startswith("tuning/"):
                 errors.append(f"{name}: production depends on offline tuning {include}")
         if name.startswith("runtime/metal/"):
             for include in includes:
-                if any(part in include for part in forbidden_metal_dependencies):
+                if include.startswith(forbidden_metal_dependencies):
                     errors.append(
                         f"{name}: Metal depends on production layer {include}"
                     )
         if name.startswith("runtime/model/"):
             for include in includes:
-                if any(part in include for part in forbidden_model_dependencies):
+                if include.startswith(forbidden_model_dependencies):
                     errors.append(f"{name}: model depends on engine layer {include}")
             if re.search(r"\b(?:graph|commandGraph)\.add\s*\(", text):
                 errors.append(f"{name}: model dispatches a Metal pipeline directly")
@@ -125,7 +156,7 @@ def check() -> list[str]:
                 errors.append(f"{name}: {layer} owns an operator workspace policy")
         if name.startswith("runtime/ops/"):
             for include in includes:
-                if any(part in include for part in forbidden_operator_dependencies):
+                if include.startswith(forbidden_operator_dependencies):
                     errors.append(
                         f"{name}: operator depends on upper production layer {include}"
                     )

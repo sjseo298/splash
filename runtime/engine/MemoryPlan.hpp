@@ -30,6 +30,10 @@ struct ModelMemoryFootprint final {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  // Metal staging of the disk tier's KV transfers, set aside whenever
+  // --max-cache-disk is set, even if the tier then fails to start; zero
+  // without the flag.
+  uint64_t kvStagingBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -109,6 +113,7 @@ struct EngineMemoryBreakdown {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  uint64_t kvStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
   // All active state cells, cached composite states, and physical KV
@@ -159,6 +164,9 @@ public:
   // pool is shared dynamically, but one admitted request is never promised
   // more than either the model supports or the complete pool can hold.
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
+  // The ceiling this plan would advertise with at most memoryBytes, within
+  // its configured limit; zero when one request cannot fit there.
+  [[nodiscard]] uint32_t contextTokensWithin(uint64_t memoryBytes) const;
 
   [[nodiscard]] std::string toStatusJson() const;
 

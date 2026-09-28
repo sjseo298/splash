@@ -158,6 +158,12 @@ def refresh(timeout: float = TIMEOUT_SECONDS, destination: Path | None = None) -
     return True
 
 
+def _offline() -> bool:
+    """HF_HUB_OFFLINE, as huggingface_hub reads it: the Hub must not be asked."""
+    value = os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE")
+    return (value or "").upper() in {"1", "ON", "YES", "TRUE"}
+
+
 def spawn_refresh() -> None:
     """Refresh the cache in a detached child, if it looks stale.
 
@@ -165,7 +171,7 @@ def spawn_refresh() -> None:
     be a thread. It is deliberately fire-and-forget: the caller never learns
     the outcome, and a failure is indistinguishable from not having run.
     """
-    if not is_stale():
+    if not is_stale() or _offline():
         return
     try:
         subprocess.Popen(

@@ -56,6 +56,8 @@ public:
         ++mappingAttempts;
         if (!admission) return false;
         if (failExtent && extent == *failExtent) return false;
+        if (throwExtent && extent == *throwExtent)
+            throw std::runtime_error("test mapping failure");
         resident_.at(extent) = true;
         return true;
     }
@@ -83,6 +85,7 @@ public:
     }
     bool admission = true;
     std::optional<uint32_t> failExtent;
+    std::optional<uint32_t> throwExtent;
     uint32_t mappingAttempts = 0;
     uint32_t releasedExtents = 0;
 
@@ -139,6 +142,55 @@ void testFailedGrowthRollsBackAtomically() {
                 backing.mappingAttempts == 2 &&
                 backing.releasedExtents == 1,
             "failed physical growth leaked references or backing");
+}
+
+// A failed acquisition returns the extents it mapped the way reclaim does:
+// only while the backing is ready, so the rollback never waits behind an
+// in-flight release. The rest stay resident and reclaimable.
+void testFailedGrowthRollbackIsPaced() {
+    for (bool releaseInFlight : {false, true}) {
+        TestBacking backing(12, 4);
+        backing.failExtent = 2;
+        backing.pacedReleases = true;
+        backing.ready = !releaseInFlight;
+        KvPool pool(backing);
+        auto pages = pool.acquirePages(9, false);
+        const uint32_t released = releaseInFlight ? 0 : 1;
+        auto status = pool.snapshot();
+        require(!pages.granted() && backing.releasedExtents == released &&
+                    status.pagesResident == 4 * (2 - released) &&
+                    status.reclaimableExtents == 2 - released &&
+                    status.pagesFree == 12 && status.pagesActive == 0,
+                "allocation rollback released backing behind a release");
+        backing.ready = true;
+        require(pool.reclaimEmptyExtents(false) == 1 &&
+                    backing.releasedExtents == released + 1,
+                "rolled-back extent was not left to paced reclaim");
+    }
+}
+
+// A backing that throws while mapping leaves every page free and the
+// accounting whole; the extent mapped before it stays resident and
+// reclaimable, and the pool keeps serving.
+void testThrowingBackingKeepsAccounting() {
+    TestBacking backing(12, 4);
+    backing.throwExtent = 1;
+    KvPool pool(backing);
+    bool threw = false;
+    try {
+        static_cast<void>(pool.acquirePages(5, false));
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    auto status = pool.snapshot();
+    require(threw && status.pagesFree == 12 && status.pagesActive == 0 &&
+                status.pagesFreeResident == 4 && status.pagesResident == 4 &&
+                status.reclaimableExtents == 1,
+            "throwing backing leaked pages or broke residency accounting");
+    backing.throwExtent.reset();
+    auto pages = pool.acquirePages(5, false);
+    require(pages.granted() && pool.snapshot().pagesActive == 5,
+            "pool did not serve after a throwing backing");
 }
 
 void testPressureReusesResidentPagesAndDeniesGrowth() {
@@ -320,6 +372,8 @@ int main() {
         testReleaseProgressIncludesAllocationRollback();
         testGrowthPacksResidentExtents();
         testFailedGrowthRollsBackAtomically();
+        testFailedGrowthRollbackIsPaced();
+        testThrowingBackingKeepsAccounting();
         testPressureReusesResidentPagesAndDeniesGrowth();
         testReleasesArePacedBehindTheBacking();
         testFullestExtentFillsFirstSoColdExtentsDrain();

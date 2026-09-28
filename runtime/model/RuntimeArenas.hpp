@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <array>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -134,20 +135,24 @@ enum class PrefillTensor : uint32_t {
   DraftRopeSin,
   ChunkKeys,
   ChunkValues,
-  MoeSelectedExperts,
-  MoeRoutingWeights,
-  MoeTileDescriptors,
-  MoeTileCount,
-  MoeGroupedRoutes,
-  MoeRouteRows,
-  MoeGroupedInput,
-  MoeExpertIntermediate,
-  MoeExpertOutput,
+  // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
+  MoeScratch,
+  MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
+  LinearPartials,
+  LinearCounters,
+  // The rotated input of a rotated projection (ops::LinearScratch::rotated).
+  LinearRotated,
   Count,
 };
 
 constexpr uint32_t prefillTensorCount =
     static_cast<uint32_t>(PrefillTensor::Count);
+
+// The arena tensor of MoE scratch field `field` (ops::kMoeScratchFields).
+template <class Tensor>
+constexpr Tensor moeScratchTensor(size_t field) noexcept {
+  return static_cast<Tensor>(static_cast<uint32_t>(Tensor::MoeScratch) + field);
+}
 
 // Sizes depend on the geometry and the installed operator choices; the arena
 // bounds include the operator defaults and every installed configuration.
@@ -189,10 +194,20 @@ public:
       draft[dim] = std::pow(geometry.draft.rotaryTheta,
                             -static_cast<float>(dim) / draftRotaryPairs);
     }
+    // Split projections return their counters to zero; they start there.
+    if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
+      std::memset(counters.contents(), 0, counters.sizeBytes());
   }
 
   [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor) const {
     return tensors_[static_cast<uint32_t>(tensor)];
+  }
+  [[nodiscard]] ops::MoeScratch moeScratch() const {
+    ops::MoeScratch scratch;
+    for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
+      scratch.*ops::kMoeScratchFields[field].buffer =
+          get(moeScratchTensor<PrefillTensor>(field));
+    return scratch;
   }
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
@@ -272,15 +287,9 @@ enum class DecodeTensor : uint32_t {
   VerifyBetaBase,
   ChunkKeysBase,
   ChunkValuesBase,
-  MoeSelectedExperts,
-  MoeRoutingWeights,
-  MoeTileDescriptors,
-  MoeTileCount,
-  MoeGroupedRoutes,
-  MoeRouteRows,
-  MoeGroupedInput,
-  MoeExpertIntermediate,
-  MoeExpertOutput,
+  // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
+  MoeScratch,
+  MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
   Count,
 };
 
@@ -345,18 +354,21 @@ public:
       gateScratch_ = backend_.allocateBuffer(
           denseScratchBytes, metal::BufferStorage::Private, "qwen-gate-scratch");
     }
+    // Each field exists only when some plan uses it (split-only plans have
+    // partials and counters but no activation table).
     const auto linearSize = linearScratchSize(geometry_, operators);
-    if (linearSize.bytes()) {
-      linearScratch_.input = backend_.allocateBuffer(
-          linearSize.input, metal::BufferStorage::Private, "q4-input");
-      linearScratch_.sums = backend_.allocateBuffer(
-          linearSize.sums, metal::BufferStorage::Private, "q4-sums");
-      linearScratch_.partials = backend_.allocateBuffer(
-          linearSize.partials, metal::BufferStorage::Private, "q4-partials");
-      linearScratch_.counters = backend_.allocateBuffer(
-          linearSize.counters, metal::BufferStorage::Shared, "q4-counters");
+    const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {
+      return bytes ? backend_.allocateBuffer(bytes, storage, label) : metal::MetalBuffer{};
+    };
+    linearScratch_.input = allocate(linearSize.input, metal::BufferStorage::Private, "q4-input");
+    linearScratch_.sums = allocate(linearSize.sums, metal::BufferStorage::Private, "q4-sums");
+    linearScratch_.partials =
+        allocate(linearSize.partials, metal::BufferStorage::Private, "q4-partials");
+    linearScratch_.counters =
+        allocate(linearSize.counters, metal::BufferStorage::Shared, "q4-counters");
+    linearScratch_.rotated = allocate(linearSize.rotated, metal::BufferStorage::Private, "linear-rotated");
+    if (linearSize.counters)
       std::memset(linearScratch_.counters.contents(), 0, linearSize.counters);
-    }
     bytes_ = checkedAdd(checkedAdd(baseBytes, denseScratchBytes, "decode arena"),
                         linearSize.bytes(), "Q4 decode scratch");
   }
@@ -388,6 +400,14 @@ public:
                          uint64_t{lanes} * sizes_[index]);
   }
 
+  [[nodiscard]] ops::MoeScratch moeScratch(uint32_t lanes) const {
+    ops::MoeScratch scratch;
+    for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
+      scratch.*ops::kMoeScratchFields[field].buffer =
+          packed(moeScratchTensor<DecodeTensor>(field), lanes);
+    return scratch;
+  }
+
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
   static ops::LinearScratchSize linearScratchSize(const RuntimeGeometry &geometry,
                                                  const ops::ExecutionPlans &operators);
@@ -400,11 +420,10 @@ public:
     // present) and the always-dense DFlash draft. Sparse target FFNs use their
     // own route-major arena tensors, but must not remove the draft's scratch.
     const uint64_t draft = operators.gateUpWorkspace(
-        {geometry.draft.intermediateSize, geometry.draft.hiddenSize});
-    const uint64_t target = geometry.target.denseIntermediateSize
-        ? operators.gateUpWorkspace({geometry.target.denseIntermediateSize,
-                                     geometry.target.hiddenSize})
-        : 0;
+        {geometry.draft.intermediateSize, geometry.draft.hiddenSize, ops::WeightLayout::Affine64});
+    uint64_t target = 0;
+    for (const auto &p : geometry.target.gateUpProjections)
+      target = std::max(target, operators.gateUpWorkspace(p));
     return std::max(target, draft);
   }
 

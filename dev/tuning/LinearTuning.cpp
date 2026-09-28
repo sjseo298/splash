@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -81,16 +80,6 @@ Layout layout(const DeviceCapabilities &device,
   return result;
 }
 
-void requireProjection(const Q4Projection &projection, LinearMatrix matrix) {
-  const uint64_t parameters = uint64_t{matrix.outputSize} * (matrix.inputSize / 64);
-  if (projection.outputSize != matrix.outputSize ||
-      projection.inputSize != matrix.inputSize ||
-      !projection.weights || projection.weights.sizeBytes() < parameters * 32 ||
-      !projection.scales || projection.scales.sizeBytes() < parameters * 2 ||
-      !projection.biases || projection.biases.sizeBytes() < parameters * 2)
-    throw std::invalid_argument("Linear tuning projection does not match workload");
-}
-
 uint32_t mix(uint32_t value) {
   value ^= value >> 16;
   value *= 0x7feb352d;
@@ -98,16 +87,11 @@ uint32_t mix(uint32_t value) {
   value *= 0x846ca68b;
   return value ^ (value >> 16);
 }
-uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return uint16_t(bits >> 16);
-}
 void initialize(metal::MetalBuffer buffer, uint64_t active, uint32_t seed) {
   auto *values = static_cast<uint16_t *>(buffer.contents());
   for (uint64_t i = 0; i < buffer.sizeBytes() / 2; ++i)
     values[i] = i < active
-        ? bf16(float(int(mix(uint32_t(i) + seed) % 257) - 128) / 257.0f) : 0;
+        ? floatToBf16(float(int(mix(uint32_t(i) + seed) % 257) - 128) / 257.0f) : 0;
 }
 void poisonBf16(metal::MetalBuffer buffer) {
   if (!buffer) return;
@@ -169,7 +153,7 @@ void requireFinite(metal::MetalBuffer buffer, bool floats) {
 
 uint64_t linearTuningFixtureBytes(const DeviceCapabilities &device,
                                   LinearWorkload workload) {
-  return layout(device, Q4Linear(device).candidates(workload)).bytes;
+  return layout(device, Linear(device).candidates(workload)).bytes;
 }
 
 LinearTuningResult tuneLinear(metal::MetalBackend &backend,
@@ -185,19 +169,22 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     return std::chrono::duration<double>(Clock::now() - start).count();
   };
   try {
-    Q4Linear linear(backend.capabilities());
+    Linear linear(backend.capabilities());
     const auto plans = linear.candidates(input.workload);
     result.choice.configuration = plans.front().configuration();
     if (!validMeasurementOptions(options) || !admit)
       throw std::invalid_argument("invalid Linear tuning measurement options or admission");
     if (input.weights.empty() || input.weights.size() > kMaximumLinearTuningRepresentatives)
       throw std::invalid_argument("Linear tuning requires 1..8 representative weight views");
+    // Block-quantized plans are not tuned: their only candidate is the baseline.
+    if (input.workload.weightLayout != WeightLayout::Affine64)
+      throw std::invalid_argument("Linear tuning takes affine workloads");
     result.representativeCount = static_cast<uint32_t>(input.weights.size());
     for (const auto &weights : input.weights) {
-      requireProjection(weights.projection, input.workload.matrix);
+      requireAffineProjection(weights.projection, input.workload.matrix);
       if ((input.workload.epilogue == LinearEpilogue::GateUp) != weights.gate.has_value())
         throw std::invalid_argument("Linear tuning gate projection is required only for GateUp");
-      if (weights.gate) requireProjection(*weights.gate, input.workload.matrix);
+      if (weights.gate) requireAffineProjection(*weights.gate, input.workload.matrix);
     }
     const auto fixture = layout(backend.capabilities(), plans);
     auto control = [&] {
@@ -253,7 +240,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       for (uint32_t repetition = 0; repetition < repetitions; ++repetition) {
         const auto &weights = input.weights[(first + repetition) % input.weights.size()];
         if (workload.phase == LinearPhase::Prefill)
-          linear.addPrefillSums(graph, buffers.input, buffers.sums, workload.matrix, workload.rows);
+          linear.addPrefillSums(graph, buffers.input, buffers.sums, weights.projection, workload.rows);
         linear.add(graph, buffers, weights.projection, plans.at(candidate.value),
                    weights.gate ? &*weights.gate : nullptr);
       }
@@ -271,7 +258,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     // gate and up projections of the representative being qualified: one
     // untimed submission per representative, before its candidates run.
     const std::optional<LinearPlan> exactPlain = fields[ReferenceGate]
-        ? std::optional{Q4Linear::plan(
+        ? std::optional{Linear::plan(
               {workload.matrix, workload.rows, LinearPhase::Decode, LinearEpilogue::None},
               {LinearTile::N128, workload.matrix.outputSize / 128})}
         : std::nullopt;

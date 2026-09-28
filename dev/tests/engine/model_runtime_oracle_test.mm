@@ -5,10 +5,10 @@
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Vision.hpp"
+#include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -74,10 +74,6 @@ private:
   double maximumAbsolute_ = 0.0;
 };
 
-float bfloatToFloat(uint16_t value) {
-  return std::bit_cast<float>(uint32_t{value} << 16);
-}
-
 const uint16_t *bfloatContents(const metal::MetalBuffer &buffer,
                                const std::string &label) {
   if (!buffer.contents() || buffer.sizeBytes() % sizeof(uint16_t)) {
@@ -97,7 +93,7 @@ Similarity compareBfloat(const metal::MetalBuffer &left,
   const uint16_t *b = bfloatContents(right, "right BF16 buffer");
   SimilarityAccumulator accumulator;
   for (uint64_t index = 0; index < elements; index += stride) {
-    accumulator.add(bfloatToFloat(a[index]), bfloatToFloat(b[index]));
+    accumulator.add(ops::tuning::bf16ToFloat(a[index]), ops::tuning::bf16ToFloat(b[index]));
   }
   return accumulator.result();
 }
@@ -319,7 +315,7 @@ StateSamples sampleCommittedState(const model::QwenStateStorage &states,
     const uint64_t count = buffer.sizeBytes() / (bfloat ? 2 : 4);
     const uint64_t stride = std::max<uint64_t>(1, count / 65536);
     for (uint64_t index = 0; index < count; index += stride) {
-      values.push_back(bfloat ? bfloatToFloat(static_cast<const uint16_t *>(
+      values.push_back(bfloat ? ops::tuning::bf16ToFloat(static_cast<const uint16_t *>(
                                                  buffer.contents())[index])
                              : static_cast<const float *>(buffer.contents())[index]);
     }
@@ -345,9 +341,9 @@ StateSamples sampleCommittedState(const model::QwenStateStorage &states,
       const uint32_t position = (index / layout.headDimension) % lengths.draftLength;
       const uint32_t head = index / (uint64_t{layout.headDimension} * lengths.draftLength);
       const uint32_t ring = (lengths.draftBase + position) % layout.tokens;
-      keySamples.push_back(bfloatToFloat(
+      keySamples.push_back(ops::tuning::bf16ToFloat(
           keys[(uint64_t{head} * layout.tokens + ring) * layout.headDimension + dimension]));
-      valueSamples.push_back(bfloatToFloat(
+      valueSamples.push_back(ops::tuning::bf16ToFloat(
           values[(uint64_t{head} * layout.headDimension + dimension) * layout.tokens + ring]));
     }
     result.emplace_back("draft_key_" + std::to_string(layer), std::move(keySamples));
@@ -385,12 +381,36 @@ struct AllocationFault final {
 
 void requireAtomicImageAdmission(model::Runtime &executor,
                                  metal::MetalBackend &backend,
+                                 const model::ModelPackage &model,
                                  AllocationFault &fault) {
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const uint64_t originalSubmissions = backend.submissionCount();
   EngineRequest image = makeRequest(93, {1, 2}, 1);
   image.images = {{0, 1, 2, 2, 139, 431}};
   image.imagePixels.resize(image.images.front().pixelBytes());
+  // At the budget the engine retries a denied admission after each reclaim
+  // step. With no encoder and an empty state pool, a request whose lane does
+  // not fit is refused before its encoder arena or image buffers are built.
+  {
+    const ImageSpan &span = image.images.front();
+    const uint64_t attemptBytes =
+        ops::Vision::scratchBytes(model.vision.tensors.layout,
+                                  ops::kMaximumImagePatches) +
+        span.pixelBytes() +
+        uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
+            model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t) +
+        model.stateLayout().activeCellBytes();
+    fault.remainingBytes = attemptBytes - 1;
+    const StateAdmission denied = executor.begin(image.modelView());
+    const uint64_t unspent = fault.remainingBytes;
+    fault = {};
+    require(!denied.granted() &&
+                denied.failure == StateFailure::MemoryPressure &&
+                unspent == attemptBytes - 1 &&
+                backend.memoryStats().allocatedBytes == originalBytes,
+            "an image request whose lane did not fit built its encoder or "
+            "image buffers");
+  }
   for (bool resume : {false, true}) {
     EngineRequest text = image;
     text.images.clear();
@@ -444,9 +464,10 @@ void requireAtomicImageAdmission(model::Runtime &executor,
         require(executor.begin(keeper.modelView()).granted(),
                 "shared vision setup failed");
       const uint64_t before = backend.memoryStats().allocatedBytes;
-      // Fresh vision, image pixels/embeddings, two GDN cells, draft ring.
-      // With an existing encoder, only the last four allocations remain.
-      for (int boundary = 0; boundary < (sharedVision ? 4 : 5); ++boundary) {
+      // The check of the whole attempt, fresh vision, image pixels/embeddings,
+      // two GDN cells, draft ring. With an existing encoder, the check and
+      // the last four allocations remain.
+      for (int boundary = 0; boundary < (sharedVision ? 5 : 6); ++boundary) {
         for (bool throwing : {false, true}) {
           fault = {boundary, throwing};
           bool threw = false;
@@ -555,14 +576,17 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
           "cached image required more than its fresh request state");
 
   // A mixed hit/miss must keep the cached rows while admitting new resources.
-  // Fail at the encoder, image buffers and first state cell, including an
-  // exception after allocation, and leave both the cache and live request intact.
+  // Fail at the check of the whole attempt, the encoder, image buffers and
+  // first state cell, including an exception after allocation, and leave both
+  // the cache and live request intact. Only the admitted attempt counts its
+  // cache hit as a reuse.
   EngineRequest mixed = request;
   mixed.id = 97;
   mixed.images.push_back({80, 16, 8, 8, 157, 439});
   mixed.imagePixels.resize(2 * request.imagePixels.size());
   const uint64_t beforeMixed = backend.memoryStats().allocatedBytes;
-  for (int boundary : {0, 1, 2}) {
+  const uint64_t reusedBeforeMixed = executor.telemetry().imageEmbeddingReuses;
+  for (int boundary : {0, 1, 2, 3}) {
     for (bool throwing : {false, true}) {
       fault = {boundary, throwing};
       bool threw = false;
@@ -581,7 +605,6 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
               "mixed image admission changed preexisting buffers on failure");
     }
   }
-  const uint64_t reusedBeforeMixed = executor.telemetry().imageEmbeddingReuses;
   const ImageSpan &miss = mixed.images.back();
   const uint64_t missingImageBytes = miss.pixelBytes() +
       uint64_t{ops::Vision::embeddingRows({miss.gridHeight, miss.gridWidth})} *
@@ -785,27 +808,19 @@ int main(int argc, char **argv) {
             "cannot measure available host memory before loading the oracle model");
     require(*hostAvailableBytes > hostReserveBytes,
             "available host memory does not cover the protected macOS reserve");
-    uint64_t remainingModelBytes = *hostAvailableBytes - hostReserveBytes;
     const std::filesystem::path modelRoot(argv[2]);
-    bool hasModelBytes = false;
-    // Match production's packed-file preflight before any model mappings.
-    // Subtract from available capacity so package sizes cannot overflow a sum.
-    for (const char *directory : {"target", "draft", "vision"}) {
-      for (const auto &entry :
-           std::filesystem::recursive_directory_iterator(modelRoot / directory)) {
-        if (!entry.is_regular_file())
-          continue;
-        const auto bytes = entry.file_size();
-        require(bytes <= remainingModelBytes,
-                "oracle model loading exceeds available host memory after protecting " +
-                    std::to_string(hostReserveBytes) + " bytes for macOS");
-        remainingModelBytes -= bytes;
-        hasModelBytes |= bytes != 0;
-      }
-    }
-    require(hasModelBytes, "oracle model package contains no nonempty regular files");
+    const auto descriptor = model::inspectModelPackage(modelRoot);
+    // Production's weight byte count with a different bound. Production checks
+    // it only against the Metal hard budget, then guards host headroom at every
+    // Metal operation while loading. This oracle has no such guard, so the
+    // prepared weights must fit in reclaimable memory above the macOS reserve
+    // before anything is mapped; it can refuse a package production starts.
+    require(model::preparedModelWeightBytes(modelRoot, descriptor) <=
+                *hostAvailableBytes - hostReserveBytes,
+            "oracle model loading exceeds available host memory after protecting " +
+                std::to_string(hostReserveBytes) + " bytes for macOS");
     model::ModelPackage model =
-        model::loadModelPackage(backend, modelRoot);
+        model::loadModelPackage(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
@@ -838,7 +853,7 @@ int main(int argc, char **argv) {
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes);
     AllocationFault allocationFault;
     const metal::AllocationAdmission admission =
-        [admit = governor.allocationAdmission(), &allocationFault](
+        [admit = governor.allocationAdmission(), &allocationFault, &backend](
             uint64_t bytes, const std::function<void()> &allocate) {
           if (bytes > allocationFault.remainingBytes)
             return false;
@@ -852,9 +867,13 @@ int main(int argc, char **argv) {
           }
           if (allocationFault.remaining > 0)
             --allocationFault.remaining;
+          // Only allocations spend the budget: the runtime's check of a
+          // whole image attempt allocates nothing.
+          const uint64_t before = backend.memoryStats().allocatedBytes;
           if (!admit(bytes, allocate))
             return false;
-          allocationFault.remainingBytes -= bytes;
+          allocationFault.remainingBytes -=
+              backend.memoryStats().allocatedBytes - before;
           return true;
         };
     metal::AllocationFailure kvAdmissionFailure = metal::AllocationFailure::None;
@@ -917,11 +936,18 @@ int main(int argc, char **argv) {
     require(static_cast<bool>(pages.ensureResident(0)),
             "warmup refusal fixture failed to recover KV admission");
     static_cast<void>(states.releaseIdle(0, 0));
-    requireAtomicImageAdmission(executor, backend, allocationFault);
-    for (uint32_t page : pageRange(120, 4))
-      require(static_cast<bool>(pages.ensureResident(page)), "image oracle KV backing is unavailable");
-    requireImageRowsAfterReclaim(executor, backend, states, model, allocationFault);
-    requireRepeatedImagePlacements(executor, backend, states, allocationFault);
+    // The engine refuses image requests to a model without vision before they
+    // reach the runtime, which treats one as a broken invariant.
+    if (model.descriptor.hasVision()) {
+      requireAtomicImageAdmission(executor, backend, model, allocationFault);
+      for (uint32_t page : pageRange(120, 4))
+        require(static_cast<bool>(pages.ensureResident(page)), "image oracle KV backing is unavailable");
+      requireImageRowsAfterReclaim(executor, backend, states, model, allocationFault);
+      requireRepeatedImagePlacements(executor, backend, states, allocationFault);
+    } else {
+      require(!imagesOnly, "--images-only needs a model that serves vision");
+      std::cout << "image scenarios: skipped, the model serves text only\n";
+    }
     if (imagesOnly) {
       std::cout << "PASS model-runtime-oracle scope=images-only model=" << model.name()
                 << " (admission rollback, chunk reclaim, cache-only budget, mixed/repeated images)\n";

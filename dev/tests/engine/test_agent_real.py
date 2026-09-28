@@ -18,6 +18,76 @@ MODEL_IDS = (
 
 
 class AgentRunnerTests(unittest.TestCase):
+    def test_pi_counts_only_successful_bash_results(self):
+        for is_error in (False, True):
+            with self.subTest(is_error=is_error):
+                parsed = [
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "bash",
+                        "toolCallId": "t1",
+                        "args": {"command": agent.TEST_COMMAND},
+                    },
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "bash",
+                        "toolCallId": "unknown",
+                        "isError": False,
+                    },
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "bash",
+                        "toolCallId": "t1",
+                        "isError": is_error,
+                    },
+                ]
+                self.assertEqual(
+                    agent.executed_commands("pi", parsed),
+                    [] if is_error else [agent.TEST_COMMAND],
+                )
+
+    def test_pi_completion_requires_final_successful_assistant_text(self):
+        def message(reason, text):
+            return {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": reason,
+                    "content": [{"type": "text", "text": text}],
+                },
+            }
+
+        success = message("stop", "Done")
+        ended = {"type": "agent_end"}
+        for parsed, expected in (
+            ([success, ended], True),
+            ([message("toolUse", ""), success, ended], True),
+            ([success], False),
+            ([ended], False),
+            ([message("stop", " "), ended], False),
+            ([success, message("error", "failed"), ended], False),
+            ([message("aborted", "partial"), ended], False),
+            ([message("length", "partial"), ended], False),
+        ):
+            with self.subTest(parsed=parsed):
+                self.assertEqual(agent.pi_completed(parsed), expected)
+
+    def test_pi_compaction_reads_the_selected_saved_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = agent.ClientRun(
+                "pi", "/bin/pi", Path(directory) / "run", "test-model", 102400, 10, []
+            )
+            runner.session = "selected-id"
+            # Pi saves sessions per working directory under its agent directory.
+            sessions = runner.pi_home / "sessions/--project--"
+            sessions.mkdir(parents=True)
+            entry = {"type": "compaction", "summary": "Earlier work"}
+            for name in ("time_selected-id.jsonl", "time_other-id.jsonl"):
+                (sessions / name).write_text(
+                    json.dumps({"type": "message"}) + "\n" + json.dumps(entry) + "\n"
+                )
+            self.assertEqual(runner.compaction(), [entry])
+
     def test_hermes_session_lookup_uses_canonical_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -26,7 +96,7 @@ class AgentRunnerTests(unittest.TestCase):
             alias = root / "alias"
             alias.symlink_to(physical, target_is_directory=True)
             runner = agent.ClientRun(
-                "hermes", "hermes", alias / "run", "test-model", 102400, 10
+                "hermes", "hermes", alias / "run", "test-model", 102400, 10, ["text"]
             )
             workspace = physical / "run/project"
             runtime = root / "runtime"
@@ -50,7 +120,7 @@ class AgentRunnerTests(unittest.TestCase):
                     "'Task complete', NULL, NULL, NULL, 1, 0)"
                 )
             with (
-                mock.patch.object(agent.launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(agent.launcher, "PROFILES_DIR", runtime),
                 mock.patch.object(
                     agent.clients, "command", return_value=(["hermes"], {})
                 ),
@@ -170,20 +240,45 @@ class AgentRunnerTests(unittest.TestCase):
                 line for line in makefile.splitlines() if line.startswith(target + ":")
             )
             self.assertIn("verify-build-identity", prerequisites)
-        self.assertIn('dev/tests/agent_real.py --model "$(MODEL)"', makefile)
-        self.assertIn('--model "$(MODEL)" --http-smoke', makefile)
-        self.assertIn('--model "$(MODEL)" $(HTTP_SMOKE_ARGS)', makefile)
+        self.assertIn('AGENT_ARGS = $(MODEL_ARGS) --package "$(MODEL_ROOT)"', makefile)
+        self.assertEqual(makefile.count("dev/tests/agent_real.py $(AGENT_ARGS)"), 3)
+        self.assertIn('--model "$(MODEL)" --package "$(MODEL_ROOT)"', makefile)
 
-    def test_model_is_required_and_only_canonical_ids_are_accepted(self):
-        for arguments in ([], ["--preflight-only"], ["--model", "qwen3.8-27b"]):
+    def test_model_is_required(self):
+        for arguments in ([], ["--preflight-only"]):
             with (
                 self.subTest(arguments=arguments),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
                 with self.assertRaises(SystemExit):
                     agent.parse_args(arguments)
-        for model in MODEL_IDS:
-            self.assertEqual(agent.parse_args(["--model", model]).model, model)
+
+    def test_real_harnesses_accept_exactly_the_ids_splash_serve_accepts(self):
+        parsers = {
+            "splash serve": lambda model: agent.launcher.parse_args(
+                ["serve", "--model", model]
+            ),
+            "agent_real": lambda model: agent.parse_args(["--model", model]),
+            "smoke_real": lambda model: agent.smoke_real.parse_args(["--model", model]),
+        }
+        for model, served in (
+            *((model, True) for model in MODEL_IDS),
+            ("mlx-community/Qwen3.8-27B-4bit", True),
+            ("unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M", True),
+            ("unsloth/Qwen3.6-35B-A3B-GGUF:", False),
+            ("unsloth/Qwen3.6-35B-A3B-GGUF:UD/Q4_K_M", False),
+            ("qwen3.8-27b", False),
+        ):
+            for name, parse in parsers.items():
+                with (
+                    self.subTest(parser=name, model=model),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    if served:
+                        self.assertEqual(parse(model).model, model)
+                    else:
+                        with self.assertRaises(SystemExit):
+                            parse(model)
 
     def test_complete_phase_handles_auxiliary_cancellation_and_retains_failures(self):
         finished = [
@@ -261,6 +356,60 @@ class AgentRunnerTests(unittest.TestCase):
                 self.assertEqual(len(runner.phases), 1)
                 if mode == "interrupt":
                     self.assertEqual(row["error"], "test interrupted")
+
+    def test_pi_phase_resumes_its_session_and_requires_a_finished_turn(self):
+        header = {"type": "session", "id": "pi-session"}
+        answer = {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "stopReason": "stop",
+                "content": [{"type": "text", "text": "Done"}],
+            },
+        }
+        idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
+        for finished in (True, False):
+            with (
+                self.subTest(finished=finished),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.name, runner.session = "pi", None
+                runner.folder = runner.workspace = Path(directory)
+                runner.timeout, runner.phases = 10, []
+                process = mock.Mock(returncode=0)
+                process.poll.return_value = 0
+
+                def launch(*args, **kwargs):
+                    ended = [{"type": "agent_end"}] if finished else []
+                    for event in [header, answer, *ended]:
+                        kwargs["stdout"].write(json.dumps(event) + "\n")
+                    return process
+
+                with (
+                    mock.patch.object(runner, "argv", return_value=(["pi"], {})),
+                    mock.patch.object(
+                        agent,
+                        "idle_status",
+                        side_effect=[
+                            {"requests": idle},
+                            {"requests": {**idle, "submitted": 1, "completed": 1}},
+                        ],
+                    ),
+                    mock.patch.object(agent.subprocess, "Popen", side_effect=launch),
+                    mock.patch.object(agent, "stop_process"),
+                    mock.patch.object(
+                        agent, "memory_sample", return_value={"pressure": 1}
+                    ),
+                ):
+                    if finished:
+                        runner.phase("test", "task")
+                    else:
+                        with self.assertRaisesRegex(
+                            agent.AgentFailure, "Pi did not finish"
+                        ):
+                            runner.phase("test", "task")
+                self.assertEqual(runner.session, "pi-session")
 
     def test_continuation_does_not_overwrite_interrupted_reference(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -440,13 +589,21 @@ class AgentRunnerTests(unittest.TestCase):
                     runner = agent.ClientRun.__new__(agent.ClientRun)
                     runner.name, runner.path = name, f"/test/{name}"
                     runner.model, runner.context = "Actual-model", 102400
+                    runner.input_modalities = ["text"]
                     runner.workspace = Path("/test/project")
                     runner.codex_home = Path(directory) / "codex-home"
+                    runner.pi_home = Path(directory) / "pi-agent"
                     runner.session = session
                     with mock.patch.object(
                         agent.clients, "command", return_value=([runner.path], {})
                     ) as adapter:
                         argv, env = runner.argv()
+                    # Pi configures itself in a private agent directory.
+                    environment = (
+                        dict(agent.os.environ, PI_CODING_AGENT_DIR=str(runner.pi_home))
+                        if name == "pi"
+                        else None
+                    )
                     self.assertEqual(env["PWD"], "/test/project")
                     if name == "codex":
                         self.assertEqual(env["CODEX_HOME"], str(runner.codex_home))
@@ -454,10 +611,12 @@ class AgentRunnerTests(unittest.TestCase):
                     adapter.assert_called_once_with(
                         name,
                         runner.path,
-                        agent.launcher.BASE_URL,
+                        agent.BASE_URL,
                         "Actual-model",
                         102400,
-                        agent.launcher.RUNTIME_DIR,
+                        agent.launcher.PROFILES_DIR,
+                        environment,
+                        input_modalities=["text"],
                     )
                     for forbidden in (
                         "--ephemeral",
@@ -479,6 +638,11 @@ class AgentRunnerTests(unittest.TestCase):
                             argv[argv.index("--allowedTools") + 1],
                             f"Bash({agent.TEST_COMMAND})",
                         )
+                    if name == "pi":
+                        expected = ["--print", "--mode", "json"]
+                        if session:
+                            expected += ["--session", session]
+                        self.assertEqual(argv[1:], expected)
 
     def test_artifact_oracle_rejects_stub_and_wrong_semantics(self):
         with tempfile.TemporaryDirectory() as directory:

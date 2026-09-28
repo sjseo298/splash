@@ -1,7 +1,8 @@
 #include "tuning/DraftAttentionTuning.hpp"
 
+#include "tuning/LinearNumerics.hpp"
+
 #include <algorithm>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -35,14 +36,6 @@ uint64_t aligned(uint64_t bytes) {
   if (bytes > std::numeric_limits<uint64_t>::max() - kAlignment + 1)
     throw std::invalid_argument("draft tuning fixture size overflow");
   return (bytes + kAlignment - 1) & ~(kAlignment - 1);
-}
-uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return uint16_t(bits >> 16);
-}
-float fp32(uint16_t value) {
-  return std::bit_cast<float>(uint32_t{value} << 16);
 }
 
 struct FixturePlan final {
@@ -134,12 +127,12 @@ public:
         if (element % 65536 == 0 && stop && stop()) return false;
         state = state * 6364136223846793005ULL + 1442695040888963407ULL;
         const float value = float((state >> 40) & 0xffffff) / 8388608.0f - 1;
-        data[element] = bf16(value * 0.5f);
+        data[element] = floatToBf16(value * 0.5f);
       }
     }
     for (Tensor tensor : {Tensor::QueryNorm, Tensor::KeyNorm})
       std::fill_n(static_cast<uint16_t *>(get(tensor).contents()),
-                   get(tensor).sizeBytes() / 2, bf16(1));
+                   get(tensor).sizeBytes() / 2, floatToBf16(1));
     auto *cosine = static_cast<float *>(get(Tensor::RopeCos).contents());
     auto *sine = static_cast<float *>(get(Tensor::RopeSin).contents());
     for (uint64_t element = 0; element < get(Tensor::RopeCos).sizeBytes() / 4; ++element) {
@@ -196,7 +189,7 @@ public:
       const auto *values =
           static_cast<const uint16_t *>(get(tensor).contents());
       for (uint64_t i = 0; i < bytes / 2; ++i)
-        if (!std::isfinite(fp32(values[i]))) throw NumericalMismatch();
+        if (!std::isfinite(bf16ToFloat(values[i]))) throw NumericalMismatch();
       if (haveReference_[history]) {
         if (std::memcmp(reference, values, bytes) != 0)
           throw NumericalMismatch();

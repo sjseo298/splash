@@ -15,7 +15,6 @@ if __package__:
         PARAMETER_CLOSE,
         PARAMETER_OPEN,
         THINK_END,
-        TOOL_CALL_CLOSE,
         TOOL_CALL_OPEN,
         json_value,
         raw_string_schema,
@@ -30,7 +29,6 @@ else:
         PARAMETER_CLOSE,
         PARAMETER_OPEN,
         THINK_END,
-        TOOL_CALL_CLOSE,
         TOOL_CALL_OPEN,
         json_value,
         raw_string_schema,
@@ -440,8 +438,6 @@ def _typed_tool_value(value, schema, root):
         return parsed
     if string_schema[0] == "raw" or value in string_schema[1]:
         return value
-    if value == "null" and None in string_schema[1]:
-        return None
     return parsed
 
 
@@ -505,19 +501,18 @@ def parse_tool_calls(text, request_id, policy=None):
         )
     content.append(text[cursor:])
     content = "".join(content)
-    if calls and any(
-        tag in content
-        for tag in (
-            TOOL_CALL_OPEN,
-            TOOL_CALL_CLOSE,
-            "<function=",
-            "</function>",
-            PARAMETER_OPEN,
-            "</parameter>",
-        )
-    ):
-        raise APIError(500, "model returned malformed tool XML", "invalid_model_output")
     return ("" if calls and not content.strip() else content), calls
+
+
+def _validate(validator, value):
+    try:
+        validator.validate(value)
+    except AttributeError as error:
+        # referencing's draft 3 crawls the keys of an extends object as schemas
+        # whenever a reference lookup scans the document for identifiers.
+        raise SchemaEvaluationError(
+            "schema reference could not be evaluated"
+        ) from error
 
 
 def validate_tool_calls(calls, policy):
@@ -540,7 +535,7 @@ def validate_tool_calls(calls, policy):
         try:
             arguments = json_codec.loads(function["arguments"])
             _validate_tool_unicode(arguments)
-            validator.validate(arguments)
+            _validate(validator, arguments)
         except SchemaEvaluationError as error:
             raise APIError(500, str(error), "output_validation_failed") from error
         except ValidationError as error:
@@ -560,7 +555,7 @@ def validate_response_content(content, validator):
         return
     try:
         value = json_codec.loads(content)
-        validator.validate(value)
+        _validate(validator, value)
     except SchemaEvaluationError as error:
         raise APIError(500, str(error), "output_validation_failed") from error
     except (ValueError, ValidationError, Unresolvable, RecursionError) as error:

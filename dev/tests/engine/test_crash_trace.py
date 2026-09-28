@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import json
 import signal
@@ -163,6 +164,51 @@ class CrashTraceTest(unittest.TestCase):
                     path,
                 )
                 self.assertEqual(len(list(directory.glob("*.json"))), 1)
+
+    def test_oversized_frame_leaves_a_marker_that_replay_refuses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with (
+                mock.patch.object(crash_trace, "DEFAULT_TRACE_DIRECTORY", directory),
+                mock.patch.object(crash_trace, "MAX_TRACE_BYTES", 64),
+            ):
+                ring = crash_trace.CrashTraceRing(
+                    ("splash", "serve-native"), enabled=True
+                )
+                ring.start_generation(1, 50)
+                small = wire.serialize_message(wire.StatusRequestFrame(1))
+                large = wire.serialize_message(
+                    wire.MaskResponseFrame(2, 3, tuple(range(64)))
+                )
+                ring.record_bytes(1, "client_to_engine", small)
+                ring.record_bytes(1, "client_to_engine", large)
+                path = ring.dump(
+                    1, RuntimeError("failed"), process_returncode=1, last_status=None
+                )
+            document = json.loads(path.read_text())
+            self.assertEqual(document["omitted_frames"], 1)
+            kept, marker = document["frames"]
+            self.assertEqual(base64.b64decode(kept["frame_base64"]), small)
+            self.assertNotIn("frame_base64", marker)
+            self.assertEqual(marker["omitted_bytes"], len(large))
+            self.assertEqual(marker["sha256"], hashlib.sha256(large).hexdigest())
+            self.assertEqual(
+                base64.b64decode(marker["header_base64"]),
+                large[: wire.FRAME_HEADER_BYTES],
+            )
+            with (
+                mock.patch.object(crash_trace.subprocess, "Popen") as spawn,
+                self.assertRaisesRegex(ValueError, "cannot be replayed"),
+            ):
+                crash_trace.replay(path)
+            spawn.assert_not_called()
+
+    def test_disabled_ring_does_not_reencode_received_frames(self):
+        ring = crash_trace.CrashTraceRing(("splash", "serve-native"))
+        frame = wire.encode_message(wire.StatusRequestFrame(1))
+        with mock.patch.object(crash_trace.wire, "serialize_frame") as serialize:
+            ring.record_frame(1, "engine_to_client", frame)
+        serialize.assert_not_called()
 
     def test_fake_process_factory_has_no_machine_global_trace(self):
         ring = crash_trace.CrashTraceRing(None)

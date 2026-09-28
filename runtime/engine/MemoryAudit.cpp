@@ -44,30 +44,42 @@ std::string_view memoryAuditErrorName(MemoryAuditError error) {
 MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
                                     ActualMemoryReport actual) {
   const EngineMemoryBreakdown &budget = plan.breakdown();
+  // Vision weights are absent without a vision tower. Loading already
+  // requires them for a model with vision.
   if (!actual.targetWeightsBytes || !actual.draftWeightsBytes ||
-      !actual.visionWeightsBytes || !actual.stateResidentBytes ||
-      !actual.sharedPrefillBytes || !actual.sharedDecodeBytes ||
-      !actual.kvResidentBytes || !actual.backendAllocatedBytes ||
-      !actual.deviceCurrentAllocatedBytes || !actual.devicePeakAllocatedBytes ||
-      !actual.estimatedWarmupPeakBytes) {
+      !actual.stateResidentBytes || !actual.sharedPrefillBytes ||
+      !actual.sharedDecodeBytes || !actual.kvResidentBytes ||
+      !actual.backendAllocatedBytes || !actual.deviceCurrentAllocatedBytes ||
+      !actual.devicePeakAllocatedBytes || !actual.estimatedWarmupPeakBytes) {
     return fail(MemoryAuditError::MissingMeasurement,
                 "warmup memory report is incomplete", actual);
   }
 
+  // The plan takes the weight categories from what loaded, so they are
+  // counted but have no bound of their own. A buffer a loader does not report
+  // is unclassified backend memory, which the pipeline and runtime reserves
+  // bound; only the arenas, KV storage and the disk tier's KV staging have
+  // planned category bounds.
+  uint64_t categorized = 0;
+  for (const uint64_t weights : {actual.targetWeightsBytes,
+                                 actual.draftWeightsBytes,
+                                 actual.visionWeightsBytes}) {
+    if (!checkedAdd(categorized, weights, categorized)) {
+      return fail(MemoryAuditError::ArithmeticOverflow,
+                  "categorized memory sum overflowed", actual);
+    }
+  }
   struct Category {
     const char *name;
     uint64_t actual;
     uint64_t planned;
   };
   const Category categories[] = {
-      {"target weights", actual.targetWeightsBytes, budget.targetWeightsBytes},
-      {"draft weights", actual.draftWeightsBytes, budget.draftWeightsBytes},
-      {"vision weights", actual.visionWeightsBytes, budget.visionWeightsBytes},
       {"shared prefill", actual.sharedPrefillBytes, budget.sharedPrefillBytes},
       {"shared decode", actual.sharedDecodeBytes, budget.sharedDecodeBytes},
       {"Q8 virtual storage", actual.kvResidentBytes, budget.kvVirtualBytes},
+      {"KV staging", actual.kvStagingBytes, budget.kvStagingBytes},
   };
-  uint64_t categorized = 0;
   for (const Category &category : categories) {
     if (category.actual > category.planned) {
       std::ostringstream message;
@@ -123,14 +135,24 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
         "pipeline and runtime allocations exceed their explicit reserve",
         actual);
   }
-  uint64_t difference =
-      actual.devicePeakAllocatedBytes > actual.estimatedWarmupPeakBytes
-          ? actual.devicePeakAllocatedBytes - actual.estimatedWarmupPeakBytes
-          : actual.estimatedWarmupPeakBytes - actual.devicePeakAllocatedBytes;
+  // The warmup estimate adds the reserves as the bound on unclassified
+  // memory; the device peak holds that memory as it is. Compare the two with
+  // the measured unclassified bytes in place of the reserves, so that the
+  // rule measures the estimate rather than the reserves' unused part.
+  if (actual.estimatedWarmupPeakBytes <= reserves) {
+    return fail(MemoryAuditError::WarmupEstimateDeviation,
+                "warmup estimate does not include the runtime reserves",
+                actual);
+  }
+  const uint64_t predicted =
+      actual.estimatedWarmupPeakBytes - reserves + unclassified;
+  uint64_t difference = actual.devicePeakAllocatedBytes > predicted
+                            ? actual.devicePeakAllocatedBytes - predicted
+                            : predicted - actual.devicePeakAllocatedBytes;
   uint64_t basisPoints =
       difference > std::numeric_limits<uint64_t>::max() / 10'000
           ? std::numeric_limits<uint64_t>::max()
-          : difference * 10'000 / actual.estimatedWarmupPeakBytes;
+          : difference * 10'000 / predicted;
   if (basisPoints > kMaximumWarmupDeviationBasisPoints) {
     return fail(
         MemoryAuditError::WarmupEstimateDeviation,

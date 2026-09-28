@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
 
 INSTALL_URLS = {
@@ -17,15 +19,36 @@ INSTALL_URLS = {
     "opencode": "https://opencode.ai/docs/",
     "codex": "https://developers.openai.com/codex/cli/",
     "hermes": "https://hermes-agent.nousresearch.com/docs/getting-started/installation/",
+    "pi": "https://pi.dev/",
 }
+# The most tokens a client reserves for one response out of the window.
+MAX_RESPONSE_TOKENS = 32768
+OPENCODE_AGENTS = ("build", "plan", "general", "explore", "title", "compaction")
+OPENCODE_EFFORTS = ("none", "low", "medium", "high", "xhigh")
+OPENCODE_CONFIG_ERROR = "OPENCODE_CONFIG_CONTENT must be a JSON object"
 
 
 class ClientError(RuntimeError):
     pass
 
 
-def _output_budget(context):
-    return min(32768, max(1, context // 4))
+@dataclass(frozen=True)
+class _Server:
+    """The ready local server a client connects to."""
+
+    base_url: str
+    model: str
+    context: int
+    input_modalities: list
+    api_key: str
+
+    @property
+    def endpoint(self):
+        return self.base_url + "/v1"
+
+    @property
+    def response_tokens(self):
+        return min(MAX_RESPONSE_TOKENS, max(1, self.context // 4))
 
 
 def find_executable(name):
@@ -62,45 +85,197 @@ def probe_major_version(path):
     return int(match.group(1)) if match else None
 
 
-def _hermes_config(home, model, endpoint, context, api_key):
-    # HERMES_HOME is Hermes's supported profile boundary. Keep sessions and
-    # the complete default tool surface, without touching ~/.hermes/config.yaml.
-    import yaml
-
-    home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = home / "config.yaml"
-    try:
-        config = yaml.safe_load(path.read_text()) if path.exists() else {}
-        if config is None:
-            config = {}
-        if not isinstance(config, dict):
-            raise ValueError("expected a mapping")
-        if config.get("model") is None:
-            config["model"] = {}
-        config["model"].update(
-            default=model,
-            provider="custom",
-            base_url=endpoint,
-            api_key=api_key,
-            api_mode="chat_completions",
-            supports_vision=True,
-            context_length=context,
-            # Leave the input room expected by Hermes's 75% small-context
-            # compaction threshold; do not inherit a cloud model's output cap.
-            max_tokens=_output_budget(context),
+def command(
+    name,
+    path,
+    base_url,
+    model,
+    context,
+    profiles_dir,
+    environment=None,
+    *,
+    input_modalities,
+    client_args=(),
+    client_version=None,
+):
+    """Return argv and a private environment; never mutate the caller's env.
+    input_modalities is what the served model accepts, as /v1/models
+    reports it."""
+    if not isinstance(model, str) or not model:
+        raise ClientError("The server did not report a model name")
+    if type(context) is not int or context <= 0:
+        raise ClientError("The server did not report a valid context limit")
+    if (
+        not isinstance(input_modalities, list)
+        or "text" not in input_modalities
+        or not all(isinstance(m, str) for m in input_modalities)
+    ):
+        raise ClientError(
+            "The server did not report its input modalities; it predates this "
+            "launcher, so restart it with this version of Splash"
         )
-    except (yaml.YAMLError, ValueError, AttributeError) as error:
-        raise ClientError(f"Invalid Hermes profile: {path}") from error
-    # Replace only after the complete config is ready; two launching shells
-    # never expose a partially written YAML file to Hermes.
-    with tempfile.NamedTemporaryFile(mode="w", dir=home, delete=False) as output:
-        temporary = Path(output.name)
-        try:
-            yaml.safe_dump(config, output, sort_keys=False)
-            output.close()
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
+    environment = dict(os.environ if environment is None else environment)
+    server = _Server(
+        base_url.rstrip("/"),
+        model,
+        context,
+        input_modalities,
+        environment.get("SPLASH_API_KEY") or "local",
+    )
+    # Each launch configures the private environment copy in place.
+    match name:
+        case "claude":
+            argv = _claude(path, server, environment, client_args)
+        case "opencode":
+            argv = _opencode(path, server, environment, client_args, client_version)
+        case "codex":
+            argv = _codex(path, server, environment, client_args)
+        case "hermes":
+            argv = _hermes(path, server, environment, client_args, profiles_dir)
+        case "pi":
+            argv = _pi(path, server, environment, client_args)
+        case _:
+            raise ClientError(f"Unknown coding client: {name}")
+    return argv, environment
+
+
+def _claude(path, server, environment, arguments):
+    environment.update(
+        ANTHROPIC_BASE_URL=server.base_url,
+        ANTHROPIC_AUTH_TOKEN=server.api_key,
+        ANTHROPIC_MODEL=server.model,
+        ANTHROPIC_DEFAULT_OPUS_MODEL=server.model,
+        ANTHROPIC_DEFAULT_SONNET_MODEL=server.model,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL=server.model,
+        ANTHROPIC_SMALL_FAST_MODEL=server.model,
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS=str(server.context),
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW=str(server.context),
+    )
+    # Select the direct endpoint even in a shell configured for a cloud
+    # provider. Keep compaction, tools and user settings unchanged.
+    environment.pop("ANTHROPIC_API_KEY", None)
+    environment.update(
+        CLAUDE_CODE_USE_BEDROCK="0",
+        CLAUDE_CODE_USE_VERTEX="0",
+        CLAUDE_CODE_USE_FOUNDRY="0",
+    )
+    # Auto mode adds classifier inference to tool approval. Start in the
+    # normal approval mode, even if the user's global default is auto.
+    return [
+        path,
+        "--disallowedTools",
+        "WebSearch",
+        "--model",
+        server.model,
+        "--permission-mode",
+        "default",
+        *arguments,
+    ]
+
+
+def _opencode(path, server, environment, arguments, version):
+    try:
+        config = json.loads(environment.get("OPENCODE_CONFIG_CONTENT", "{}"))
+    except ValueError as error:
+        raise ClientError(OPENCODE_CONFIG_ERROR) from error
+    if not isinstance(config, dict):
+        raise ClientError(OPENCODE_CONFIG_ERROR)
+    served = f"splash/{server.model}"
+    config.update(model=served, small_model=served)
+    # A user's global config may pin a model per agent, and an agent-level
+    # model outranks the top-level one; point the built-in agents at the
+    # served model too, leaving their other settings.
+    agents = config["agent"] = _opencode_object(config, "agent")
+    for agent in OPENCODE_AGENTS:
+        agents[agent] = {**_opencode_object(agents, agent), "model": served}
+    provider = config["provider"] = _opencode_object(config, "provider")
+    variants = {effort: {"reasoningEffort": effort} for effort in OPENCODE_EFFORTS}
+    variants |= _opencode_object(provider, "splash", "models", server.model, "variants")
+    output = server.response_tokens
+    provider["splash"] = {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "Splash",
+        "options": {"baseURL": server.endpoint, "apiKey": server.api_key},
+        "models": {
+            server.model: {
+                "name": server.model,
+                "reasoning": True,
+                "variants": variants,
+                # Attachments are images and PDFs.
+                "attachment": server.input_modalities != ["text"],
+                "modalities": {"input": server.input_modalities, "output": ["text"]},
+                # The shared window includes the output allowance. An explicit
+                # input budget also lets OpenCode retain its normal compaction
+                # reserve for the next turn.
+                "limit": {
+                    "context": server.context,
+                    "input": max(1, server.context - output),
+                    "output": output,
+                },
+            }
+        },
+    }
+    environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
+    argv = [path, *arguments]
+    # OpenCode 2 loads configuration inside its persistent background
+    # service, which this process's environment never reaches; a private
+    # server keeps the inline configuration authoritative. OpenCode 1
+    # reads the environment directly and rejects the flag.
+    if (
+        type(version) is int
+        and version >= 2
+        and not _selects_opencode_server(arguments)
+    ):
+        # V2 parses this as a command-local flag, so it must follow any
+        # subcommand and precede the end-of-options separator.
+        argv.insert(argv.index("--") if "--" in argv else len(argv), "--standalone")
+    return argv
+
+
+def _opencode_object(value, *keys):
+    """The object at keys in the user's inline config; {} where it is unset."""
+    for key in keys:
+        value = value.get(key, {})
+        if not isinstance(value, dict):
+            raise ClientError(f"OPENCODE_CONFIG_CONTENT: {key!r} must be a JSON object")
+    return value
+
+
+def _selects_opencode_server(arguments):
+    """The user already chose the server: an explicit URL or a private one."""
+    if "--" in arguments:
+        arguments = arguments[: arguments.index("--")]
+    return any(
+        argument == "--standalone"
+        or argument == "--server"
+        or argument.startswith("--server=")
+        for argument in arguments
+    )
+
+
+def _codex(path, server, environment, arguments):
+    environment["SPLASH_API_KEY"] = server.api_key
+    settings = {
+        "model": json.dumps(server.model),
+        "web_search": json.dumps("disabled"),
+        "model_provider": json.dumps("splash"),
+        "model_providers.splash": (
+            f'{{name="Splash",base_url={json.dumps(server.endpoint)},'
+            'env_key="SPLASH_API_KEY",wire_api="responses"}'
+        ),
+        "model_context_window": str(server.context),
+        # Override a possible threshold from the user's other model. The
+        # remaining 10% is room for completion and compaction itself.
+        "model_auto_compact_token_limit": str(server.context * 9 // 10),
+    }
+    argv = [path]
+    for key, value in settings.items():
+        argv += ["-c", f"{key}={value}"]
+    # User overrides retain their order and take precedence over defaults.
+    # Config is global in Codex. Keep its complete list at the root so a
+    # subcommand's overrides cannot replace the connection settings.
+    overrides, arguments = _codex_config_args(arguments)
+    return [*argv, *overrides, *arguments]
 
 
 def _codex_config_args(arguments):
@@ -125,188 +300,121 @@ def _codex_config_args(arguments):
     return config, remaining
 
 
-def _selects_opencode_server(arguments):
-    """The user already chose the server: an explicit URL or a private one."""
-    if "--" in arguments:
-        arguments = arguments[: arguments.index("--")]
-    return any(
-        argument == "--standalone"
-        or argument == "--server"
-        or argument.startswith("--server=")
-        for argument in arguments
+def _hermes(path, server, environment, arguments, profiles_dir):
+    # HERMES_HOME is Hermes's supported profile boundary. Keep sessions and
+    # the complete default tool surface, without touching ~/.hermes/config.yaml.
+    home = profiles_dir / "hermes"
+    _write_hermes_profile(home, server)
+    environment.update(
+        HERMES_HOME=str(home),
+        CUSTOM_BASE_URL=server.endpoint,
+        OPENAI_BASE_URL=server.endpoint,
+        OPENAI_API_KEY=server.api_key,
     )
+    return [path, "chat", "--provider", "custom", "--model", server.model, *arguments]
 
 
-def command(
-    name,
-    path,
-    base_url,
-    model,
-    context,
-    runtime_dir,
-    environment=None,
-    *,
-    client_args=(),
-    client_version=None,
-):
-    """Return argv and a private environment; never mutate the caller's env."""
-    if not isinstance(model, str) or not model:
-        raise ClientError("The server did not report a model name")
-    if type(context) is not int or context <= 0:
-        raise ClientError("The server did not report a valid context limit")
-    environment = dict(os.environ if environment is None else environment)
-    endpoint = base_url.rstrip("/") + "/v1"
-    api_key = environment.get("SPLASH_API_KEY") or "local"
+def _write_hermes_profile(home, server):
+    # The launcher imports this module before the environment that provides
+    # PyYAML is installed.
+    import yaml
 
-    if name == "claude":
-        environment.update(
-            ANTHROPIC_BASE_URL=base_url.rstrip("/"),
-            ANTHROPIC_AUTH_TOKEN=api_key,
-            ANTHROPIC_MODEL=model,
-            ANTHROPIC_DEFAULT_OPUS_MODEL=model,
-            ANTHROPIC_DEFAULT_SONNET_MODEL=model,
-            ANTHROPIC_DEFAULT_HAIKU_MODEL=model,
-            ANTHROPIC_SMALL_FAST_MODEL=model,
-            CLAUDE_CODE_MAX_CONTEXT_TOKENS=str(context),
-            CLAUDE_CODE_AUTO_COMPACT_WINDOW=str(context),
-        )
-        # Select the direct endpoint even in a shell configured for a cloud
-        # provider. Keep compaction, tools and user settings unchanged.
-        environment.pop("ANTHROPIC_API_KEY", None)
-        for key in (
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_VERTEX",
-            "CLAUDE_CODE_USE_FOUNDRY",
-        ):
-            environment[key] = "0"
-        # Auto mode adds classifier inference to tool approval. Start in the
-        # normal approval mode, even if the user's global default is auto.
-        return [
-            path,
-            "--disallowedTools",
-            "WebSearch",
-            "--model",
-            model,
-            "--permission-mode",
-            "default",
-            *client_args,
-        ], environment
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = home / "config.yaml"
+    invalid = f"Invalid Hermes profile: {path}"
+    try:
+        profile = yaml.safe_load(path.read_text()) if path.exists() else None
+    except (yaml.YAMLError, ValueError) as error:
+        raise ClientError(invalid) from error
+    if profile is None:
+        profile = {}
+    if not isinstance(profile, dict):
+        raise ClientError(invalid)
+    if profile.get("model") is None:
+        profile["model"] = {}
+    if not isinstance(profile["model"], dict):
+        raise ClientError(invalid)
+    profile["model"].update(
+        default=server.model,
+        provider="custom",
+        base_url=server.endpoint,
+        api_key=server.api_key,
+        api_mode="chat_completions",
+        supports_vision="image" in server.input_modalities,
+        context_length=server.context,
+        # Leave the input room expected by Hermes's 75% small-context
+        # compaction threshold; do not inherit a cloud model's output cap.
+        max_tokens=server.response_tokens,
+    )
+    _replace_file(path, yaml.safe_dump(profile, sort_keys=False))
 
-    if name == "opencode":
-        output = _output_budget(context)
+
+def _pi(path, server, environment, arguments):
+    # Pi reads custom providers only from models.json in its agent directory,
+    # beside the user's sessions, settings and extensions. Replace this
+    # server's provider there and leave everything else as it is: splash for
+    # the default port, 8000, and splash-<port> for another, so a Pi session
+    # keeps the server it was started for.
+    port = urllib.parse.urlsplit(server.base_url).port
+    provider = "splash" if port == 8000 else f"splash-{port}"
+    _write_pi_provider(_pi_models_path(environment), provider, server, environment)
+    return [path, "--provider", provider, "--model", server.model, *arguments]
+
+
+def _pi_models_path(environment):
+    agent = environment.get("PI_CODING_AGENT_DIR")
+    directory = Path(agent).expanduser() if agent else Path.home() / ".pi/agent"
+    return directory / "models.json"
+
+
+def _write_pi_provider(path, provider, server, environment):
+    # Write through a symlinked models.json, as dotfile managers link it.
+    path = path.resolve()
+    invalid = f"Invalid Pi models.json: {path}"
+    try:
+        config = json.loads(path.read_text()) if path.exists() else {}
+    except ValueError as error:
+        raise ClientError(invalid) from error
+    providers = config.get("providers", {}) if isinstance(config, dict) else None
+    if not isinstance(providers, dict):
+        raise ClientError(invalid)
+    # Pi expands the variable for each request. The server's key is never
+    # saved, nor run as a command when it begins with "!".
+    api_key = "$SPLASH_API_KEY" if environment.get("SPLASH_API_KEY") else "local"
+    # Pi accepts only text and image input; any other entry invalidates the
+    # user's whole models.json.
+    vision = "image" in server.input_modalities
+    model = {
+        "id": server.model,
+        "reasoning": True,
+        # Pi sends no effort when thinking is off, which leaves the
+        # template's default; "none" turns thinking off.
+        "thinkingLevelMap": {"off": "none"},
+        "input": ["text", "image"] if vision else ["text"],
+        "contextWindow": server.context,
+        "maxTokens": server.response_tokens,
+    }
+    config["providers"] = {
+        **providers,
+        provider: {
+            "baseUrl": server.endpoint,
+            "api": "openai-completions",
+            "apiKey": api_key,
+            "models": [model],
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _replace_file(path, json.dumps(config, indent=2) + "\n")
+
+
+def _replace_file(path, text):
+    """Replace path only once text is complete: two launching shells never
+    expose a partially written configuration to the client."""
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as output:
+        temporary = Path(output.name)
         try:
-            config = json.loads(environment.get("OPENCODE_CONFIG_CONTENT", "{}"))
-            config.update(model=f"splash/{model}", small_model=f"splash/{model}")
-            # A user's global config may pin a model per agent, and an
-            # agent-level model outranks the top-level one; point the built-in
-            # agents at the served model too, leaving their other settings.
-            for agent in ("build", "plan", "general", "explore", "title", "compaction"):
-                config.setdefault("agent", {}).setdefault(agent, {})["model"] = (
-                    f"splash/{model}"
-                )
-            variants = (
-                config.get("provider", {})
-                .get("splash", {})
-                .get("models", {})
-                .get(model, {})
-                .get("variants", {})
-            )
-            config.setdefault("provider", {})["splash"] = {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Splash",
-                "options": {"baseURL": endpoint, "apiKey": api_key},
-                "models": {
-                    model: {
-                        "name": model,
-                        "reasoning": True,
-                        "variants": {
-                            "none": {"reasoningEffort": "none"},
-                            "low": {"reasoningEffort": "low"},
-                            "medium": {"reasoningEffort": "medium"},
-                            "high": {"reasoningEffort": "high"},
-                            "xhigh": {"reasoningEffort": "xhigh"},
-                            **variants,
-                        },
-                        "attachment": True,
-                        "modalities": {
-                            "input": ["text", "image", "pdf"],
-                            "output": ["text"],
-                        },
-                        # The shared window includes the output allowance.
-                        # An explicit input budget also lets OpenCode retain
-                        # its normal compaction reserve for the next turn.
-                        "limit": {
-                            "context": context,
-                            "input": max(1, context - output),
-                            "output": output,
-                        },
-                    }
-                },
-            }
-        except (ValueError, TypeError, AttributeError) as error:
-            raise ClientError(
-                "OPENCODE_CONFIG_CONTENT must be a JSON object"
-            ) from error
-        environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
-        # OpenCode 2 loads configuration inside its persistent background
-        # service, which this process's environment never reaches; a private
-        # server keeps the inline configuration authoritative. OpenCode 1
-        # reads the environment directly and rejects the flag.
-        standalone = (
-            type(client_version) is int
-            and client_version >= 2
-            and not _selects_opencode_server(client_args)
-        )
-        argv = [path, *client_args]
-        if standalone:
-            # V2 parses this as a command-local flag, so it must follow any
-            # subcommand and precede the end-of-options separator.
-            index = argv.index("--") if "--" in argv else len(argv)
-            argv.insert(index, "--standalone")
-        return argv, environment
-
-    if name == "codex":
-        environment["SPLASH_API_KEY"] = api_key
-        settings = {
-            "web_search": json.dumps("disabled"),
-            "model_provider": json.dumps("splash"),
-            "model_providers.splash": (
-                '{name="Splash",base_url='
-                + json.dumps(endpoint)
-                + ',env_key="SPLASH_API_KEY",wire_api="responses"}'
-            ),
-            "model_context_window": str(context),
-            # Override a possible threshold from the user's other model. The
-            # remaining 10% is room for completion and compaction itself.
-            "model_auto_compact_token_limit": str(context * 9 // 10),
-        }
-        argv = [path]
-        settings = {"model": json.dumps(model), **settings}
-        for key, value in settings.items():
-            argv.extend(["-c", f"{key}={value}"])
-        # User overrides retain their order and take precedence over defaults.
-        # Config is global in Codex. Keep its complete list at the root so
-        # a subcommand's overrides cannot replace the connection settings.
-        overrides, arguments = _codex_config_args(client_args)
-        return [*argv, *overrides, *arguments], environment
-
-    if name == "hermes":
-        home = runtime_dir / "hermes"
-        _hermes_config(home, model, endpoint, context, api_key)
-        environment.update(
-            HERMES_HOME=str(home),
-            CUSTOM_BASE_URL=endpoint,
-            OPENAI_BASE_URL=endpoint,
-            OPENAI_API_KEY=api_key,
-        )
-        return [
-            path,
-            "chat",
-            "--provider",
-            "custom",
-            "--model",
-            model,
-            *client_args,
-        ], environment
-
-    raise ClientError(f"Unknown coding client: {name}")
+            output.write(text)
+            output.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)

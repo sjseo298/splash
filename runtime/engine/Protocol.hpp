@@ -219,9 +219,13 @@ enum ReadyFeature : uint64_t {
   FeatureTokenMasks = 1ULL << 1,
   FeatureStatusJson = 1ULL << 2,
   FeatureMultiplexing = 1ULL << 3,
+  // Requests may carry image spans. A model serving without vision leaves it
+  // clear and rejects each image request with a request error.
+  FeatureVision = 1ULL << 4,
 };
 
-// The native runtime implements every feature; ReadyEvent announces them all.
+// The native runtime implements every other feature; ReadyEvent announces
+// them all, and FeatureVision when the loaded model has vision.
 inline constexpr uint64_t kNativeFeatureBits =
     FeatureCancellation | FeatureTokenMasks | FeatureStatusJson |
     FeatureMultiplexing;

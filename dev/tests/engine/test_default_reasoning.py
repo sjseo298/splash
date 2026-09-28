@@ -7,7 +7,7 @@ from unittest import mock
 
 from dev.tests import test_server as fixtures
 from install import launcher
-from server import frontend
+from server import chat_templates
 from server import server as api
 
 SERVER_ARGS = ["target", "draft", "--tokenizer", "tokenizer", "--model", "owner/repo"]
@@ -183,7 +183,7 @@ class DefaultReasoningTests(unittest.TestCase):
                     )
 
     def test_cli_over_environment_and_launcher_forwarding(self):
-        self.assertEqual(frontend.REASONING_EFFORTS, launcher.REASONING_EFFORTS)
+        self.assertEqual(chat_templates.REASONING_EFFORTS, launcher.REASONING_EFFORTS)
         for env, explicit, expected in (
             (None, None, None),
             ("none", None, "none"),

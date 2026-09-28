@@ -1,8 +1,9 @@
 #include "tuning/MoeTuning.hpp"
 
+#include "tuning/LinearNumerics.hpp"
+
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -15,19 +16,6 @@ namespace {
 
 constexpr CandidateId kAlternative{1};
 constexpr std::array<WorkloadId, 2> kDistributions{{{0}, {1}}};
-constexpr std::array kScratchFields{
-    &MoeBuffers::selectedExperts, &MoeBuffers::routingWeights,
-    &MoeBuffers::tileDescriptors, &MoeBuffers::tileCount,
-    &MoeBuffers::groupedRoutes, &MoeBuffers::routeRows,
-    &MoeBuffers::groupedInput, &MoeBuffers::expertIntermediate,
-    &MoeBuffers::expertOutput};
-constexpr std::array kWorkspaceFields{
-    &MoeWorkspace::selectedExpertsBytes, &MoeWorkspace::routingWeightsBytes,
-    &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
-    &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
-    &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes};
-
 uint64_t aligned(uint64_t value, uint64_t alignment) {
   if (value > std::numeric_limits<uint64_t>::max() - alignment + 1)
     throw std::overflow_error("MoE tuning fixture is too large");
@@ -41,7 +29,7 @@ struct Fixture final {
 };
 
 struct FixtureLayout final {
-  std::array<uint64_t, 13> sizes;
+  std::array<uint64_t, 4 + kMoeScratchFields.size()> sizes;
   uint64_t bytes = 0;
 };
 
@@ -53,10 +41,10 @@ FixtureLayout fixtureLayout(const std::array<MoePlan, 2> &plans) {
   // of whichever candidate happens to have the larger workspace.
   FixtureLayout layout{{rowBytes, rowBytes, rowBytes,
                          rowBytes * kDistributions.size()}};
-  for (size_t field = 0; field < kWorkspaceFields.size(); ++field)
+  for (size_t field = 0; field < kMoeScratchFields.size(); ++field)
     layout.sizes[field + 4] =
-        std::max(plans[0].workspace().*kWorkspaceFields[field],
-                 plans[1].workspace().*kWorkspaceFields[field]);
+        std::max(plans[0].workspace().*kMoeScratchFields[field].bytes,
+                 plans[1].workspace().*kMoeScratchFields[field].bytes);
   for (const uint64_t size : layout.sizes) {
     const uint64_t padded = aligned(size, 256);
     if (layout.bytes > std::numeric_limits<uint64_t>::max() - padded)
@@ -88,7 +76,10 @@ Fixture allocateFixture(metal::MetalBackend &backend,
   if (!fixture.arena)
     throw std::logic_error("MoE tuning admission did not allocate its fixture");
   uint64_t offset = 0;
+  // A field no candidate uses (the grouped sums of non-register plans) stays
+  // empty, as in the runtime arenas.
   auto view = [&](size_t index) {
+    if (!layout.sizes[index]) return metal::MetalBuffer{};
     auto result = backend.view(fixture.arena, offset, layout.sizes[index]);
     offset += aligned(layout.sizes[index], 256);
     return result;
@@ -99,15 +90,9 @@ Fixture allocateFixture(metal::MetalBackend &backend,
   const auto references = view(3);
   for (size_t i = 0; i < fixture.references.size(); ++i)
     fixture.references[i] = backend.view(references, i * layout.sizes[0], layout.sizes[0]);
-  for (size_t field = 0; field < kScratchFields.size(); ++field)
-    fixture.buffers.*kScratchFields[field] = view(field + 4);
+  for (size_t field = 0; field < kMoeScratchFields.size(); ++field)
+    fixture.buffers.scratch.*kMoeScratchFields[field].buffer = view(field + 4);
   return fixture;
-}
-
-uint16_t bf16(float value) noexcept {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return static_cast<uint16_t>(bits >> 16);
 }
 
 // Approximately unit-variance normalized inputs, reproducible without libc's
@@ -126,15 +111,15 @@ void reset(Fixture &fixture, const MoeWorkload &workload,
     };
     for (uint32_t column = 0; column < workload.shape.hiddenSize; ++column) {
       const uint64_t index = uint64_t{row} * workload.shape.hiddenSize + column;
-      input[index] = bf16(1.7320508F * random());
-      residual[index] = bf16(0.125F * random());
+      input[index] = floatToBf16(1.7320508F * random());
+      residual[index] = floatToBf16(0.125F * random());
     }
   }
   auto *output = static_cast<uint16_t *>(fixture.buffers.output.contents());
   std::fill_n(output, fixture.buffers.output.sizeBytes() / sizeof(uint16_t),
               uint16_t{0x7fc0});
-  for (auto field : kScratchFields) {
-    const auto &buffer = fixture.buffers.*field;
+  for (const MoeScratchField &field : kMoeScratchFields) {
+    const auto &buffer = fixture.buffers.scratch.*field.buffer;
     std::memset(buffer.contents(), 0, static_cast<size_t>(buffer.sizeBytes()));
   }
 }
@@ -166,7 +151,7 @@ MoeTuningResult tuneMoe(metal::MetalBackend &backend,
   using Clock = std::chrono::steady_clock;
   const auto start = Clock::now();
   const auto plans = ExecutionPlans(backend.capabilities()).moeCandidates(input.workload);
-  MoeTuningResult result{{input.workload, plans[0].config()}, {}, false, {}};
+  MoeTuningResult result{{input.workload, plans[0].configuration()}, {}, false, {}};
   WorkloadId current = kDistributions[0];
   auto recordFailure = [&](MeasurementStatus status,
                            std::exception_ptr failure = {}) {
@@ -350,7 +335,7 @@ MoeTuningResult tuneMoe(metal::MetalBackend &backend,
     if (gpuSelection.verdict == SelectionVerdict::Selected &&
         wallSelection.verdict == SelectionVerdict::Selected &&
         gpuSelection.candidate == wallSelection.candidate)
-      result.choice.configuration = plans[1].config();
+      result.choice.configuration = plans[1].configuration();
     result.complete = true;
   } catch (const Interrupted &interruption) {
     recordFailure(interruption.status);

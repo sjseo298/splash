@@ -112,7 +112,18 @@ class ProtocolFatal(EngineRuntimeError):
 
 
 class MaskComputationFailed(EngineRuntimeError):
-    pass
+    """A token mask was not delivered.
+
+    ``retryable`` marks a server condition, such as a full mask queue or a
+    stalled transport, rather than the request's constraint or provider.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False):
+        self.retryable = retryable
+        super().__init__(message)
+
+    def restate(self) -> MaskComputationFailed:
+        return MaskComputationFailed(*self.args, retryable=self.retryable)
 
 
 @dataclass(slots=True, frozen=True)
@@ -179,7 +190,6 @@ class GenerationRequest:
 class GenerationResult:
     request_id: int
     start: wire.StartEvent | None
-    tokens: tuple[int, ...]
     done: wire.DoneEvent
 
 
@@ -209,7 +219,6 @@ class RuntimeCall:
         self._error: EngineRuntimeError | None = None
         self._start: wire.StartEvent | None = None
         self._progress: wire.PromptProgressEvent | None = None
-        self._token_chunks: dict[int, tuple[int, ...]] = {}
         self._next_token_offset = 0
         self._mask_error: MaskComputationFailed | None = None
         self._callback_errors: list[BaseException] = []
@@ -322,7 +331,6 @@ class RuntimeCall:
                     f"TokensEvent stream length {next_offset} exceeds logical "
                     f"maximum {self.request.logical_max_output_tokens}"
                 )
-            self._token_chunks[event.sequence_offset] = event.tokens
             self._next_token_offset = next_offset
         self._emit(event)
         return None
@@ -391,12 +399,7 @@ class RuntimeCall:
                 raise ProtocolFatal(
                     "DoneEvent returned option logits for a generation request"
                 )
-            tokens = tuple(
-                token
-                for offset in sorted(self._token_chunks)
-                for token in self._token_chunks[offset]
-            )
-            return GenerationResult(self.request_id, self._start, tokens, done)
+            return GenerationResult(self.request_id, self._start, done)
 
     def _terminal_mask_error(self) -> MaskComputationFailed | None:
         with self._lock:
@@ -494,7 +497,9 @@ class MultiplexedRuntime:
         self._restart_count = 0
         self._startup_attempt: _StartupAttempt | None = None
         self._ready_message: wire.ReadyEvent | None = None
-        self._context_limit: int | None = None
+        self._first_ready: wire.ReadyEvent | None = None
+        # Set when a relaunch cannot help; no further engine is started.
+        self._fatal_error: EngineRuntimeError | None = None
         self._terminal_error: EngineRuntimeError | None = None
         self._pending: dict[int, RuntimeCall] = {}
         self._status_waiters: dict[int, _StatusWaiter] = {}
@@ -505,6 +510,10 @@ class MultiplexedRuntime:
         self._crash_trace = CrashTraceRing(
             self._command, enabled=os.environ.get("SPLASH_CRASH_TRACE") == "1"
         )
+        # Called with the failure once an engine that reached Ready has
+        # failed for any reason but close(). It runs, without locks, on the
+        # thread that saw the failure and must return quickly.
+        self.on_engine_failure: Callable[[EngineRuntimeError], None] | None = None
 
         if eager_start:
             self._ensure_process()
@@ -699,6 +708,18 @@ class MultiplexedRuntime:
             self._ready_message = None
         self._mask_executor.shutdown(wait=True, cancel_futures=True)
 
+    def kill(self) -> None:
+        """SIGKILL the engine now, skipping its paced teardown.
+
+        Safe in a signal handler: close() may be waiting for that teardown.
+        """
+        process = self._process
+        if process is not None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
     def _request_protocol_error(
         self, request_id: int, issue: wire.ProtocolIssue
     ) -> EngineRuntimeError:
@@ -722,6 +743,8 @@ class MultiplexedRuntime:
             with self._state_lock:
                 if self._closed:
                     raise RuntimeClosed("runtime is closed")
+                if self._fatal_error is not None:
+                    raise self._fatal_error.restate()
                 process = self._process
                 if (
                     process is not None
@@ -900,9 +923,13 @@ class MultiplexedRuntime:
         call: RuntimeCall | None = None,
         deadline: float | None = None,
     ) -> None:
-        io_deadline = time.monotonic() + self._io_timeout
-        deadline = min(deadline, io_deadline) if deadline is not None else io_deadline
-        if not self._write_lock.acquire(timeout=_remaining(deadline)):
+        # The caller's deadline bounds only the start of a frame. A started
+        # frame must be finished: then only the I/O timeout, counted from the
+        # last write that made progress, bounds it.
+        limit = time.monotonic() + self._io_timeout
+        if deadline is not None:
+            limit = min(deadline, limit)
+        if not self._write_lock.acquire(timeout=_remaining(limit)):
             raise TimeoutError("native write lock timed out")
         failure: BaseException | None = None
         finish_failure = None
@@ -918,14 +945,14 @@ class MultiplexedRuntime:
                         return
                     assert self._process is not None
                     stream = self._process.stdin
-                _remaining(deadline)
+                _remaining(limit)
                 # Record under the same lock that defines native wire order.
                 # Concurrent callers can arrive in any Python scheduling
                 # order, but a replay must reproduce the order actually
                 # written to the engine.
                 view = memoryview(encoded)
                 while offset < len(view):
-                    _remaining(deadline)
+                    _remaining(limit)
                     try:
                         written = stream.write(view[offset:])
                     except BlockingIOError:
@@ -935,11 +962,12 @@ class MultiplexedRuntime:
                         # EAGAIN, never a successful write of the whole frame.
                         with selectors.DefaultSelector() as selector:
                             selector.register(stream, selectors.EVENT_WRITE)
-                            selector.select(_remaining(deadline))
+                            selector.select(_remaining(limit))
                         continue
                     if written <= 0:
                         raise BrokenPipeError("native stdin accepted zero bytes")
                     offset += written
+                    limit = time.monotonic() + self._io_timeout
                 self._crash_trace.record_bytes(generation, "client_to_engine", encoded)
             except TimeoutError:
                 if offset == 0:
@@ -1046,12 +1074,6 @@ class MultiplexedRuntime:
 
     def _dispatch_message(self, generation: int, message: wire.Message) -> None:
         if isinstance(message, wire.ReadyEvent):
-            if int(message.feature_bits) & _REQUIRED_READY_FEATURES != (
-                _REQUIRED_READY_FEATURES
-            ):
-                raise ProtocolFatal(
-                    "native ReadyEvent is missing required native protocol features"
-                )
             with self._state_lock:
                 if generation != self._generation or self._terminal_error is not None:
                     return
@@ -1067,14 +1089,32 @@ class MultiplexedRuntime:
                     raise attempt.error.restate()
                 if time.monotonic() >= attempt.deadline:
                     raise EngineUnhealthy("native ReadyEvent timed out")
-                if (
-                    self._context_limit is not None
-                    and message.max_context_tokens != self._context_limit
+                first = self._first_ready
+                if first is None:
+                    if int(message.feature_bits) & _REQUIRED_READY_FEATURES != (
+                        _REQUIRED_READY_FEATURES
+                    ):
+                        raise ProtocolFatal(
+                            "native ReadyEvent is missing required native "
+                            "protocol features"
+                        )
+                    self._first_ready = message
+                elif (
+                    message.max_context_tokens,
+                    message.max_concurrent_requests,
+                    message.feature_bits,
+                ) != (
+                    first.max_context_tokens,
+                    first.max_concurrent_requests,
+                    first.feature_bits,
                 ):
-                    raise EngineUnhealthy(
-                        "native context window changed; restart the Splash server"
+                    # The frontend serves the first engine's limits. Every
+                    # relaunch would load the model to announce them again.
+                    self._fatal_error = EngineUnhealthy(
+                        "native context window, concurrency or features "
+                        "changed; restart the Splash server"
                     )
-                self._context_limit = message.max_context_tokens
+                    raise self._fatal_error.restate()
                 self._ready_message = message
                 attempt.event.set()
             return
@@ -1187,7 +1227,9 @@ class MultiplexedRuntime:
             )
             return
         if not self._mask_slots.acquire(blocking=False):
-            self._mask_failed(call, MaskComputationFailed("token-mask queue is full"))
+            self._mask_failed(
+                call, MaskComputationFailed("token-mask queue is full", retryable=True)
+            )
             return
 
         def compute():
@@ -1199,7 +1241,7 @@ class MultiplexedRuntime:
             future = self._mask_executor.submit(compute)
         except RuntimeError as error:
             self._mask_slots.release()
-            self._mask_failed(call, MaskComputationFailed(str(error)))
+            self._mask_failed(call, MaskComputationFailed(str(error), retryable=True))
             return
 
         def complete(completed) -> None:
@@ -1222,8 +1264,9 @@ class MultiplexedRuntime:
                     return
                 self._write_bytes(encoded, call.generation, call=call)
             except BaseException as error:
-                if isinstance(error, EngineRuntimeError):
-                    failure = MaskComputationFailed(str(error))
+                if isinstance(error, (EngineRuntimeError, TimeoutError)):
+                    # The transport, not the request's constraint, failed.
+                    failure = MaskComputationFailed(str(error), retryable=True)
                 elif isinstance(error, wire.ProtocolError):
                     failure = MaskComputationFailed(error.issue.describe())
                 else:
@@ -1267,6 +1310,7 @@ class MultiplexedRuntime:
             # kept, so its frames do not outlive the requests they ran for.
             failure = error.restate()
             self._terminal_error = failure
+            served = self._ready_message is not None
             self._ready_message = None
             attempt = self._startup_attempt
             if (
@@ -1304,6 +1348,13 @@ class MultiplexedRuntime:
                 except OSError:
                     pass
                 self._arm_kill_fallback(process)
+            listener = self.on_engine_failure
+            if served and listener and not isinstance(failure, RuntimeClosed):
+                # The failure is already delivered; a listener cannot change it.
+                try:
+                    listener(failure)
+                except Exception:
+                    pass
 
         return finish
 
@@ -1343,8 +1394,7 @@ class MultiplexedRuntime:
         # Bound the child's exit time before escalating to SIGKILL.
         try:
             process.wait(timeout=self._shutdown_grace_seconds)
-        except (OSError, subprocess.TimeoutExpired, TimeoutError, KeyboardInterrupt):
-            # A second Ctrl+C during the grace means "stop now".
+        except (OSError, subprocess.TimeoutExpired, TimeoutError):
             try:
                 process.kill()
             except OSError:

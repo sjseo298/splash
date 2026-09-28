@@ -1,12 +1,15 @@
 import array
+import errno
+import select
 import socket
+import struct
 import unittest
 from unittest import mock
 
 from referencing import Registry
 
 from dev.tests.engine.test_runtime import FakeFactory, request
-from dev.tests.test_server import FakeRuntime, Harness
+from dev.tests.test_server import FakeRuntime, Harness, no_signed_thinking
 from server import frontend as request_frontend
 from server import protocol as wire
 from server import runtime, schema_validation, tool_schema
@@ -45,7 +48,8 @@ class RequestContractTests(unittest.TestCase):
                     "max_tokens": 4096,
                     "thinking": {"type": "enabled", "budget_tokens": 1024},
                     "output_config": {"effort": effort},
-                }
+                },
+                thinking_resolver=no_signed_thinking,
             )
             self.assertEqual(converted["reasoning_effort"], effort)
 
@@ -64,9 +68,9 @@ class RequestContractTests(unittest.TestCase):
             }
         ]
         self.assertEqual(
-            normalize_messages([{"role": "user", "content": "Hi"}, *messages])[1][
-                "tool_calls"
-            ][0]["id"],
+            normalize_messages(
+                [{"role": "user", "content": "Hi"}, *messages], vision=True
+            )[1]["tool_calls"][0]["id"],
             "call_42",
         )
 
@@ -80,6 +84,29 @@ class RequestContractTests(unittest.TestCase):
         peer.sendall(b"trailing")
         peer.close()
         self.assertFalse(handler._client_disconnected())
+        self.assertTrue(handler._client_disconnected())
+
+    def test_descriptor_exhaustion_does_not_read_as_a_disconnect(self):
+        local, peer = socket.socketpair()
+        self.addCleanup(local.close)
+        self.addCleanup(peer.close)
+        handler = object.__new__(api.FrontendHandler)
+        handler.connection = local
+        exhausted = OSError(errno.EMFILE, "Too many open files")
+        with mock.patch("select.kqueue", side_effect=exhausted):
+            self.assertFalse(handler._client_disconnected())
+
+    def test_reset_client_reads_as_disconnected(self):
+        listener = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+        client = socket.create_connection(listener.getsockname())
+        accepted, _ = listener.accept()
+        self.addCleanup(accepted.close)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
+        self.assertTrue(select.select([accepted], [], [], 2)[0])
+        handler = object.__new__(api.FrontendHandler)
+        handler.connection = accepted
         self.assertTrue(handler._client_disconnected())
 
     def test_unsupported_http_version_is_rejected_before_header_validation(self):

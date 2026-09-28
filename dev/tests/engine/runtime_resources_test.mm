@@ -99,25 +99,34 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   }
   config.memoryPressure = [] { return MemoryPressure::Warning; };
 
-  // Each low ceiling fits two components, so every directory must be counted.
-  // The other ceilings must reach the real loader, whose expected weight files
-  // are deliberately absent. No actual model package is needed for this test.
-  for (uint64_t ceiling : {root.packageBytes - 1, root.packageBytes,
-                           uint64_t{0}}) {
+  // Beside its weights a model needs at least the runtime reserves, one state
+  // cell and one KV extent. The low ceiling is one byte short of all that, so
+  // every directory must be counted. The other ceilings must reach the real
+  // loader, whose expected weight files are deliberately absent. No actual
+  // model package is needed for this test.
+  const kv::Layout kvLayout = config.model.targetKvLayout;
+  const uint64_t minimumBytes =
+      root.packageBytes + model::kPipelineReserveBytes +
+      model::kRuntimeOverheadReserveBytes +
+      config.model.stateLayout.activeCellBytes() +
+      uint64_t{kvLayout.backingExtentPages()} * kvLayout.bytesPerModelPage();
+  for (uint64_t ceiling : {minimumBytes - 1, minimumBytes, uint64_t{0}}) {
     config.maximumMemoryBytes = ceiling;
     try {
       auto resources = RuntimeResources::create(config);
       throw std::runtime_error("placeholder model unexpectedly loaded");
     } catch (const RuntimeResourcesError &error) {
-      if (ceiling == root.packageBytes - 1) {
+      if (ceiling == minimumBytes - 1) {
         require(error.failure() == RuntimeResourceFailure::EngineCapacity,
                 "hard weight budget lost its engine-capacity classification");
         require(std::string(error.what()).find("[memory_planning]") !=
                     std::string::npos &&
-                    error.message().find("model weights require 49152 bytes") !=
+                    error.message().find(
+                        "require " + std::to_string(minimumBytes) + " bytes") !=
                         std::string::npos &&
-                    error.message().find("budget is 49151 bytes") !=
-                        std::string::npos,
+                    error.message().find(
+                        "budget is " + std::to_string(minimumBytes - 1) +
+                        " bytes") != std::string::npos,
                 "weight loading began before checking the memory ceiling");
       } else {
         require(error.failure() == RuntimeResourceFailure::Other,
@@ -129,6 +138,24 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   requireReachesModelLoader(config, root.path,
                             "a sufficient weight budget did not reach the "
                             "model loader");
+}
+
+// A 34.5 GiB model under a 35 GiB budget: the weights alone fit, but not
+// with what the runtime needs beside them. Startup refuses it before any
+// weight is prepared or registered.
+void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
+  TemporaryModelRoot root(23 * kGiB / 2);
+  RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
+  config.maximumMemoryBytes = 35 * kGiB;
+  try {
+    auto resources = RuntimeResources::create(config);
+    throw std::runtime_error("placeholder model unexpectedly loaded");
+  } catch (const RuntimeResourcesError &error) {
+    require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
+                std::string(error.what()).find("[memory_planning]") !=
+                    std::string::npos,
+            "a model that cannot fit reached the weight loader");
+  }
 }
 
 // The rule that keeps users off the startup floor: admission weighs
@@ -164,13 +191,43 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
   }
 }
 
+// The memory plan takes the vision category from what loaded, so a model
+// with vision whose loader produced no vision bytes must stop here.
+void testLoadedVisionIsRequiredOnlyWithVision() {
+  model::ModelPackage package;
+  package.descriptor = model::makeModelDescriptor(
+      "loaded-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
+      ops::VisionLayout{});
+  model::Qwen3_8Weights target;
+  target.actualAllocatedBytes = 1;
+  target.manifestFingerprintSha256 = "target";
+  package.target = std::move(target);
+  package.draft.actualAllocatedBytes = 1;
+  package.manifestFingerprintSha256 = "package";
+  bool rejected = false;
+  try {
+    requireLoadedModel(package);
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected && package.descriptor.hasVision(),
+          "a multimodal model without loaded vision weights was accepted");
+  package.vision.actualAllocatedBytes = 1;
+  requireLoadedModel(package);
+  package.vision.actualAllocatedBytes = 0;
+  package.descriptor.visionSource = model::VisionSource::None;
+  requireLoadedModel(package);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
       require(argc == 2, "expected metallib path");
+      testLoadedVisionIsRequiredOnlyWithVision();
       testWeightBudgetBeforeLoading(argv[1]);
+      testModelBeyondBudgetIsRefusedBeforeLoading(argv[1]);
       testStartupAdmissionIgnoresPackageSize(argv[1]);
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;

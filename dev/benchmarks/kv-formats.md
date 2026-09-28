@@ -46,7 +46,7 @@ power condition.
   width, order main/INT8/BF16/BF16/INT8/main: default INT8 cycle-time changes
   ranged from -0.08% to +0.81% on M3 and -0.71% to +0.07% on M5.
 - Native long-context runs completed through 256K for 35B in both formats on
-  both devices. Follow-up integration with PR92 completed the 27B 256K matrix
+  both devices. With PR #92 integrated, the 27B 256K matrix completed
   as well: both formats on both devices, 262,016 input tokens plus 128 output
   tokens, followed by exact-prefix replay. Each replay reused 261,984 tokens
   and matched its cold run's 128-token output exactly. Active KV pages and
@@ -57,7 +57,7 @@ The benchmark tools accept `--kv-format int8|bf16`. `attention-sweep` accepts
 `--compare-metallib BASELINE` and checks exact output equality;
 `paged-attention-plan METALLIB --long` runs the long independent references.
 
-## Combined serving validation with PR92
+## Combined serving validation with PR #92
 
 The integrated build passed all four real HTTP and runtime-oracle combinations
 (27B/35B, INT8/BF16) on M5 Pro 20. HTTP coverage includes tools, structured
@@ -71,7 +71,7 @@ The combined Python suite ran 766 tests: 764 passed and two opt-in external CLI
 routing tests were skipped. Production/CPU/sanitizers and Python 3.12–3.14 CI
 passed, as did the full Metal gate with shader validation on M5 Pro 20.
 
-The real HTTP smoke and ABBA tools now accept `--kv-format int8|bf16` and check
+The real HTTP smoke and ABBA tools accept `--kv-format int8|bf16` and check
 the running format and its quantization/scale identity. M5 Pro 20 HTTP ABBA
 against main passed transcript/usage equality and the unchanged 2% regression
 limit for both models (three samples per build, 2K/8K cold and cached requests,

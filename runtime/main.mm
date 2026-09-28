@@ -1,4 +1,3 @@
-#include "ops/Vision.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
@@ -36,10 +35,6 @@
 namespace splash {
 namespace {
 
-// One image may cover at most this many 16x16 patches (4,194,304 pixels).
-// The wire limit, the engine's request validation, and the model's vision
-// scratch are all sized from this one value.
-constexpr uint32_t kMaximumImagePatches = ops::kMaximumImagePatches;
 // Temporary host/driver allocation failures can recover during startup.
 // Preserve the desktop reserve and bound retries; configuration and compute
 // failures remain immediate and fail-closed.
@@ -55,6 +50,7 @@ struct NativeArguments final {
   model::ModelDescriptor model;
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
+  uint64_t maxCacheDiskBytes = 0;
   kv::Format kvFormat = kv::Format::Int8;
 };
 
@@ -125,7 +121,8 @@ private:
 void printUsage(std::string_view executable) {
   std::cerr << "usage: " << executable
             << " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
-               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [--kv-format int8|bf16]\n";
+               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
+               " [--kv-format int8|bf16]\n";
 }
 
 template <typename T>
@@ -184,14 +181,21 @@ std::filesystem::path requireModelRoot(std::string_view targetArgument,
 }
 
 NativeArguments parseArguments(int argc, char **argv) {
-  if ((argc != 6 && argc != 8) || std::string_view(argv[1]) != "serve-native") {
+  if (argc < 6 || std::string_view(argv[1]) != "serve-native") {
     throw UsageError("expected the serve-native command");
   }
   NativeArguments result;
-  if (argc == 8) {
-    const std::string_view format(argv[7]);
-    if (std::string_view(argv[6]) != "--kv-format" ||
-        (format != "int8" && format != "bf16"))
+  int next = 6;
+  if (next < argc && std::string_view(argv[next]) != "--kv-format") {
+    const std::string_view quota(argv[next++]);
+    if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
+      throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
+  }
+  if (next < argc) {
+    if (argc - next != 2 || std::string_view(argv[next]) != "--kv-format")
+      throw UsageError("expected --kv-format int8 or bf16");
+    const std::string_view format(argv[next + 1]);
+    if (format != "int8" && format != "bf16")
       throw UsageError("--kv-format requires int8 or bf16");
     result.kvFormat = format == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
   }
@@ -240,11 +244,9 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.model = arguments.model;
   config.resources.buildId = SPLASH_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
+  config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
   config.resources.kvFormat = arguments.kvFormat;
-  config.resources.maximumImagePatches = kMaximumImagePatches;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
-  config.nativeLoop.engine.maxImagePatches = kMaximumImagePatches;
-  config.protocolLimits.maxImagePatches = kMaximumImagePatches;
   config.nativeLoop.engineInstanceId = engineInstanceId();
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
   config.protocolLimits.maxTokenBatch =
@@ -257,7 +259,8 @@ bootstrapConfig(const NativeArguments &arguments) {
 
 // SIGTERM, SIGINT and SIGHUP end the transport loop instead of killing the
 // process, so the KV backing is released one extent at a time by the normal
-// destructors. SIGPIPE is ignored: a closed parent pipe surfaces as EPIPE,
+// destructors. An inherited ignored SIGHUP (nohup) stays ignored, as it does
+// for the server. SIGPIPE is ignored: a closed parent pipe surfaces as EPIPE,
 // which the transport already reports as an I/O failure.
 std::atomic<engine::FdTransport *> gShutdownTransport{nullptr};
 
@@ -280,8 +283,13 @@ public:
     action.sa_handler = requestShutdownFromSignal;
     sigemptyset(&action.sa_mask);
     action.sa_flags = 0;
-    for (const int number : {SIGTERM, SIGINT, SIGHUP})
+    for (const int number : {SIGTERM, SIGINT, SIGHUP}) {
+      struct sigaction inherited {};
+      if (number == SIGHUP && sigaction(number, nullptr, &inherited) == 0 &&
+          inherited.sa_handler == SIG_IGN)
+        continue;
       sigaction(number, &action, nullptr);
+    }
     std::signal(SIGPIPE, SIG_IGN);
   }
   ShutdownSignals(const ShutdownSignals &) = delete;
@@ -313,8 +321,7 @@ int runNative(const NativeArguments &arguments) {
         published->nativeLoop().resourceWaitSnapshot());
   };
 
-  const auto recoveryDeadline =
-      std::chrono::steady_clock::now() + kStartupMemoryRecoveryTimeout;
+  engine::StartupRetryWindow recovery(kStartupMemoryRecoveryTimeout);
   bool reportedRecoveryWait = false;
   std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
   while (!bootstrap) {
@@ -331,12 +338,9 @@ int runNative(const NativeArguments &arguments) {
       if (transport.shutdownRequested())
         return static_cast<int>(engine::NativeProcessExit::CleanEof);
       const auto now = std::chrono::steady_clock::now();
-      const auto failure = error.report().resourceFailure;
-      if ((failure != engine::RuntimeResourceFailure::HostCapacity &&
-           failure != engine::RuntimeResourceFailure::DriverAllocation) ||
-          now >= recoveryDeadline) {
+      const auto recoveryDeadline = recovery.retryUntil(error.report(), now);
+      if (!recoveryDeadline)
         throw;
-      }
       if (!reportedRecoveryWait) {
         std::cerr
             << "Waiting for sufficient available memory to start; "
@@ -345,7 +349,7 @@ int runNative(const NativeArguments &arguments) {
       }
       const auto resumeAt = std::min(
           now + std::chrono::steady_clock::duration(kStartupMemoryRecoveryPoll),
-          recoveryDeadline);
+          *recoveryDeadline);
       while (std::chrono::steady_clock::now() < resumeAt &&
              !transport.shutdownRequested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -382,12 +386,17 @@ int runNative(const NativeArguments &arguments) {
         pressurePolicy.update(memory, now, wait.memory || wait.suspended);
     if (!directive.reclaimEmptyKvExtents)
       return false;
-    static_cast<void>(published->nativeLoop().reclaimMemory(directive));
+    const engine::MemoryReclaimResult reclaim =
+        published->nativeLoop().reclaimMemory(directive);
+    pressurePolicy.reclaimed(directive, reclaim);
+    governor.reclaimed(reclaim.outcome);
     static_cast<void>(resources.backend().refreshMemoryStats());
-    // KV backing is returned one extent at a time. Ask to run again at the
-    // next command-free point while a release is still in flight, so the
-    // rest of the empty backing follows without a burst of kernel work.
-    return published->nativeLoop().reclaimDeferred();
+    // KV backing is returned one extent at a time, and a target that
+    // transfers held back continues as they land. Ask to run again at the
+    // next command-free point meanwhile, so the rest follows without a
+    // burst of kernel work.
+    return published->nativeLoop().reclaimDeferred() ||
+           reclaim.outcome == engine::ReclaimOutcome::Pending;
   });
   const auto exit = transport.run(bootstrap->nativeLoop());
   switch (exit) {
@@ -397,7 +406,8 @@ int runNative(const NativeArguments &arguments) {
     std::cerr << "error: native transport stopped after a protocol failure\n";
     break;
   case engine::NativeProcessExit::EngineFailure:
-    std::cerr << "error: native transport stopped after an engine failure\n";
+    std::cerr << "error: native transport stopped after an engine failure ("
+              << bootstrap->nativeLoop().engineFailure() << ")\n";
     break;
   case engine::NativeProcessExit::IoFailure:
     std::cerr << "error: native transport stopped after an I/O failure\n";
@@ -413,12 +423,24 @@ void printBootstrapError(const engine::RuntimeBootstrapReport &report) {
   }
 }
 
+// The engine's device rule, which the launcher runs before any download:
+// serve-native applies it only once the model is prepared.
+int checkDevice() {
+  const auto message = metal::probeDeviceCapabilities().validationMessage();
+  if (!message)
+    return 0;
+  std::cerr << "error: " << *message << '\n';
+  return static_cast<int>(engine::NativeProcessExit::EngineFailure);
+}
+
 } // namespace
 } // namespace splash
 
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
+      if (argc == 2 && std::string_view(argv[1]) == "device-check")
+        return splash::checkDevice();
       splash::NativeArguments arguments = splash::parseArguments(argc, argv);
       return splash::runNative(arguments);
     } catch (const splash::UsageError &error) {

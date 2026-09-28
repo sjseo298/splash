@@ -3,6 +3,7 @@
 #include "engine/FdTransport.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -35,8 +36,9 @@ private:
 
 class Executor final : public model::Model {
 public:
+  // No request gets a lane: one waits for it until its deadline.
   StateAdmission begin(const ModelRequest &) override {
-    return {0, StateFailure::None};
+    return {{}, StateFailure::ConcurrencyLimit};
   }
   void suspend(uint64_t) override {}
   StateAdmission resume(const ModelRequest &) override {
@@ -145,6 +147,58 @@ void testShutdownRequestAndControlContinuation() {
   }
 }
 
+// With no input and no command in flight, the loop sleeps until the
+// engine's next deadline and then fails the request that reached it.
+void testLoopWakesForAnEngineDeadline() {
+  Pipes pipes;
+  Backing backing;
+  KvPool pool{backing};
+  engine::Cache resources{pool, CacheNamespace{}};
+  Executor executor;
+  engine::FdTransport transport{pipes.input[0], pipes.output[1]};
+  std::vector<protocol::ErrorEvent> errors;
+  engine::NativeRuntime loop{
+      {}, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        // Each call carries one whole frame.
+        protocol::FrameParser parser;
+        auto step = parser.consume(bytes);
+        if (!step.frame)
+          return;
+        auto message = protocol::decodeFrame(*step.frame);
+        if (message &&
+            std::holds_alternative<protocol::ErrorEvent>(*message.value)) {
+          errors.push_back(std::get<protocol::ErrorEvent>(*message.value));
+          transport.requestShutdown();
+        }
+      },
+      [] { return std::string("{\"schema_version\":5}"); }};
+  loop.announceReady();
+  protocol::RequestFrame request;
+  request.requestId = 5;
+  request.promptTokens = {1, 2, 3};
+  request.logicalMaxOutputTokens = 1;
+  request.absoluteDeadlineUnixMicros =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count() +
+      60'000'000;
+  request.remainingDeadlineMicros = 20'000;
+  auto wire = protocol::serializeMessage(protocol::Message{request});
+  require(static_cast<bool>(wire), "request encoding failed");
+  require(write(pipes.input[1], wire.value->data(), wire.value->size()) ==
+              static_cast<ssize_t>(wire.value->size()),
+          "failed to send the request");
+  // The input stays open. The alarm turns a missed wake-up into a failure
+  // instead of a hang.
+  alarm(10);
+  const engine::NativeProcessExit exit = transport.run(loop);
+  alarm(0);
+  require(exit == engine::NativeProcessExit::CleanEof && errors.size() == 1 &&
+              errors[0].requestId == 5 && errors[0].code == "deadline_exceeded",
+          "loop did not wake for the request deadline");
+}
+
 void testCleanEofAndProtocolFailure() {
   require(run({}) == engine::NativeProcessExit::CleanEof,
           "empty clean input did not return clean EOF");
@@ -159,6 +213,7 @@ int main() {
   try {
     testCleanEofAndProtocolFailure();
     testShutdownRequestAndControlContinuation();
+    testLoopWakesForAnEngineDeadline();
     std::cout << "native fd transport tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

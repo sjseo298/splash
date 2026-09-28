@@ -2,7 +2,6 @@
 
 #include "metal/DeviceCapabilities.hpp"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -116,6 +115,9 @@ private:
   friend class MetalBackend;
 };
 
+// Tiles [bufferOffsetBytes, bufferOffsetBytes + sizeBytes) of a
+// placement-sparse buffer, never a view with an offset, backed from
+// heapOffsetBytes of a placement heap.
 struct SparseMapping {
   MetalBuffer buffer;
   uint64_t bufferOffsetBytes = 0;
@@ -258,11 +260,22 @@ private:
   AllocationFailure failure_;
 };
 
+// The capabilities a backend reads, without loading kernels or allocating:
+// enough to refuse an unsupported Mac before a model is downloaded. Only a
+// backend also exercises placement-sparse mapping.
+[[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
+
 // Permits exactly one submitted-but-not-applied command on its command queue.
 class MetalBackend final {
 public:
+  // A sparse map a command waits for, or an unmap, still pending after
+  // sparseTimeoutMilliseconds fails the command or the backend. Buffers kept
+  // resident stay wired until residencyKeepAliveSeconds pass without a
+  // command.
   explicit MetalBackend(std::string metallibPath,
-                        double commandTimeoutSeconds = 120.0);
+                        double commandTimeoutSeconds = 120.0,
+                        uint32_t sparseTimeoutMilliseconds = 30000,
+                        double residencyKeepAliveSeconds = 600.0);
   ~MetalBackend();
   // Invoked before allocations and submissions; may throw to stop bootstrap.
   void setOperationGuard(std::function<void()> guard);
@@ -277,9 +290,6 @@ public:
   MetalBackend &operator=(MetalBackend &&) noexcept;
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
-  // Digest of the immutable bytes used to create this backend's library,
-  // independent of later replacement or removal of its original file path.
-  [[nodiscard]] const std::array<uint8_t, 32> &metallibSha256() const noexcept;
 
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
@@ -324,6 +334,17 @@ public:
                                              std::string_view label = {});
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
+
+  // Metal wires a buffer only while a command uses it and a few seconds
+  // after, so memory pressure can drop idle weights and the next request
+  // reads them from disk again. A kept buffer (the base allocation of a view)
+  // is wired from here on until the keep-alive passes without a command, and
+  // again from the next command, until the allocation's last view is gone.
+  // Keeping a buffer twice throws.
+  void keepResident(const MetalBuffer &buffer);
+  // The kept bytes whose residency the keep-alive has ended, until the next
+  // command holds them again; Metal unwires them shortly after the end.
+  [[nodiscard]] uint64_t lapsedResidentBytes() const noexcept;
 
   // Encodes exactly one compute dispatch, commits it, waits for completion,
   // and reports both GPU and end-to-end wall time.

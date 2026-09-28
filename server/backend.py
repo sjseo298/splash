@@ -13,6 +13,7 @@ if __package__:
     from . import protocol as wire
     from . import runtime as engine_runtime
     from .constraints import TokenConstraint
+    from .diagnostics import print_status
     from .errors import APIError, NativeError
     from .latency import RequestLatency
     from .metrics import metrics_dict
@@ -22,6 +23,7 @@ else:
     import json_codec
     import protocol as wire
     from constraints import TokenConstraint
+    from diagnostics import print_status
     from errors import APIError, NativeError
     from latency import RequestLatency
     from metrics import metrics_dict
@@ -269,6 +271,8 @@ class NativeBackend:
         self.status_refresh_thread = None
         self.status_refresh_failures = 0
         self.status_refresh_after = 0.0
+        # Why the engine cannot serve: its failure or the last failed restart.
+        self.engine_error = None
         self.terminals = queue.Queue()
         self.finalizer = threading.Thread(
             target=self._finalize_loop,
@@ -276,6 +280,21 @@ class NativeBackend:
             daemon=True,
         )
         self.finalizer.start()
+        runtime.on_engine_failure = self._engine_failed
+
+    def _engine_unavailable(self, event, error):
+        # Clients get the reason with every refusal until a status succeeds.
+        with self.lock:
+            if self.closing:
+                return
+            self.engine_error = str(error)
+        print_status(f"{event} · {error}", error=True)
+
+    def _engine_failed(self, error):
+        self._engine_unavailable("Engine failed", error)
+        # Start the backed-off recovery now: an engine that fails while idle
+        # would otherwise reload only after the next request was refused.
+        self._ensure_background_status_refresh()
 
     def can_submit(self):
         with self.lock:
@@ -312,11 +331,19 @@ class NativeBackend:
             self.status_snapshot_at = time.monotonic()
             self.status_refresh_failures = 0
             self.status_refresh_after = 0.0
+            restarted = self.engine_error is not None
+            self.engine_error = None
+        if restarted:
+            print_status("Engine restarted")
 
     def _background_status_refresh(self):
         try:
             if not self.runtime.ready:
-                self.runtime.wait_ready()
+                try:
+                    self.runtime.wait_ready()
+                except Exception as error:
+                    self._engine_unavailable("Engine restart failed", error)
+                    raise
             event = self.runtime.status(timeout=STATUS_BACKGROUND_TIMEOUT_SECONDS)
             self._cache_status(self._decode_status_event(event))
         except Exception:
@@ -385,6 +412,7 @@ class NativeBackend:
             self._cache_status(snapshot)
         with self.lock:
             transport_ready = not self.closing and self.runtime.ready
+            engine_error = self.engine_error
         snapshot["transport"] = {
             "ready": transport_ready,
             "recovering": not self.closing and not transport_ready,
@@ -398,7 +426,7 @@ class NativeBackend:
             ),
         }
         if stale_error is not None:
-            snapshot["transport"]["error"] = str(stale_error)
+            snapshot["transport"]["error"] = engine_error or str(stale_error)
         metal = snapshot.get("metal")
         if (
             not transport_ready
@@ -739,6 +767,8 @@ class NativeBackend:
         if isinstance(error, engine_runtime.CapacityExhausted):
             return APIError(503, str(error), "capacity_exhausted")
         if isinstance(error, engine_runtime.MaskComputationFailed):
+            if error.retryable:
+                return APIError(503, str(error), "runtime_busy")
             return APIError(400, str(error), "constraint_error")
         if isinstance(
             error, (engine_runtime.EngineUnhealthy, engine_runtime.RuntimeClosed)

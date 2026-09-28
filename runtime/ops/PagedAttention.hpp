@@ -5,6 +5,7 @@
 #include "metal/abi/PagedAttention.h"
 #include "ops/PagedKv.hpp"
 #include "ops/Linear.hpp"
+#include "ops/Normalization.hpp"
 
 #include <algorithm>
 #include <array>
@@ -36,10 +37,10 @@ inline constexpr uint32_t kQ8VerifyPagesPerSplit =
 static_assert(kQ8VerifySplits >= 1 && kQ8VerifySplits <= kQ8VerifyMaximumSplits);
 static_assert(kQ8VerifyPagesPerSplit >= 1);
 
-// One lane's verify split count: never fewer than the configured base, one
-// more split per kQ8VerifyPagesPerSplit visible pages, never more than the
-// maximum the partial workspace is sized for. It depends only on the lane's
-// own history, so batching never changes a lane's arithmetic.
+// One lane's verify split count: one split per kQ8VerifyPagesPerSplit
+// visible pages, never fewer than the configured base and never more than
+// the maximum the partial workspace is sized for. It depends only on the
+// lane's own history, so batching never changes a lane's arithmetic.
 [[nodiscard]] constexpr uint32_t
 q8VerifyAttentionSplits(uint32_t baseSplits, uint32_t committedTokens,
                         uint32_t activeRows) noexcept {
@@ -289,7 +290,7 @@ public:
 
   static void
   addPrefillProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
-                       metal::MetalBuffer queryNorm, metal::MetalBuffer keyNorm,
+                       const NormWeights &queryNorm, const NormWeights &keyNorm,
                        metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                        metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                        metal::MetalBuffer chunkValues, uint32_t tokens,
@@ -303,20 +304,22 @@ public:
                              uint32_t queryHeads, kv::Layout layout);
   static void
   addVerifyProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
-                      metal::MetalBuffer queryNorm, metal::MetalBuffer keyNorm,
+                      const NormWeights &queryNorm, const NormWeights &keyNorm,
                       metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                       metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                       metal::MetalBuffer chunkValues, uint32_t rowsPerLane,
                       uint32_t cacheStride, uint32_t rowStride,
                       uint32_t queryHeads, kv::Layout layout,
                       uint32_t lanes);
-  static void addVerifyGate(metal::CommandGraph &graph,
-                            metal::MetalBuffer packed,
-                            metal::MetalBuffer attention,
-                            metal::MetalBuffer hidden, uint32_t rowsPerLane,
-                            uint32_t cacheStride, uint32_t rowStride,
-                            uint32_t queryHeads, kv::Layout layout,
-                            uint32_t lanes, LinearScratch scratch = {});
+  // Also writes the out-projection's `input` table when it needs one.
+  static PreparedInput addVerifyGate(metal::CommandGraph &graph,
+                                     metal::MetalBuffer packed,
+                                     metal::MetalBuffer attention,
+                                     metal::MetalBuffer hidden, uint32_t rowsPerLane,
+                                     uint32_t cacheStride, uint32_t rowStride,
+                                     uint32_t queryHeads, kv::Layout layout,
+                                     uint32_t lanes, LinearScratch scratch = {},
+                                     LinearInput input = LinearInput::Plain);
 
   [[nodiscard]] static kv::Q8ChunkedPrefillParams
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,

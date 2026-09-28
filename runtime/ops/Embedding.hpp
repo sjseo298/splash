@@ -10,7 +10,7 @@ namespace splash::ops {
 class Embedding final {
 public:
   static void add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
-                  const Q4Projection &table, metal::MetalBuffer output,
+                  const EmbeddingWeights &table, metal::MetalBuffer output,
                   uint32_t rows);
 };
 

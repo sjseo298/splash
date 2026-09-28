@@ -6,7 +6,6 @@
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 
-#include <CommonCrypto/CommonDigest.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -77,17 +76,6 @@ struct TemporaryMetallib final {
     ~TemporaryMetallib() { ::unlink(path.c_str()); }
     std::string path;
 };
-
-std::array<uint8_t, 32> libraryDigest(NSData *data) {
-    require(data && data.length &&
-                data.length <= std::numeric_limits<CC_LONG>::max(),
-            "invalid test library data");
-    std::array<uint8_t, 32> digest{};
-    require(CC_SHA256(data.bytes, static_cast<CC_LONG>(data.length),
-                      digest.data()) != nullptr,
-            "test library SHA-256 failed");
-    return digest;
-}
 
 template <typename Function>
 void requireBackendError(Function &&function, const std::string &message) {
@@ -205,6 +193,13 @@ IMP originalCommandCommit = nullptr;
 void commitBehindWatchdogGate(id command, SEL selector) {
     [command encodeWaitForEvent:commandWatchdogGate value:1];
     reinterpret_cast<void (*)(id, SEL)>(originalCommandCommit)(command, selector);
+}
+
+std::atomic<unsigned> commits{0};
+IMP originalCountedCommit = nullptr;
+void countCommit(id command, SEL selector) {
+    ++commits;
+    reinterpret_cast<void (*)(id, SEL)>(originalCountedCommit)(command, selector);
 }
 
 MTLCommandBufferStatus terminalCommandStatus(id command, SEL selector) {
@@ -387,6 +382,115 @@ void pendingCommandStillTimesOut(const std::string &metallibPath) {
     std::cout << "PASS pending GPU command watchdog and resource lifetime\n";
 }
 
+// Kept buffers stay held until the keep-alive passes without a command, the
+// next command holds them again at once, and a buffer's last view takes it
+// out of the set.
+void keptBuffersStayResident(const std::string &metallibPath) {
+    constexpr double kKeepAliveSeconds = 1.0;
+    MetalBackend backend(metallibPath, 120.0, 30000, kKeepAliveSeconds);
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    MetalBuffer dropped = backend.allocateBuffer(page);
+    MetalBuffer used = backend.allocateBuffer(page);
+    const uint64_t each = backend.memoryStats().allocatedBytes / 2;
+    const auto start = std::chrono::steady_clock::now();
+    backend.keepResident(backend.view(dropped, 0, 64));
+    backend.keepResident(used);
+    require(backend.lapsedResidentBytes() == 0, "kept buffers were not held at once");
+    requireBackendError([&] { backend.keepResident(dropped); },
+                        "the base of a kept view was kept again");
+    while (!backend.lapsedResidentBytes() &&
+           std::chrono::steady_clock::now() - start < std::chrono::seconds(5))
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const std::chrono::duration<double> lapsedAfter = std::chrono::steady_clock::now() - start;
+    require(backend.lapsedResidentBytes() == 2 * each &&
+                lapsedAfter.count() >= kKeepAliveSeconds,
+            "kept buffers did not lapse once the keep-alive passed without a command");
+    dropped = {};
+    require(backend.lapsedResidentBytes() == each,
+            "a buffer whose last view is gone is still kept");
+    const uint32_t count = 1, increment = 7;
+    *static_cast<uint32_t *>(used.contents()) = 0;
+    ComputeDispatch dispatch{"test_add_u32", {{0, used}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    auto ticket = backend.submitAsync(dispatch);
+    require(backend.lapsedResidentBytes() == 0,
+            "a command did not hold the kept buffers again");
+    (void)ticket.wait();
+    require(*static_cast<uint32_t *>(used.contents()) == increment,
+            "a command on a kept buffer produced the wrong result");
+    std::cout << "PASS kept buffers stay resident keep_alive_seconds=" << kKeepAliveSeconds
+              << " lapsed_after_seconds=" << lapsedAfter.count() << '\n';
+}
+
+// Keeping, lapsing and holding again race the heartbeat while another thread
+// drops kept buffers, as command completion can, and the backend is then
+// destroyed with its heartbeat live and a kept buffer outliving it. Nothing
+// may block, and every command must see its buffer.
+void residencyRacesTheHeartbeat(const std::string &metallibPath) {
+    constexpr double kKeepAliveSeconds = 0.05;
+    constexpr int kRounds = 24;
+    auto backend = std::make_unique<MetalBackend>(metallibPath, 120.0, 30000,
+                                                  kKeepAliveSeconds);
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    MetalBuffer used = backend->allocateBuffer(page);
+    backend->keepResident(used);
+    *static_cast<uint32_t *>(used.contents()) = 0;
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::vector<MetalBuffer> handed;
+    bool finished = false;
+    std::thread dropper([&] {
+        std::unique_lock lock(mutex);
+        while (!finished || !handed.empty()) {
+            ready.wait(lock, [&] { return finished || !handed.empty(); });
+            std::vector<MetalBuffer> drop = std::move(handed);
+            handed.clear();
+            lock.unlock();
+            drop.clear();
+            lock.lock();
+        }
+    });
+    const uint32_t count = 1, increment = 1;
+    ComputeDispatch dispatch{"test_add_u32", {{0, used}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    int lapses = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        MetalBuffer kept = backend->allocateBuffer(page);
+        backend->keepResident(kept);
+        {
+            std::lock_guard lock(mutex);
+            handed.push_back(std::move(kept));
+        }
+        ready.notify_one();
+        // Every third round lets the heartbeat end residency, so that its
+        // command holds the set again.
+        if (round % 3 == 2) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!backend->lapsedResidentBytes() &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            lapses += backend->lapsedResidentBytes() != 0;
+        }
+        (void)backend->submitAsync(dispatch).wait();
+    }
+    {
+        std::lock_guard lock(mutex);
+        finished = true;
+    }
+    ready.notify_one();
+    dropper.join();
+    require(*static_cast<uint32_t *>(used.contents()) == kRounds,
+            "a command racing the residency heartbeat produced the wrong result");
+    require(lapses == kRounds / 3, "residency did not lapse between the racing commands");
+    (void)backend->submitAsync(dispatch).wait();
+    backend.reset();
+    used = {};
+    std::cout << "PASS residency races the heartbeat rounds=" << kRounds
+              << " lapses=" << lapses << '\n';
+}
+
 id<MTLSharedEvent> submissionGate = nil;
 id<MTLSharedEvent> delayedMappingEvent = nil;
 IMP originalSparseSignal = nullptr;
@@ -405,10 +509,14 @@ void delayMappingSignal(id queue, SEL selector, id<MTLSharedEvent> event, uint64
 void backendDeferredSubmission(const std::string &metallibPath) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    // A command buffer of the class the backend commits.
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
     constexpr uint64_t tile = MetalBackend::kPlacementSparsePageBytes;
     // Exercise the real submission/ticket path, not just the event helper.
     for (const std::string mode : {"resume", "stop", "timeout", "teardown-unmap"}) {
-        auto backend = std::make_unique<MetalBackend>(metallibPath);
+        // "timeout" gives up on the mapping after 500 ms instead of 30 s.
+        auto backend = std::make_unique<MetalBackend>(
+            metallibPath, 120.0, mode == "timeout" ? 500 : 30000);
         auto sparse = backend->allocatePlacementSparseBuffer(tile, tile, "gated-map");
         auto heap = backend->allocatePlacementHeap(tile, tile, "gated-heap");
         SparseMapping mapping{sparse, 0, tile, 0};
@@ -432,9 +540,10 @@ void backendDeferredSubmission(const std::string &metallibPath) {
                 "mapping test gate was not installed");
         if (mode == "teardown-unmap") {
             backend->unmapSparse({&mapping, 1}, std::move(heap));
-            const auto start = std::chrono::steady_clock::now();
+            // The unmap (event 4) waits on the sparse queue for the withheld
+            // mapping event: teardown must return before it completes.
             backend.reset();
-            require(std::chrono::steady_clock::now() - start < std::chrono::seconds(2),
+            require(delayedMappingEvent.signaledValue < 4,
                     "backend teardown waited for the mapping queue");
             require([submissionGate waitUntilSignaledValue:1 timeoutMS:5000],
                     "test mapping did not complete");
@@ -446,6 +555,10 @@ void backendDeferredSubmission(const std::string &metallibPath) {
         std::atomic<unsigned> callbacks{0};
         std::promise<void> completion;
         auto notified = completion.get_future();
+        commits = 0;
+        MethodReplacement counting(command, @selector(commit),
+                                   reinterpret_cast<IMP>(countCommit));
+        originalCountedCommit = counting.original;
         auto ticket = backend->submitAsync(dispatch, [&](uint64_t) {
             if (++callbacks == 1) completion.set_value();
         });
@@ -458,15 +571,17 @@ void backendDeferredSubmission(const std::string &metallibPath) {
         requireBackendError([&] { (void)backend->submitAsync(dispatch); },
                             "deferred command did not hold the submission gate");
         if (mode == "resume") {
-            std::this_thread::sleep_for(std::chrono::seconds(6));
-            require(!ticket.ready() && callbacks == 0,
-                    "backend completed a command before its mapping");
+            // The command waits on the host and reaches the GPU only once its
+            // mapping completes, so no GPU queue timeout can run out on it.
+            require(!ticket.ready() && callbacks == 0 && commits == 0,
+                    "backend committed a command before its mapping");
             require([submissionGate waitUntilSignaledValue:1 timeoutMS:5000],
                     "test mapping did not complete");
             delayedMappingEvent.signaledValue = 3;
             (void)ticket.wait();
             requireNotifiedOnce();
-            require(backend->healthy(), "resumed ticket poisoned the backend");
+            require(backend->healthy() && commits == 1,
+                    "resumed ticket poisoned the backend");
             auto *words = static_cast<uint32_t *>(readback.contents());
             for (uint32_t i = 0; i < count; ++i)
                 require(words[i] == seed + i, "deferred command produced wrong output");
@@ -474,11 +589,8 @@ void backendDeferredSubmission(const std::string &metallibPath) {
             backend->drainSparseUnmaps();
             awaitSparseRelease(*backend, 0);
         } else {
-            const auto start = std::chrono::steady_clock::now();
             if (mode == "stop") backend->stop();
-            const auto deadline = start + std::chrono::seconds(mode == "stop" ? 2 : 35);
-            while (!ticket.ready() && std::chrono::steady_clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            requireNotifiedOnce();
             require(ticket.ready(), "stopped/timed-out mapping did not finish its ticket");
             try {
                 (void)ticket.wait();
@@ -488,7 +600,6 @@ void backendDeferredSubmission(const std::string &metallibPath) {
                 require(message.find(mode == "stop" ? "stopped before" : "wait exceeded") !=
                             std::string::npos, "deferred failure lost its cause: " + message);
             }
-            requireNotifiedOnce();
             require(!backend->healthy(), "failed ticket did not poison the backend");
             requireBackendError([&] { (void)backend->submitAsync(dispatch); },
                                 "stopped backend accepted new work");
@@ -498,7 +609,7 @@ void backendDeferredSubmission(const std::string &metallibPath) {
             delayedMappingEvent.signaledValue = 3;
             require([delayedMappingEvent waitUntilSignaledValue:3 timeoutMS:5000],
                     "map ownership did not survive backend teardown");
-            require(static_cast<uint32_t *>(readback.contents())[0] == 0,
+            require(commits == 0 && static_cast<uint32_t *>(readback.contents())[0] == 0,
                     "cancelled deferred command ran on the GPU");
         }
         std::cout << "PASS backend deferred submission " << mode << '\n';
@@ -533,6 +644,9 @@ void placementProbeFailures(const std::string &metallibPath) {
         MetalBackend backend(metallibPath);
         require(!backend.capabilities().supportsPlacementSparse,
                 "unsupported device was not preserved as a capability result");
+        require(splash::metal::probeDeviceCapabilities().validationError().value_or("") ==
+                    "placement_sparse_required",
+                "the device check accepted a device without placement-sparse buffers");
     }
     {
         MethodReplacement replacement(device, @selector(supportsPlacementSparse),
@@ -946,7 +1060,6 @@ void run(const std::string &metallibPath) {
     backendDeferredSubmission(metallibPath);
     NSData *libraryData = [NSData dataWithContentsOfFile:
         [NSString stringWithUTF8String:metallibPath.c_str()]];
-    const auto expectedDigest = libraryDigest(libraryData);
     TemporaryMetallib temporary;
     NSString *temporaryPath = [NSString stringWithUTF8String:temporary.path.c_str()];
     require([libraryData writeToFile:temporaryPath options:0 error:nullptr],
@@ -968,18 +1081,11 @@ void run(const std::string &metallibPath) {
             "operation guard leaked memory or poisoned the backend");
     backend.setOperationGuard({});
 
-    require(backend.metallibSha256() == expectedDigest,
-            "backend digest does not match the loaded library bytes");
     NSData *replacement = [@"replaced after library loading"
         dataUsingEncoding:NSUTF8StringEncoding];
     require([replacement writeToFile:temporaryPath
                             options:NSDataWritingAtomic error:nullptr],
             "could not replace temporary metallib");
-    require(libraryDigest([NSData dataWithContentsOfFile:temporaryPath]) !=
-                expectedDigest,
-            "temporary metallib replacement did not change its bytes");
-    require(backend.metallibSha256() == expectedDigest,
-            "backend digest followed the replaced library path");
     // All existing pipeline/dispatch checks below run from the original
     // loaded library even though its former path now contains invalid bytes.
     const auto &capabilities = backend.capabilities();
@@ -998,6 +1104,12 @@ void run(const std::string &metallibPath) {
             "threadgroup thread capability is insufficient");
     require(capabilities.supportsPlacementSparse,
             "placement-sparse capability is missing");
+    const auto probed = splash::metal::probeDeviceCapabilities();
+    require(probed.deviceName == capabilities.deviceName &&
+                probed.appleGpuFamily == capabilities.appleGpuFamily &&
+                probed.macosVersion() == capabilities.macosVersion() &&
+                probed.supportsPlacementSparse && !probed.validationMessage(),
+            "the device check read the device differently from the backend");
     require(backend.healthy(), "new backend is unhealthy");
     require(backend.submissionCount() == 0, "new backend has submissions");
     require(backend.pipelineCount() == 0, "pipeline cache is not empty");
@@ -1146,6 +1258,20 @@ void run(const std::string &metallibPath) {
     requireBackendError(
         [&] { (void)backend.submit(missingPipeline); },
         "missing pipeline was accepted");
+    {
+        // A binding takes one of the argument table's 31 entries of its own.
+        ComputeDispatch rebound;
+        rebound.pipelineName = "test_add_u32";
+        rebound.buffers = {{0, view}};
+        rebound.bytes = {{0, &kIncrement, sizeof(kIncrement)}};
+        requireBackendError(
+            [&] { (void)backend.submit(rebound); },
+            "a binding index bound twice was accepted");
+        rebound.bytes = {{31, &kIncrement, sizeof(kIncrement)}};
+        requireBackendError(
+            [&] { (void)backend.submit(rebound); },
+            "a binding index past the argument table was accepted");
+    }
     require(backend.healthy(),
             "a descriptor error incorrectly poisoned the backend");
     require(backend.unhealthyReason().empty(),
@@ -1239,6 +1365,25 @@ void run(const std::string &metallibPath) {
                 "sparse mapping was not visible to the compute queue");
     }
 
+    // Tiles are counted from the start of the buffer, so a view with an
+    // offset can be neither mapped nor unmapped: its tile 0 is not the
+    // buffer's.
+    MetalBuffer wide = backend.allocatePlacementSparseBuffer(
+        2 * kSparseTileBytes, kSparseTileBytes, "sparse-view-test");
+    SparseMapping viewMapping{
+        backend.view(wide, kSparseTileBytes, kSparseTileBytes), 0,
+        kSparseTileBytes, 0};
+    requireBackendError(
+        [&] { backend.mapSparse(heap, {&viewMapping, 1}); },
+        "a sparse view with an offset was mapped");
+    requireBackendError(
+        [&] { backend.unmapSparse({&viewMapping, 1}, std::move(heap)); },
+        "a sparse view with an offset was unmapped");
+    require(heap && backend.healthy(),
+            "a rejected view mapping took the heap or poisoned the backend");
+    viewMapping.buffer = {};
+    wide = {};
+
     // Unmapping is asynchronous: the backend owns the heap until the sparse
     // queue reports completion, and the caller's handle is left empty.
     requireBackendError(
@@ -1299,6 +1444,8 @@ int main(int argc, const char *argv[]) {
             terminalCommandRecovers(argv[1], false, true);
             terminalCommandRecovers(argv[1], true);
             pendingCommandStillTimesOut(argv[1]);
+            keptBuffersStayResident(argv[1]);
+            residencyRacesTheHeartbeat(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()

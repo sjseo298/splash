@@ -120,7 +120,7 @@ void testCanonicalPagesAndSparseState() {
               !lookup.junctionBoundary(),
           "KV-first lookup did not coordinate the sparse state");
   resources.beginRequest(2);
-  resources.restoreRequest(2, lookup);
+  require(resources.restoreRequest(2, lookup).granted(), "restore pages were denied");
   require(resources.pageTable(2).pages.size() == 2,
           "restored request did not retain the state KV chain");
   resources.endRequest(2);
@@ -220,6 +220,42 @@ void testFragmentedColdKvPrecedesNewerState() {
           "physical-byte preference evicted newer state before cold KV");
 }
 
+// A request short of logical pages evicts the least recently used KV leaf
+// together with its composite state. A leaf whose state a lookup holds is
+// not a candidate, so the next leaf goes instead.
+void testLogicalPressureEvictsALeafWithItsState() {
+  for (bool leased : {false, true}) {
+    Backing backing(4);
+    KvPool pool(backing);
+    engine::Cache resources(pool, cacheNamespace());
+    const auto older = tokens(33, 100);
+    const auto newer = tokens(33, 200);
+    uint64_t id = 1;
+    for (const auto &prompt : {older, newer}) {
+      resources.beginRequest(id);
+      require(resources.ensureTokens(id, 32).granted(),
+              "fixture allocation failed");
+      publish(resources, resources.publishCommittedBlocks(id, prompt, 32), 100);
+      resources.endRequest(id++);
+    }
+    std::optional<CacheLookup> lease;
+    if (leased)
+      lease = resources.lookup(older);
+    resources.beginRequest(id);
+    require(resources.ensureTokens(id, 96).granted(),
+            "logical pressure did not take a cached page");
+    const auto snapshot = resources.snapshot();
+    require(snapshot.kvCache.blocks == 1 &&
+                snapshot.stateCache.entries == 1 &&
+                snapshot.stateCache.evictions == 1,
+            "logical eviction did not take exactly one leaf with its state");
+    require(resources.probe(leased ? older : newer).cachedTokens() == 32 &&
+                resources.probe(leased ? newer : older).cachedTokens() == 0,
+            "logical eviction took the leased or the newer leaf");
+    resources.endRequest(id);
+  }
+}
+
 void testReplacementPreservesBackingEvenWhenExtentBecomesEmpty() {
   Backing backing(8, 4);
   KvPool pool(backing);
@@ -308,6 +344,7 @@ int main() {
     testActiveTipProtectsTheContentChain();
     testPhysicalGrowthReclaimsOneWholeCachedExtent();
     testFragmentedColdKvPrecedesNewerState();
+    testLogicalPressureEvictsALeafWithItsState();
     testReplacementPreservesBackingEvenWhenExtentBecomesEmpty();
     std::cout << "engine cache tests passed\n";
     return EXIT_SUCCESS;

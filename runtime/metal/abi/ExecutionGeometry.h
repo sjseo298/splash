@@ -17,9 +17,9 @@
 #define SPLASH_PREFILL_ATTENTION_TILE_ROWS 8u
 #define SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS 32u
 #define SPLASH_VERIFY_ATTENTION_SPLITS 32u
-// Verify attention starts from the configured split count and adds one split
-// per this many visible Page32 blocks, capped at the maximum that sizes the
-// partial workspace.
+// Verify attention runs one split per this many visible Page32 blocks, at
+// least the configured split count and at most the maximum that sizes the
+// partial workspace (ops::q8VerifyAttentionSplits).
 #define SPLASH_VERIFY_ATTENTION_PAGES_PER_SPLIT 16u
 #define SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS 128u
 #define SPLASH_TARGET_SAMPLING_SHARDS 16u
@@ -31,4 +31,12 @@
 // prefill/gdn.metal ties the two literals together.
 #define SPLASH_GDN_SCAN_STATE_ROWS 16u
 #define SPLASH_GDN_SCAN_THREADS 128u
+// Plain norms of at most SPLASH_STAGED_NORM_ROWS rows of at most
+// SPLASH_STAGED_NORM_WIDTH columns run norm_rms_staged, whose 1024-thread
+// groups hold a row in threadgroup memory: the region where it measured
+// faster than norm_rms (shared/normalization.metal), which covers every
+// decode norm of a 2048-wide model and its short prefill chunks.
+#define SPLASH_STAGED_NORM_WIDTH 2048u
+#define SPLASH_STAGED_NORM_ROWS 64u
+#define SPLASH_STAGED_NORM_THREADS 1024u
 #define SPLASH_ALLOCATION_EXTENT_TARGET_BYTES (128ull * 1024ull * 1024ull)

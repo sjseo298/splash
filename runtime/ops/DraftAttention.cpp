@@ -49,6 +49,26 @@ uint64_t queryRowsBytes(const DraftAttentionPlan &plan) {
   return uint64_t{plan.lanes()} * kRows * plan.shape().attentionSize * 2;
 }
 
+// One lane's keys, or values, of one layer: the kernels place a position in
+// slot position % kWindow of each KV head's ring.
+uint64_t ringBytes(DraftAttentionShape shape) {
+  return uint64_t{shape.kvHeads} * kWindow * shape.headDimension * 2;
+}
+
+// What the context writers read for `rows` rows: the packed QKV rows, the
+// key norm and the rows' RoPE tables (kernels/common/draft_context_kv.h).
+void requireContextInputs(const metal::MetalBuffer &contextQkv,
+                          const metal::MetalBuffer &keyNorm,
+                          const metal::MetalBuffer &ropeCos,
+                          const metal::MetalBuffer &ropeSin, uint64_t rows,
+                          DraftAttentionShape shape) {
+  requireBuffer(contextQkv, rows * shape.qkvSize * 2);
+  requireBuffer(keyNorm, uint64_t{shape.headDimension} * 2);
+  const uint64_t ropeBytes = rows * shape.headDimension / 2 * 4;
+  requireBuffer(ropeCos, ropeBytes);
+  requireBuffer(ropeSin, ropeBytes);
+}
+
 void requireLanes(uint32_t lanes) {
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid draft batch width");
@@ -190,13 +210,11 @@ void DraftAttention::addDecode(
   requireBuffer(buffers.groupedQueries, workspace.groupedQueriesBytes);
   requireBuffer(buffers.queryKeys, workspace.queryKeysBytes);
   requireBuffer(buffers.queryValues, workspace.queryValuesBytes);
-  const uint64_t ringBytes =
-      uint64_t{shape.kvHeads} * cacheStride * shape.headDimension * 2;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (cacheLengths[lane] > SPLASH_MAXIMUM_CONTEXT_TOKENS)
       throw std::invalid_argument("draft attention cache length exceeds limit");
-    requireBuffer(buffers.persistentKeys[lane], ringBytes);
-    requireBuffer(buffers.persistentValues[lane], ringBytes);
+    requireBuffer(buffers.persistentKeys[lane], ringBytes(shape));
+    requireBuffer(buffers.persistentValues[lane], ringBytes(shape));
   }
   DraftAttentionBatchParams params{cacheStride, kSplits, lanes, {}};
   std::copy(cacheLengths.begin(), cacheLengths.end(),
@@ -236,8 +254,11 @@ void DraftAttention::addContextPrefill(
     metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
     uint32_t startPosition, DraftAttentionShape shape) {
   static_cast<void>(kernelShape(shape));
-  if (!tokens || !cacheStride)
+  if (!tokens || cacheStride != kWindow)
     throw std::invalid_argument("invalid draft context prefill geometry");
+  requireContextInputs(contextQkv, keyNorm, ropeCos, ropeSin, tokens, shape);
+  requireBuffer(keys, ringBytes(shape));
+  requireBuffer(values, ringBytes(shape));
   const DraftContextParams params{tokens, cacheStride, startPosition};
   graph.add("prefill_draft_context_kv",
             {std::move(contextQkv), std::move(keyNorm), std::move(ropeCos),
@@ -256,8 +277,18 @@ void DraftAttention::addContextCommit(
     DraftAttentionShape shape, uint32_t lanes) {
   requireLanes(lanes);
   static_cast<void>(kernelShape(shape));
-  if (startPositions.size() != kMaximumLanes || !cacheStride)
+  if (startPositions.size() != kMaximumLanes || cacheStride != kWindow ||
+      persistentKeys.size() != kMaximumLanes ||
+      persistentValues.size() != kMaximumLanes)
     throw std::invalid_argument("invalid draft context commit geometry");
+  // Each lane commits up to its eight verify rows.
+  requireContextInputs(contextQkv, keyNorm, ropeCos, ropeSin,
+                       uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, shape);
+  requireBuffer(retainedCounts, uint64_t{lanes} * sizeof(uint32_t));
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    requireBuffer(persistentKeys[lane], ringBytes(shape));
+    requireBuffer(persistentValues[lane], ringBytes(shape));
+  }
   DraftContextBatchParams params{cacheStride, lanes, {}};
   std::copy(startPositions.begin(), startPositions.end(),
             std::begin(params.start_position));

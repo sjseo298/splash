@@ -104,60 +104,76 @@ Options parse(int argc, char **argv) {
   return options;
 }
 
-uint64_t packageBytes(const std::filesystem::path &root) {
-  uint64_t total = 0;
-  for (const std::string_view directory : {"target", "draft", "vision"}) {
-    for (const auto &entry : std::filesystem::recursive_directory_iterator(root / directory)) {
-      if (!entry.is_regular_file()) continue;
-      constexpr uint64_t padding = model::kWeightFileAlignment - 1;
-      total += (entry.file_size() + padding) & ~padding;
-    }
-  }
-  if (!total) throw std::invalid_argument("empty model package");
-  return total;
-}
+// The choice lines are pasted as code, so an enumerator prints as the token of
+// its own case label: a rename changes both, and -Wswitch catches a new one.
+#define ENUMERATOR_NAME(enumerator) \
+  case enumerator:                  \
+    return #enumerator
+[[noreturn]] void unnamed() { throw std::logic_error("value outside its enumeration"); }
 
 std::string_view name(LinearTile tile) {
   switch (tile) {
-  case LinearTile::N128: return "LinearTile::N128";
-  case LinearTile::N256: return "LinearTile::N256";
-  case LinearTile::Paired128: return "LinearTile::Paired128";
-  case LinearTile::Simdgroup: return "Simdgroup";
-  case LinearTile::Split32: return "LinearTile::Split32";
-  case LinearTile::Split64: return "LinearTile::Split64";
-  case LinearTile::Paired256: return "LinearTile::Paired256";
+    ENUMERATOR_NAME(LinearTile::N128);
+    ENUMERATOR_NAME(LinearTile::N256);
+    ENUMERATOR_NAME(LinearTile::Paired128);
+    ENUMERATOR_NAME(LinearTile::Split32);
+    ENUMERATOR_NAME(LinearTile::Split64);
+    ENUMERATOR_NAME(LinearTile::Paired256);
+    ENUMERATOR_NAME(LinearTile::Simdgroup);
+    ENUMERATOR_NAME(LinearTile::GgufStaged);
+    ENUMERATOR_NAME(LinearTile::GgufRegister);
   }
-  return "LinearTile::N128";
+  unnamed();
 }
 std::string_view name(LinearPhase phase) {
-  return phase == LinearPhase::Prefill ? "LinearPhase::Prefill" : "LinearPhase::Decode";
+  switch (phase) {
+    ENUMERATOR_NAME(LinearPhase::Prefill);
+    ENUMERATOR_NAME(LinearPhase::Decode);
+  }
+  unnamed();
 }
 std::string_view name(LinearEpilogue epilogue) {
   switch (epilogue) {
-  case LinearEpilogue::None: return "LinearEpilogue::None";
-  case LinearEpilogue::Residual: return "LinearEpilogue::Residual";
-  case LinearEpilogue::GateUp: return "LinearEpilogue::GateUp";
-  case LinearEpilogue::UpWithGate: return "LinearEpilogue::UpWithGate";
+    ENUMERATOR_NAME(LinearEpilogue::None);
+    ENUMERATOR_NAME(LinearEpilogue::Residual);
+    ENUMERATOR_NAME(LinearEpilogue::GateUp);
+    ENUMERATOR_NAME(LinearEpilogue::UpWithGate);
   }
-  return "LinearEpilogue::None";
+  unnamed();
 }
 std::string_view name(LinearSimdgroups groups) {
-  return groups == LinearSimdgroups::Four ? "LinearSimdgroups::Four" : "LinearSimdgroups::Eight";
+  switch (groups) {
+    ENUMERATOR_NAME(LinearSimdgroups::Two);
+    ENUMERATOR_NAME(LinearSimdgroups::Four);
+    ENUMERATOR_NAME(LinearSimdgroups::Eight);
+  }
+  unnamed();
 }
 std::string_view name(AttentionScalePlacement placement) {
-  return placement == AttentionScalePlacement::Softmax ? "AttentionScalePlacement::Softmax"
-                                                       : "AttentionScalePlacement::Cooperative";
+  switch (placement) {
+    ENUMERATOR_NAME(AttentionScalePlacement::Softmax);
+    ENUMERATOR_NAME(AttentionScalePlacement::Cooperative);
+  }
+  unnamed();
 }
 std::string_view name(PrefillSplitMultiplier value) {
-  return value == PrefillSplitMultiplier::One ? "PrefillSplitMultiplier::One"
-                                              : "PrefillSplitMultiplier::Two";
+  switch (value) {
+    ENUMERATOR_NAME(PrefillSplitMultiplier::One);
+    ENUMERATOR_NAME(PrefillSplitMultiplier::Two);
+  }
+  unnamed();
 }
 std::string name(VerifySplitCount value) {
   return "VerifySplitCount(" + std::to_string(static_cast<uint32_t>(value)) + ")";
 }
 std::string_view name(MoePhase phase) {
-  return phase == MoePhase::Prefill ? "MoePhase::Prefill" : "MoePhase::Decode";
+  switch (phase) {
+    ENUMERATOR_NAME(MoePhase::Prefill);
+    ENUMERATOR_NAME(MoePhase::Decode);
+  }
+  unnamed();
 }
+#undef ENUMERATOR_NAME
 std::string name(MoeExpertTile tile) {
   return "MoeExpertTile::M" + std::to_string(static_cast<uint32_t>(tile));
 }
@@ -237,8 +253,6 @@ std::optional<CandidateId> candidateOf(const Plans &plans, const Config &config)
   for (size_t index = 0; index < plans.size(); ++index) {
     if constexpr (requires { plans[index].configuration(); }) {
       if (plans[index].configuration() == config) return CandidateId{uint32_t(index)};
-    } else if constexpr (requires { plans[index].config(); }) {
-      if (plans[index].config() == config) return CandidateId{uint32_t(index)};
     } else {
       if (plans[index] == config) return CandidateId{uint32_t(index)};
     }
@@ -380,12 +394,12 @@ int main(int argc, char **argv) {
       deviceName = device.deviceName;
       gpuFamily = device.appleGpuFamily;
       if (const auto error = device.validationError()) throw std::runtime_error(*error);
-      const uint64_t margin =
-          engine::EngineMemoryPolicy::workingSetMarginBytes(device.recommendedMaxWorkingSetBytes);
-      if (device.recommendedMaxWorkingSetBytes <= margin)
+      const uint64_t budget =
+          engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes);
+      if (!budget)
         throw std::runtime_error("device working set does not cover its protected margin");
       engine::MemoryGovernor governor(
-          backend, device.recommendedMaxWorkingSetBytes - margin,
+          backend, budget,
           engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes));
       const MeasurementStop underPressure = [&] {
         const auto state = governor.snapshot();
@@ -398,9 +412,10 @@ int main(int argc, char **argv) {
         return !interrupted && !underPressure() && governed(bytes, allocate);
       };
 
+      const auto descriptor = model::inspectModelPackage(modelRoot);
       std::optional<model::ModelPackage> package;
-      if (!admit(packageBytes(modelRoot),
-                 [&] { package.emplace(model::loadModelPackage(backend, modelRoot)); }))
+      if (!admit(model::preparedModelWeightBytes(modelRoot, descriptor),
+                 [&] { package.emplace(model::loadModelPackage(backend, modelRoot, descriptor)); }))
         throw std::runtime_error("model package memory admission denied or interrupted");
       const auto workloads =
           model::collectTuningWorkloads(*package, kPrefillProbeRows, kDecodeProbeWidths);
@@ -411,7 +426,13 @@ int main(int argc, char **argv) {
                 << SPLASH_BUILD_ID << "\n  " << options.measurement.samplePairs
                 << " pairs per candidate, " << options.measurement.maximumWallSeconds
                 << " s per key (attention " << options.measurement.maximumWallSeconds * 4
-                << " s per policy)\n\n";
+                << " s per policy)\n";
+      // The workloads keep only Affine64 weights, and a GGUF source prepares
+      // every target projection and expert as Block32.
+      if (descriptor.targetSource == model::TargetSource::Gguf)
+        std::cout << "  GGUF target: its projections and experts follow the device policy; "
+                     "only attention and the draft are measured\n";
+      std::cout << '\n';
 
       MeasurementOptions attention = options.measurement;
       attention.maximumWallSeconds = options.measurement.maximumWallSeconds * 4;
@@ -423,7 +444,7 @@ int main(int argc, char **argv) {
         if (!backend.healthy()) throw std::runtime_error("Metal backend became unhealthy");
       };
 
-      const Q4Linear linear(device);
+      const Linear linear(device);
       const auto verifyBaseline = VerifyAttentionConfig{};
       for (const auto &input : workloads.linear) {
         if (interrupted) break;
@@ -505,7 +526,7 @@ int main(int argc, char **argv) {
         if (interrupted) break;
         const auto result = tuneMoe(backend, admit, input, options.measurement, underPressure, stop);
         const auto candidates = ExecutionPlans(backend.capabilities()).moeCandidates(input.workload);
-        const MoeConfig baseline = candidates.front().config();
+        const MoeConfig baseline = candidates.front().configuration();
         const bool didChange = result.complete && result.choice.configuration != baseline;
         if (didChange) choices.moe.push_back(result.choice);
         outcome("moe", describe(input.workload), result.complete, didChange,

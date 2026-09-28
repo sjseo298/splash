@@ -1,12 +1,10 @@
 #include "ops/PageStorage.hpp"
 #include "engine/MemoryGovernor.hpp"
-#include "engine/MemoryPlan.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -20,75 +18,6 @@ void require(bool condition, const char *message) {
 }
 
 void run(const std::string &metallib) {
-    constexpr uint64_t pageSize = 16384;
-    auto availablePages = [](const HostMemoryPages &pages) {
-        return estimateHostAvailableMemory(pages, pageSize, 100 * pageSize) /
-               pageSize;
-    };
-    HostMemoryPages pages{.active = 50, .inactive = 20, .speculative = 5,
-                          .wired = 10, .compressor = 5,
-                          .fileBacked = 35, .purgeable = 5};
-    require(availablePages(pages) == 50,
-            "host availability does not match macOS reclaimable accounting");
-    pages.active += pages.inactive;
-    pages.inactive = 0;
-    require(availablePages(pages) == 50,
-            "active/inactive transitions changed reclaimable capacity");
-    pages.active -= 5;
-    pages.speculative += 5;
-    require(availablePages(pages) == 50,
-            "speculative file pages were counted twice");
-    pages.inactive += 10;
-    require(availablePages(pages) == 40,
-            "inactive anonymous allocations did not consume capacity");
-    pages.purgeable = 0;
-    require(availablePages(pages) == 35,
-            "non-purgeable backing received reclaimable credit");
-    pages.compressor += 5;
-    require(availablePages(pages) == 30,
-            "compressor physical memory was not charged");
-    // Wired file pages leave external_page_count: GPU pinning must reduce
-    // available memory, rather than crediting hot weights for KV growth.
-    pages.active -= 10;
-    pages.fileBacked -= 10;
-    pages.wired += 10;
-    require(availablePages(pages) == 20,
-            "wired weights remained available for new allocations");
-
-    // Reading a file into clean cache does not require a second full copy
-    // when that same immutable file is mapped again on the next startup.
-    HostMemoryPages uncached{.active = 10, .wired = 10, .compressor = 5};
-    HostMemoryPages cached = uncached;
-    cached.active += 40;
-    cached.fileBacked = 40;
-    require(availablePages(uncached) == 75 && availablePages(cached) == 75,
-            "cached weights reduced model reload capacity");
-    require(estimateHostAvailableMemory(
-                {.active = 1'298'324, .inactive = 1'281'896,
-                 .speculative = 53'613, .wired = 259'122,
-                 .compressor = 182'452, .fileBacked = 1'745'483,
-                 .purgeable = 22'868}, pageSize, 48ULL << 30) == 30'124'802'048ULL,
-            "unexpected available memory for warm-restart snapshot");
-    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
-    require(estimateHostAvailableMemory(
-                {.active = maximum, .inactive = 1}, 1, maximum) == 0 &&
-                estimateHostAvailableMemory(
-                    {.active = maximum}, pageSize, maximum) == 0 &&
-                estimateHostAvailableMemory({.fileBacked = 1}, 1, maximum) == 0 &&
-                estimateHostAvailableMemory({.purgeable = 1}, 1, maximum) == 0 &&
-                estimateHostAvailableMemory(
-                    {.active = maximum}, 1, maximum - 1) == 0 &&
-                estimateHostAvailableMemory({}, 1, maximum) == maximum &&
-                estimateHostAvailableMemory(pages, 0, maximum) == 0 &&
-                estimateHostAvailableMemory(pages, pageSize, 0) == 0,
-            "invalid host counters or arithmetic overflow did not fail closed");
-    require(EngineMemoryPolicy::hostAvailableReserveBytes(16 * (1ULL << 30)) ==
-                16 * (1ULL << 30) / 10 &&
-            EngineMemoryPolicy::hostAvailableReserveBytes(48 * (1ULL << 30)) ==
-                2 * (1ULL << 30) &&
-            EngineMemoryPolicy::hostAvailableReserveBytes(128 * (1ULL << 30)) ==
-                2 * (1ULL << 30),
-            "the macOS reserve is a tenth of a small machine, 2 GiB above 20 GiB");
     constexpr kv::Layout kvLayout{16, 4, 256};
     constexpr kv::Layout compactLayout{10, 2, 256};
     // 64 KiB sparse tiles: the 512-byte-per-page scale buffers force
@@ -142,14 +71,15 @@ void run(const std::string &metallib) {
             "admission swallowed a backend defect or leaked its reservation");
     require(admit(1024, [] {}) && bounded.snapshot().reservedBytes == 0,
             "driver allocation denial poisoned later admission");
-    // A request may cross the reserve while the idle pressure snapshot is
-    // still Normal. Its exact refusal reason must remain retryable.
+    // A request may cross the warning margin while the idle headroom still
+    // clears it. Its exact refusal reason must remain retryable, and the
+    // refusal holds host pressure so that paced reclaim starts.
     fakeHostAvailable = hostReserve + giB + 512;
     bool allocated = false;
     const auto hostDenied = admit(1024, [&] { allocated = true; });
     require(!hostDenied && !allocated &&
                 hostDenied.failure == metal::AllocationFailure::HostPressure &&
-                bounded.snapshot().pressure == MemoryPressure::Normal &&
+                bounded.snapshot().pressure == MemoryPressure::Warning &&
                 bounded.snapshot().reservedBytes == 0,
             "request-sized host refusal lost its cause or ran allocation");
     fakeHostAvailable = hostReserve + 3 * giB;
@@ -208,12 +138,10 @@ void run(const std::string &metallib) {
     require(bounded.snapshot().hostHeadroomBytes == 3 * giB,
             "host memory headroom accounting is wrong");
 
-    // Lots of inactive anonymous memory must not reopen physical growth or
-    // suppress the existing pressure reclaimer. Reclaimable file cache can.
-    HostMemoryPages pressurePages{
-        .inactive = 24 * giB, .fileBacked = giB / 2};
-    fakeHostAvailable = estimateHostAvailableMemory(
-        pressurePages, 1, hostReserve + 24 * giB);
+    // Low reclaimable memory must not reopen physical growth or suppress
+    // the existing pressure reclaimer. Reclaimable file cache can.
+    HostMemoryPages pressurePages{.free = hostReserve, .fileBacked = giB / 2};
+    fakeHostAvailable = estimateHostAvailableMemory(pressurePages, 1);
     MemoryPressurePolicy hostPolicy;
     auto hostDirective = hostPolicy.update(bounded.snapshot(), 0.0, false);
     require(!bounded.tryReserve(1).has_value() &&
@@ -221,10 +149,9 @@ void run(const std::string &metallib) {
                 hostDirective.reclaimEmptyKvExtents &&
                 !hostDirective.evictAllUnpinnedPrefixes &&
                 hostDirective.targetBytes == giB,
-            "inactive anonymous credit bypassed bounded pressure recovery");
+            "low reclaimable memory bypassed bounded pressure recovery");
     pressurePages.fileBacked = 3 * giB;
-    fakeHostAvailable = estimateHostAvailableMemory(
-        pressurePages, 1, hostReserve + 24 * giB);
+    fakeHostAvailable = estimateHostAvailableMemory(pressurePages, 1);
     require(bounded.snapshot().growthAllowed &&
                 bounded.tryReserve(1).has_value() &&
                 !hostPolicy.update(bounded.snapshot(), 1000.0, false).reclaimEmptyKvExtents,

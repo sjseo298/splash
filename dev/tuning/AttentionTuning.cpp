@@ -1,7 +1,8 @@
 #include "tuning/AttentionTuning.hpp"
 
+#include "tuning/LinearNumerics.hpp"
+
 #include <algorithm>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -31,14 +32,6 @@ uint64_t aligned(uint64_t bytes) {
   if (bytes > std::numeric_limits<uint64_t>::max() - kAlignment + 1)
     throw std::invalid_argument("attention tuning fixture size overflow");
   return (bytes + kAlignment - 1) & ~(kAlignment - 1);
-}
-uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return uint16_t(bits >> 16);
-}
-float fp32(uint16_t value) {
-  return std::bit_cast<float>(uint32_t{value} << 16);
 }
 
 struct FixturePlan final {
@@ -205,8 +198,8 @@ public:
               keys[scale * kDimension + d] = key;
               values[valueIndex(scale, d)] = value;
             } else {
-              data<uint16_t>(Tensor::Keys)[scale * kDimension + d] = bf16(key * 0.006f);
-              data<uint16_t>(Tensor::Values)[valueIndex(scale, d)] = bf16(value * 0.007f);
+              data<uint16_t>(Tensor::Keys)[scale * kDimension + d] = floatToBf16(key * 0.006f);
+              data<uint16_t>(Tensor::Values)[valueIndex(scale, d)] = floatToBf16(value * 0.007f);
             }
           }
         }
@@ -217,15 +210,15 @@ public:
                                  plan_.stride * kDimension;
           for (uint32_t d = 0; d < kDimension; ++d) {
             chunkKeys[base + row * kDimension + d] =
-                bf16(float(int((row * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127) * 0.006f);
+                floatToBf16(float(int((row * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127) * 0.006f);
             chunkValues[base + uint64_t{d} * plan_.stride + row] =
-                bf16(float(int((row * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127) * 0.007f);
+                floatToBf16(float(int((row * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127) * 0.007f);
           }
         }
         for (uint32_t head = 0; head < plan_.shape.queryHeads; ++head)
           for (uint32_t d = 0; d < kDimension; ++d)
             queries[plan_.queryIndex(lane, head, row, d)] =
-                bf16(float(int((row * 43 + head * 67 + d * 11 + head * d * 7 +
+                floatToBf16(float(int((row * 43 + head * 67 + d * 11 + head * d * 7 +
                                 lane * 29) % 1019) - 509) / 1018.0f);
       }
     }
@@ -304,10 +297,10 @@ public:
         for (uint32_t row = 0; row < plan_.rows; ++row)
           for (uint32_t d = 0; d < kDimension; ++d) {
             const uint64_t index = plan_.queryIndex(lane, head, row, d);
-            const float right = fp32(output[index]);
+            const float right = bf16ToFloat(output[index]);
             if (!std::isfinite(right)) throw NumericalMismatch();
             if (!haveReference_) continue;
-            const float left = fp32(reference[index]);
+            const float left = bf16ToFloat(reference[index]);
             maximumError = std::max(maximumError, std::abs(left - right));
             dot += double(left) * right;
             refSquared += double(left) * left;

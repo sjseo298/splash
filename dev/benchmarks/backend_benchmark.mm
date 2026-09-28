@@ -737,18 +737,38 @@ double decodeWallThroughputMedian(
   return median(std::move(values));
 }
 
-enum class BenchmarkScenario : uint8_t { All, Decode, Partial, Context, Exact };
+// The scenarios one run measures: decode, partial and context by default, or
+// the comma-separated set --scenario names. exact measures the context
+// lengths as repeated restores instead, so it excludes context.
+struct BenchmarkScenarios final {
+  bool decode = true;
+  bool partial = true;
+  bool context = true;
+  bool exact = false;
+};
 
-BenchmarkScenario parseScenario(std::string_view value) {
-  if (value == "decode")
-    return BenchmarkScenario::Decode;
-  if (value == "partial")
-    return BenchmarkScenario::Partial;
-  if (value == "context")
-    return BenchmarkScenario::Context;
-  if (value == "exact")
-    return BenchmarkScenario::Exact;
-  throw std::invalid_argument("unknown benchmark scenario");
+BenchmarkScenarios parseScenarios(std::string_view value) {
+  BenchmarkScenarios selected{false, false, false, false};
+  for (;;) {
+    const size_t comma = value.find(',');
+    const std::string_view name = value.substr(0, comma);
+    bool *scenario = name == "decode"    ? &selected.decode
+                     : name == "partial" ? &selected.partial
+                     : name == "context" ? &selected.context
+                     : name == "exact"   ? &selected.exact
+                                         : nullptr;
+    if (!scenario)
+      throw std::invalid_argument("unknown benchmark scenario");
+    if (*scenario)
+      throw std::invalid_argument("benchmark scenario named twice");
+    *scenario = true;
+    if (comma == std::string_view::npos)
+      break;
+    value.remove_prefix(comma + 1);
+  }
+  if (selected.context && selected.exact)
+    throw std::invalid_argument("exact and context scenarios exclude each other");
+  return selected;
 }
 
 } // namespace
@@ -759,11 +779,13 @@ int main(int argc, char **argv) {
     if (argc < 3) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
-                   "[--scenario decode|partial|context|exact]\n";
+                   "[--scenario NAME[,NAME...]]\n"
+                   "  NAME: decode, partial, context or exact "
+                   "(default: decode,partial,context)\n";
       return 2;
     }
     uint32_t samples = 1;
-    BenchmarkScenario selected = BenchmarkScenario::All;
+    BenchmarkScenarios selected;
     std::optional<std::filesystem::path> progressPath;
     for (int index = 3; index < argc; index += 2) {
       if (index + 1 >= argc)
@@ -774,7 +796,7 @@ int main(int argc, char **argv) {
       } else if (option == "--progress") {
         progressPath = std::filesystem::path(argv[index + 1]);
       } else if (option == "--scenario") {
-        selected = parseScenario(argv[index + 1]);
+        selected = parseScenarios(argv[index + 1]);
       } else {
         throw std::invalid_argument("unknown benchmark option");
       }
@@ -923,8 +945,7 @@ int main(int argc, char **argv) {
     std::vector<DecodeThroughputMeasurement> decodeThroughput;
     decodeThroughput.reserve(model::ExecutionLimits::maximumBatchWidth * samples);
     uint64_t requestId = 1;
-    if (selected == BenchmarkScenario::All ||
-        selected == BenchmarkScenario::Decode) {
+    if (selected.decode) {
       for (uint32_t sample = 0; sample < samples; ++sample) {
         for (uint32_t offset = 0;
              offset < model::ExecutionLimits::maximumBatchWidth; ++offset) {
@@ -945,16 +966,14 @@ int main(int argc, char **argv) {
 
     constexpr std::array<uint32_t, 4> lengths{2048, 10000, 50000, 128000};
     std::vector<Measurement> measurements;
-    for (uint32_t length : (selected == BenchmarkScenario::All ||
-                           selected == BenchmarkScenario::Context ||
-                           selected == BenchmarkScenario::Exact)
+    for (uint32_t length : selected.context || selected.exact
                                ? std::span<const uint32_t>{lengths}
                                : std::span<const uint32_t>{}) {
       if (length > engineConfig.maxContext)
         throw std::runtime_error("benchmark length exceeds runtime capacity");
       // Repeat short contexts for timing; run the costly 50K/128K cases once.
       const uint32_t lengthSamples =
-          selected != BenchmarkScenario::Exact && length <= 10000 ? samples : 1;
+          !selected.exact && length <= 10000 ? samples : 1;
       for (uint32_t sample = 0; sample < lengthSamples; ++sample) {
         evictAllCache(resources->cache());
         // Every cache prompt ends with the chat-formatted decode prompt so the
@@ -981,7 +1000,7 @@ int main(int argc, char **argv) {
         // Cache reuse changes chunking and reduction order. Output agreement
         // is diagnostic; the runtime/Metal oracles validate state and numerics.
         exactResult.coldOutputMatch = coldResult.outputTokens == exactResult.outputTokens;
-        if (selected == BenchmarkScenario::Exact) {
+        if (selected.exact) {
           // Retain one cold seed and every hit, including the first. Repeated
           // long-context restore timing must not require repeated cold prefill.
           for (uint32_t hit = 0; hit < samples; ++hit) {
@@ -1082,8 +1101,7 @@ int main(int argc, char **argv) {
     // A 4K suffix rebuilds the windows required by its recovery boundaries.
     // Compare against the same prompt evaluated cold, then recreate its 10K
     // prefix so the second evaluation is a real partial state-backed hit.
-    if (selected == BenchmarkScenario::All ||
-        selected == BenchmarkScenario::Partial) {
+    if (selected.partial) {
       std::vector<uint32_t> partialBase = prompt(10000, 0x5041525449414cULL);
       std::vector<uint32_t> partialPrompt = partialBase;
       std::vector<uint32_t> partialSuffix = prompt(4096, 0x535546464958ULL);
@@ -1134,8 +1152,7 @@ int main(int argc, char **argv) {
     // State eviction deliberately leaves the Page32 graph intact. The next
     // request must replay target work and lazily materialize the proven KV
     // junction; only the following request may restore it directly.
-    if (selected == BenchmarkScenario::All ||
-        selected == BenchmarkScenario::Context) {
+    if (selected.context) {
       evictAllCache(resources->cache());
       std::vector<uint32_t> lazyPrompt = prompt(10000, 0x4c415a594b56ULL);
       Measurement lazySeed =

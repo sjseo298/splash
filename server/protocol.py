@@ -245,6 +245,8 @@ class ReadyFeature(IntFlag):
     TOKEN_MASKS = 1 << 1
     STATUS_JSON = 1 << 2
     MULTIPLEXING = 1 << 3
+    # Requests may carry image spans; clear for a model serving without vision.
+    VISION = 1 << 4
 
 
 @dataclass(slots=True, frozen=True)
@@ -253,6 +255,10 @@ class ReadyEvent:
     max_concurrent_requests: int
     max_context_tokens: int
     feature_bits: int | ReadyFeature
+
+    @property
+    def vision(self) -> bool:
+        return bool(int(self.feature_bits) & ReadyFeature.VISION)
 
 
 class CacheDisposition(IntEnum):
@@ -442,6 +448,14 @@ def _bytes(value: object, label: str) -> bytes:
 def _words(values: object, label: str) -> tuple[int, ...]:
     if type(values) is not tuple:
         raise ValueError(f"{label} must be a tuple of uint32 values")
+    # Prompts run to a million words, so accept the common valid case in C.
+    # Anything else falls through to the per-word check for its exact error.
+    if (
+        set(map(type, values)) == {int}
+        and min(values) >= 0
+        and max(values) <= 0xFFFFFFFF
+    ):
+        return values
     return tuple(_u32(value, f"{label} element") for value in values)
 
 

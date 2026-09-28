@@ -7,16 +7,16 @@ production allocations, startup benchmarks or per-model/per-SKU tables.
 
 ## Policy ownership
 
-`runtime/ops/Linear.cpp` owns Q4 selection. Apple9 one-lane decode uses
-bfloat simdgroup matrices with 1/2/4/8 K partitions. Apple10 uses MPP tiles,
-with shape and core count selecting grids and the narrow M24 variant.
+`runtime/ops/Linear.cpp` owns Q4 selection. Apple9 decode uses bfloat
+simdgroup matrices with 1/2/4/8 K partitions
+([apple9-simdgroup.md](apple9-simdgroup.md)). Apple10 uses MPP tiles, with
+shape and core count selecting grids and the narrow M24 variant.
 Apple10 split-K tiles are offline candidates only. Their former one-lane
 defaults have been withdrawn after reproducible speculative-acceptance
 reductions on some M5 prompts. Those projections use the existing sequential
 tiles again; paired N256, M24, and Apple9 simdgroup selection are unchanged.
-Prefill and wider decode batches retain their existing rules. The obsolete
-Apple9 one-lane MPP branches have been removed; those kernels remain useful
-as qualification references and offline candidates.
+The obsolete Apple9 one-lane MPP branches have been removed; those kernels
+remain useful as qualification references and offline candidates.
 
 Core count comes from the Metal device's IORegistry property. Missing metadata
 uses one 32-core estimate across families, an intermediate value in the
@@ -37,7 +37,7 @@ Q4 candidates always start with the shipped baseline. Persistent grids now
 include two, three and four threadgroups per reported core plus the full grid,
 instead of fixed counts 36/60/80. Apple9 additionally exposes every valid
 simdgroup split in 1/2/4/8. The maximum candidate count is 20, derived beside
-`Q4Linear::kMaximumCandidates`; deduplication handles small grids. Prefill
+`Linear::kMaximumCandidates`; deduplication handles small grids. Prefill
 candidates are unchanged. New candidates do not automatically change serving.
 
 The existing offline tuner qualifies numerical results, admits the maximum
@@ -47,12 +47,11 @@ Its scratch admission already covered candidate maxima; the independent batch
 reuse test was corrected to do the same after the extra K splits exposed its
 baseline-only allocation assumption.
 
-On a new device, build the existing tuning tool and use an installed model:
+On a new device, run the tuning tool on an installed model:
 
 ```sh
-make -j8 all build/engine-tests/tune-kernels
-build/engine-tests/tune-kernels build/splash.metallib MODEL_ROOT \
-  --seconds 30 --pairs 31 --candidates --confirm 12
+make tune-kernels MODEL=mlx-community/Qwen3.8-27B-4bit \
+  TUNE_ARGS='--seconds 30 --pairs 31 --candidates --confirm 12'
 ```
 
 Record GPU family/core count, power mode, OS/toolchain and source identity.
@@ -87,9 +86,8 @@ on the missing hardware; the existing MoE tuner does not vary that rule.
   calibration; it does not claim a new serving speedup or repeat the previous
   whole-model ABBA measurements.
 
-Raw logs, the original failed test and its passing rerun, and the independent
-policy snapshot harness are archived under `convergence/` in the review
-evidence directory. Earlier serving results remain in
+The policy snapshot harness is not in the repository. Earlier serving results
+remain in
 [remaining-decode-optimizations.md](remaining-decode-optimizations.md) and
 [apple9-simdgroup.md](apple9-simdgroup.md).
 

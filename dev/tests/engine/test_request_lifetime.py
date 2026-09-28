@@ -252,14 +252,16 @@ class RequestLifetimeTests(unittest.TestCase):
         )
         process.send(wire.TokensEvent(call.request_id, 0, (4,)))
         self.assertTrue(entered.wait(1))
+        # The failure starts a replacement engine with a reader of its own.
+        reader = backend.runtime._reader_thread
         backend.runtime._fail_generation(
             call.generation, engine_runtime.EngineUnhealthy("native failed")
         )
         self.assertEqual(self.terminal(job)[0], "error")
         self.assertIsNotNone(owner())
         release.set()
-        backend.runtime._reader_thread.join(1)
-        self.assertFalse(backend.runtime._reader_thread.is_alive())
+        reader.join(1)
+        self.assertFalse(reader.is_alive())
         del call, job
         self.assert_released(cache, owner)
 

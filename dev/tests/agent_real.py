@@ -29,6 +29,8 @@ from dev.tools import build_identity  # noqa: E402
 from install import clients, launcher  # noqa: E402
 
 CLIENTS = tuple(clients.INSTALL_URLS)
+# The server this harness starts or finds, on the default port.
+BASE_URL = launcher._base_url(launcher.PORT)
 TEST_COMMAND = "python3 -m unittest -v"
 
 
@@ -118,6 +120,15 @@ def executed_commands(name, parsed, messages=()):
                     commands.append(calls[message["tool_call_id"]])
         return commands
     for event in parsed:
+        if name == "pi" and event.get("toolName") == "bash":
+            if event.get("type") == "tool_execution_start":
+                calls[event["toolCallId"]] = event.get("args", {}).get("command", "")
+            if (
+                event.get("type") == "tool_execution_end"
+                and event.get("isError") is False
+                and event.get("toolCallId") in calls
+            ):
+                commands.append(calls[event["toolCallId"]])
         if name == "codex" and event.get("type") == "item.completed":
             item = event.get("item", {})
             if item.get("type") == "command_execution" and item.get("exit_code") == 0:
@@ -147,6 +158,24 @@ def executed_commands(name, parsed, messages=()):
                 ):
                     commands.append(calls[block["tool_use_id"]])
     return commands
+
+
+def pi_completed(parsed):
+    """Pi's agent ended on a stopped assistant message with text."""
+    messages = [
+        event["message"]
+        for event in parsed
+        if event.get("type") == "message_end"
+        and event.get("message", {}).get("role") == "assistant"
+    ]
+    return bool(
+        messages
+        and messages[-1].get("stopReason") == "stop"
+        and any(
+            block.get("text", "").strip() for block in messages[-1].get("content", [])
+        )
+        and any(event.get("type") == "agent_end" for event in parsed)
+    )
 
 
 # The engine's own critical verdict drops every evictable cache entry and
@@ -368,24 +397,36 @@ print('independent oracle passed')
 
 
 class ClientRun:
-    def __init__(self, name, path, folder, model, context, timeout):
+    def __init__(self, name, path, folder, model, context, timeout, input_modalities):
         self.name, self.path, self.folder = name, path, folder
         self.model, self.context, self.timeout = model, context, timeout
+        # What the served model accepts, as /v1/models reports it.
+        self.input_modalities = input_modalities
         self.workspace = (folder / "project").resolve()
         self.session = None
         self.phases = []
         self.codex_home = (folder / "codex-home").resolve()
+        self.pi_home = (folder / "pi-agent").resolve()
         folder.mkdir(parents=True)
         fixture(self.workspace)
 
     def argv(self):
+        # Pi keeps its providers, sessions, settings and extensions in one
+        # agent directory; a private one leaves the developer's untouched.
+        environment = (
+            dict(os.environ, PI_CODING_AGENT_DIR=str(self.pi_home))
+            if self.name == "pi"
+            else None
+        )
         argv, env = clients.command(
             self.name,
             self.path,
-            launcher.BASE_URL,
+            BASE_URL,
             self.model,
             self.context,
-            launcher.RUNTIME_DIR,
+            launcher.PROFILES_DIR,
+            environment,
+            input_modalities=self.input_modalities,
         )
         # subprocess(cwd=...) does not update inherited PWD. Keep both views
         # consistent, just as a user shell entering the project would.
@@ -419,6 +460,10 @@ class ClientRun:
             if self.session:
                 argv += ["resume", self.session]
             argv += ["--json", "-"]
+        elif self.name == "pi":
+            argv += ["--print", "--mode", "json"]
+            if self.session:
+                argv += ["--session", self.session]
         else:
             argv += ["--oneshot", "--query-file", "-"]
             if self.session:
@@ -426,7 +471,7 @@ class ClientRun:
         return argv, env
 
     def hermes_messages(self):
-        path = launcher.RUNTIME_DIR / "hermes/state.db"
+        path = launcher.PROFILES_DIR / "hermes/state.db"
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
             if self.session is None:
@@ -542,6 +587,8 @@ class ClientRun:
         text = log.read_text(errors="replace")
         parsed = events(text)
         for e in parsed:
+            if self.name == "pi" and e.get("type") == "session":
+                self.session = e.get("id", self.session)
             self.session = e.get(
                 "session_id", e.get("sessionID", e.get("thread_id", self.session))
             )
@@ -616,6 +663,11 @@ class ClientRun:
             elif self.name == "codex":
                 if not any(e.get("type") == "turn.completed" for e in parsed):
                     raise AgentFailure("Codex did not complete its turn")
+            elif self.name == "pi":
+                if not pi_completed(parsed):
+                    raise AgentFailure(
+                        "Pi did not finish its user turn with assistant text"
+                    )
             else:
                 if any(e.get("type") == "error" for e in parsed):
                     raise AgentFailure("OpenCode reported a request error")
@@ -652,14 +704,23 @@ class ClientRun:
                 for e in events(p.read_text())
                 if e.get("type") == "compacted"
             ]
+        if self.name == "pi":
+            found = (self.pi_home / "sessions").rglob(f"*_{self.session}.jsonl")
+            return [
+                entry
+                for path in found
+                for entry in events(path.read_text())
+                if entry.get("type") == "compaction"
+            ]
         if self.name == "opencode":
             argv, env = clients.command(
                 self.name,
                 self.path,
-                launcher.BASE_URL,
+                BASE_URL,
                 self.model,
                 self.context,
-                launcher.RUNTIME_DIR,
+                launcher.PROFILES_DIR,
+                input_modalities=self.input_modalities,
             )
             env["PWD"] = str(self.workspace)
             # A regular file avoids losing buffered pipe output when the CLI
@@ -795,9 +856,17 @@ def parse_args(argv=None):
     parser.add_argument("--clients", default=",".join(CLIENTS))
     parser.add_argument(
         "--model",
-        type=launcher.model_artifacts.parse_repo_id,
+        type=launcher.model_artifacts.parse_model_id,
         required=True,
     )
+    # The installation's source options, which splash serve is given, and
+    # its selection link (install/models.py link), which they name by default.
+    parser.add_argument("--revision")
+    parser.add_argument(
+        "--draft-model", type=launcher.model_artifacts.parse_draft_model
+    )
+    parser.add_argument("--language-only", action="store_true")
+    parser.add_argument("--package", type=Path)
     parser.add_argument("--max-context", default="100K")
     # Complete runs include several long-context turns and can take minutes.
     parser.add_argument("--client-timeout", type=float, default=900)
@@ -807,7 +876,16 @@ def parse_args(argv=None):
     parser.add_argument(
         "--output", type=Path, default=ROOT / "build/release/agent-real.json"
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.package is None:
+        args.package = launcher.model_artifacts.Selection.of(
+            launcher.model_artifacts.MODELS,
+            args.model,
+            revision=args.revision,
+            language_only=args.language_only,
+            draft_model=args.draft_model,
+        ).link
+    return args
 
 
 def main(argv=None):
@@ -858,6 +936,9 @@ def main(argv=None):
                 args.max_context,
                 "--model",
                 args.model,
+                *(("--revision", args.revision) if args.revision else ()),
+                *(("--draft-model", args.draft_model) if args.draft_model else ()),
+                *(("--language-only",) if args.language_only else ()),
             ]
             with (directory / "server.log").open("x") as log:
                 process = subprocess.Popen(
@@ -875,7 +956,8 @@ def main(argv=None):
                     )
                 time.sleep(0.5)
         initial = idle_status()
-        model = launcher._request_json("/v1/models")["data"][0]["id"]
+        served = launcher._request_json("/v1/models")["data"][0]
+        model = served["id"]
         context = initial["maximum_context_tokens"]
         validate_server_configuration(
             initial,
@@ -891,14 +973,11 @@ def main(argv=None):
         document["validation_script_sha256"] = hashlib.sha256(
             Path(__file__).read_bytes()
         ).hexdigest()
-        port = int(launcher.BASE_URL.rsplit(":", 1)[1])
+        port = launcher.PORT
         if args.http_smoke:
             smoke_real.run(port, model)
-        installed = launcher.model_artifacts.installed_root(
-            launcher.model_artifacts.MODELS, args.model
-        )
         reference = (
-            reference_fixture(installed / "tokenizer", context)
+            reference_fixture(args.package / "tokenizer", context)
             if args.scenario == "complete"
             else ""
         )
@@ -910,6 +989,7 @@ def main(argv=None):
                 model,
                 context,
                 args.client_timeout,
+                served["input_modalities"],
             )
             entry = {**versions[name], "result": "running", "phases": runner.phases}
             document["clients"][name] = entry

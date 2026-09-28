@@ -10,10 +10,10 @@ namespace splash::ops::tuning {
 inline constexpr size_t kMaximumLinearTuningRepresentatives = 8;
 
 struct LinearTuningWeights final {
-  Q4Projection projection;
+  Projection projection;
   // Required only for GateUp. UpWithGate consumes deterministic gate scratch
   // as its semantic input; it does not include an external gate projection.
-  std::optional<Q4Projection> gate;
+  std::optional<Projection> gate;
 };
 
 struct LinearTuningInput final {
@@ -43,7 +43,7 @@ struct LinearTuningResult final {
     const DeviceCapabilities &device, LinearWorkload workload);
 
 // Offline only: real supplied weights, deterministic BF16 inputs and the
-// production Q4Linear graph. Candidate IDs are their baseline-first plan index.
+// production Linear graph. Candidate IDs are their baseline-first plan index.
 // Every representative is qualified against its own baseline before timing.
 // Existing baseline qualification timings select a fixed batch of 1..16 whole
 // operators, rounded to complete representative rings, targeting about 5 ms.

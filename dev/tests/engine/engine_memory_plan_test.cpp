@@ -112,6 +112,48 @@ void testUserCeilingAndFailure() {
           "budget smaller than B1 plus one extent was accepted");
 }
 
+// The disk tier's KV pages stage through a ring of Metal memory, which the
+// governor charges beside the weights. The plan sets it aside, so one lone
+// request can still map every KV page the advertised context promises.
+void testDiskTierKvStagingIsBudgeted() {
+  const EngineMemoryPlan without = requireEngineMemoryPlan(device(), model());
+  ModelMemoryProfile tiered = model();
+  // 128 16 KiB-aligned page slots plus the copy table rounded up to 16 KiB.
+  const uint64_t ring =
+      128 * tiered.targetKvLayout.bytesPerModelPage() + 16 * 1024;
+  tiered.footprint.kvStagingBytes = ring;
+  const EngineMemoryPlan with = requireEngineMemoryPlan(device(), tiered);
+  const auto &budget = with.breakdown();
+  require(without.breakdown().fixedRuntimeBytes + ring +
+                  budget.activeStateCellBytes + budget.kvVirtualBytes <=
+              budget.hardBudgetBytes,
+          "the advertised context cannot be mapped beside the KV staging ring");
+  require(with.maximumContextTokens() < without.maximumContextTokens(),
+          "a budget-limited context did not shrink by the KV staging ring");
+  require(budget.kvStagingBytes == ring &&
+              budget.fixedRuntimeBytes ==
+                  without.breakdown().fixedRuntimeBytes + ring,
+          "KV staging was not planned as fixed runtime memory");
+  // A budget that fits everything but the ring is refused by the plan, not
+  // by a warmup allocation.
+  const auto tight = evaluateEngineMemoryPlan(
+      device(), tiered, without.breakdown().minimumRequiredBytes);
+  require(!tight.plan &&
+              tight.status.code == BudgetErrorCode::KvPoolDoesNotFit,
+          "a budget without room for the KV staging ring was accepted");
+  const std::string staging = "\"kv_staging_bytes\":" + std::to_string(ring);
+  require(with.toStatusJson().find(staging + ",\"fixed_runtime_bytes\"") !=
+                  std::string::npos &&
+              with.toStatusJson().find(staging + "}}") != std::string::npos &&
+              budget.describe().find("disk tier KV staging: " +
+                                     std::to_string(ring)) != std::string::npos,
+          "KV staging is missing from the memory plan status");
+  require(without.breakdown().kvStagingBytes == 0 &&
+              without.toStatusJson().find("\"kv_staging_bytes\":0,") !=
+                  std::string::npos,
+          "a plan without the disk tier reported KV staging");
+}
+
 void testHardBudgetBoundaries() {
   require(EngineMemoryPolicy::hardBudgetBytes(12 * kGiB) == 11 * kGiB &&
               EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 8 * kGiB) ==
@@ -126,6 +168,23 @@ void testHardBudgetBoundaries() {
   require(EngineMemoryPolicy::hardBudgetBytes(maximum, maximum) ==
               maximum - EngineMemoryPolicy::workingSetMarginBytes(maximum),
           "maximum working set overflowed the preflight ceiling");
+}
+
+// What memory holds below the plan's budget, where the host has less: the
+// plan made there, within the configured limit, and nothing where one request
+// does not fit.
+void testContextTokensWithin() {
+  const EngineMemoryPlan plan = requireEngineMemoryPlan(device(), model());
+  const auto &budget = plan.breakdown();
+  const uint64_t ceiling = budget.minimumRequiredBytes + 64 * kMiB;
+  const EngineMemoryPlan limited = requireEngineMemoryPlan(device(), model(), ceiling);
+  require(plan.contextTokensWithin(16 * kGiB) == plan.maximumContextTokens() &&
+              plan.contextTokensWithin(ceiling) == limited.maximumContextTokens() &&
+              limited.maximumContextTokens() < plan.maximumContextTokens() &&
+              limited.contextTokensWithin(16 * kGiB) == limited.maximumContextTokens() &&
+              !plan.contextTokensWithin(budget.minimumRequiredBytes - 1) &&
+              !plan.contextTokensWithin(0),
+          "the context memory holds is not the plan's within the host's memory");
 }
 
 void testModelProvidedKvGeometry() {
@@ -172,14 +231,48 @@ void testDeviceValidationNamesTheMacosFloor() {
   require(!newer.validationError(), "a newer macOS major was refused");
 }
 
+void testDeviceValidationMessageNamesWhatTheMacHas() {
+  require(!device().validationMessage(),
+          "the reference device has a validation message");
+  const std::string needs =
+      "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 26.4 "
+      "or newer, with placement-sparse buffers; this Mac has ";
+  DeviceCapabilities m2 = device();
+  m2.deviceName = "Apple M2 Max";
+  m2.appleGpuFamily = 8;
+  m2.macosPatch = 1;
+  require(m2.validationMessage().value_or("") ==
+              needs + "Apple M2 Max (Apple GPU family 8) on macOS 26.4.1, "
+                      "with placement-sparse buffers "
+                      "(apple_gpu_family_9_required)",
+          "a family-8 GPU was not named against the family required");
+  DeviceCapabilities older = device();
+  older.macosMinor = 3;
+  older.supportsPlacementSparse = false;
+  require(older.validationMessage().value_or("") ==
+              needs + "test (Apple GPU family 9) on macOS 26.3.0, where "
+                      "placement-sparse support cannot be queried "
+                      "(macos_26_4_required)",
+          "an older macOS was not named against the macOS required");
+  DeviceCapabilities dense = device();
+  dense.supportsPlacementSparse = false;
+  require(dense.validationMessage().value_or("") ==
+              needs + "test (Apple GPU family 9) on macOS 26.4.0, without "
+                      "placement-sparse buffers (placement_sparse_required)",
+          "missing placement-sparse buffers were not named");
+}
+
 int main() {
   try {
     testUnifiedElasticBudget();
     testBf16BudgetAndStatus();
     testUserCeilingAndFailure();
+    testDiskTierKvStagingIsBudgeted();
     testHardBudgetBoundaries();
+    testContextTokensWithin();
     testModelProvidedKvGeometry();
     testDeviceValidationNamesTheMacosFloor();
+    testDeviceValidationMessageNamesWhatTheMacHas();
     std::cout << "elastic memory plan tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

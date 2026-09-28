@@ -14,11 +14,13 @@
 //
 // The buffer contracts equal the decode kernels in linear_q4.metal: Affine
 // (input, weights, scales, biases, output, params), Residual (..., residual,
-// output, params) and GateUp (gate stream, output, up stream, params).
-template <ushort TileN, ushort Simdgroups, bool Residual, bool GateUp = false>
+// output, params) and GateUp (gate stream, output, up stream, params). The
+// destination's type Out is bf16, or fp32 for a plain projection's logits
+// (ops::Projection::destination), which keeps the sum unrounded.
+template <ushort TileN, ushort Simdgroups, bool Residual, bool GateUp = false, class Out>
 inline void q4_split(device bfloat *input, device uchar *weights,
                      device bfloat *scales, device bfloat *biases,
-                     device bfloat *residual, device bfloat *output,
+                     device bfloat *residual, device Out *output,
                      device uchar *upWeights, device bfloat *upScales,
                      device bfloat *upBiases, constant Q4Params &p, uint group,
                      uint lane, uint simd, threadgroup float *sums,
@@ -39,7 +41,7 @@ inline void q4_split(device bfloat *input, device uchar *weights,
       for (uint part = 0; part < Parts; ++part)
         value += partials[part * 8 * TileN + i];
       uint index = (i / TileN) * p.output_size + tile * TileN + i % TileN;
-      value = float(bfloat(value));
+      if constexpr (!is_same_v<Out, float>) value = float(bfloat(value));
       if constexpr (GateUp) {
         float up = 0;
         for (uint part = 0; part < Parts; ++part)
@@ -49,29 +51,35 @@ inline void q4_split(device bfloat *input, device uchar *weights,
       }
       if constexpr (Residual)
         value += float(residual[index]);
-      output[index] = bfloat(value);
+      output[index] = Out(value);
     }
     // The next tile's partials overwrite this reduction's inputs.
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
 
-#define Q4_SPLIT_AFFINE(Name, TileN, Simdgroups)                               \
+// A plain projection reads no residual (its input stands in) and writes a
+// destination of type Out: each kernel into bf16 and into fp32 (Name_f32: the
+// logits, ops::Projection::destination).
+#define Q4_SPLIT_OUTPUT(Name, TileN, Simdgroups, Out)                          \
   kernel void Name(device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
                    device bfloat *scales [[buffer(2)]],                        \
                    device bfloat *biases [[buffer(3)]],                        \
-                   device bfloat *output [[buffer(4)]],                        \
+                   device Out *output [[buffer(4)]],                           \
                    constant Q4Params &params [[buffer(5)]],                    \
                    uint group [[threadgroup_position_in_grid]],                \
                    uint lane [[thread_index_in_simdgroup]],                    \
                    uint simd [[simdgroup_index_in_threadgroup]]) {             \
     threadgroup float sums[4 * 64], partials[4 * 8 * TileN];                   \
-    q4_split<TileN, Simdgroups, false>(input, weights, scales, biases, output, \
+    q4_split<TileN, Simdgroups, false>(input, weights, scales, biases, input,  \
                                        output, weights, scales, biases,        \
                                        params, group, lane, simd, sums,        \
                                        partials);                              \
   }
+#define Q4_SPLIT_AFFINE(Name, TileN, Simdgroups)                               \
+  Q4_SPLIT_OUTPUT(Name, TileN, Simdgroups, bfloat)                             \
+  Q4_SPLIT_OUTPUT(Name##_f32, TileN, Simdgroups, float)
 
 #define Q4_SPLIT_RESIDUAL(Name, TileN, Simdgroups)                             \
   kernel void Name(device bfloat *input [[buffer(0)]],                         \
@@ -99,6 +107,7 @@ Q4_SPLIT_AFFINE(decode_linear_q4_n64_split4, 64, 2)        // 256 threads
 Q4_SPLIT_RESIDUAL(decode_linear_q4_n32_split4_residual, 32, 1)
 Q4_SPLIT_RESIDUAL(decode_linear_q4_n64_split4_residual, 64, 2)
 #undef Q4_SPLIT_AFFINE
+#undef Q4_SPLIT_OUTPUT
 #undef Q4_SPLIT_RESIDUAL
 
 // 128 threads: four single-simdgroup partitions, two weight streams.

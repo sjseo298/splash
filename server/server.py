@@ -7,7 +7,7 @@ import os
 import queue
 import re
 import secrets
-import selectors
+import select
 import signal
 import socket
 import sys
@@ -39,10 +39,11 @@ if __package__:
         stream_chunk,
     )
     from .backend import NativeBackend, remaining_request_time
+    from .chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
     from .constraints import ConstraintFactory, validate_tokenizer
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
-    from .frontend import REASONING_EFFORTS, Frontend, validate_served_model_name
+    from .frontend import Frontend, validate_served_model_name
     from .http_security import authenticate, validate_api_key, validate_headers
     from .latency import RequestLatency
     from .metrics import (
@@ -79,10 +80,11 @@ else:
         stream_chunk,
     )
     from backend import NativeBackend, remaining_request_time
+    from chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
     from constraints import ConstraintFactory, validate_tokenizer
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
-    from frontend import REASONING_EFFORTS, Frontend, validate_served_model_name
+    from frontend import Frontend, validate_served_model_name
     from http_security import authenticate, validate_api_key, validate_headers
     from latency import RequestLatency
     from metrics import (
@@ -111,7 +113,12 @@ DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 MAX_CONTEXT_TOKENS = 262144
 HTTP_IO_TIMEOUT = 30.0
 HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
-CLIENT_DISCONNECT_POLL = 0.01
+# How long a response sent before the request body was read waits for the
+# client to finish uploading it.
+HTTP_UNREAD_BODY_DRAIN_SECONDS = 2.0
+# Native events wake a waiting request at once; this only bounds how late a
+# client disconnect is noticed.
+CLIENT_DISCONNECT_POLL = 0.1
 SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
@@ -149,6 +156,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def setup(self):
         self._response_started = False
+        self._unread_body = False
         self._last_sse_write = time.monotonic()
         super().setup()
         self.connection.settimeout(self.server.io_timeout)
@@ -166,7 +174,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def finish(self):
         self._header_timer.cancel()
+        if self._unread_body:
+            self._discard_unread_body()
         super().finish()
+
+    def _discard_unread_body(self):
+        # Closing with request bytes unread resets the connection, and the
+        # reset can destroy the response before a client still uploading
+        # reads it. Half-close, then discard the upload for a bounded time.
+        deadline = time.monotonic() + HTTP_UNREAD_BODY_DRAIN_SECONDS
+        try:
+            self.connection.shutdown(socket.SHUT_WR)
+            while (remaining := deadline - time.monotonic()) > 0:
+                self.connection.settimeout(remaining)
+                if not self.rfile.read1(65536):
+                    return
+        except OSError:
+            pass
 
     def log_message(self, format, *args):
         pass
@@ -182,6 +206,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.send_error(505, "HTTP version not supported")
             return False
+        # finish() drains a body that no handler read before responding.
+        self._unread_body = bool(
+            self.headers.get_all("Content-Length")
+            or self.headers.get_all("Transfer-Encoding")
+        )
         try:
             allowed_hosts = self.server.allowed_hosts | {
                 self.connection.getsockname()[0].lower()
@@ -331,6 +360,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 if not chunk:
                     raise APIError(400, "request body ended before Content-Length")
                 payload.extend(chunk)
+            self._unread_body = False
         finally:
             self.connection.settimeout(self.server.io_timeout)
         text = payload.decode(json.detect_encoding(payload), "surrogatepass")
@@ -396,6 +426,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "owned_by": "splash",
                     "max_model_len": self.app.max_context,
                     "context_length": self.app.max_context,
+                    "vision": self.app.vision,
+                    "input_modalities": self.app.input_modalities,
                     **({"root": self.app.model} if name != self.app.model else {}),
                 }
                 for name in self.app.model_names
@@ -464,10 +496,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._safe_error(APIError(404, "not found", "not_found"))
             return
         if not prompt_only and not self.app.backend.can_submit():
+            failure = self.app.backend.engine_error
             self._safe_error(
                 APIError(
                     529 if systemone else 503,
-                    "engine is recovering; retry shortly",
+                    "engine is recovering; retry shortly"
+                    + (f" (last failure: {failure})" if failure else ""),
                     "engine_recovering",
                 ),
                 anthropic,
@@ -516,9 +550,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if count_tokens:
                 tokens = self.app.count_tokens(
                     anthropic_to_chat_prompt(
-                        body,
-                        deadline=deadline,
-                        thinking_resolver=self.app.thinking_codec.decode,
+                        body, thinking_resolver=self.app.thinking_codec.decode
                     ),
                     deadline=deadline,
                 )
@@ -551,9 +583,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if anthropic:
                 job, thinking, has_tools = self.app.prepare(
                     anthropic_to_chat_body(
-                        body,
-                        deadline=deadline,
-                        thinking_resolver=self.app.thinking_codec.decode,
+                        body, thinking_resolver=self.app.thinking_codec.decode
                     ),
                     deadline=deadline,
                     clamp_output_budget=True,
@@ -759,18 +789,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 return event
 
     def _client_disconnected(self):
+        # A poll object holds no descriptor: running out of descriptors
+        # must not read as a disconnect.
+        poller = select.poll()
+        poller.register(self.connection, select.POLLIN)
         try:
-            with selectors.DefaultSelector() as selector:
-                selector.register(self.connection, selectors.EVENT_READ)
-                readable = selector.select(0)
             # The body is already consumed and every response closes the
             # connection. Drain unexpected trailing bytes so they cannot hide EOF.
-            return bool(readable) and not self.connection.recv(
+            return bool(poller.poll(0)) and not self.connection.recv(
                 65536, socket.MSG_DONTWAIT
             )
         except BlockingIOError:
             return False
-        except (OSError, ValueError):
+        except ConnectionError:
             return True
 
     def _finalize_content(self, content, job, has_tools, incomplete, projector=None):
@@ -1785,6 +1816,18 @@ def _parse_max_context(value):
     return parsed
 
 
+def _parse_max_cache_disk(value):
+    if value.strip() == "0":
+        return 0
+    try:
+        result = _parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        result = None
+    if result is None:
+        raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
+    return result
+
+
 def _parse_max_memory(value):
     if value == "auto":
         return None
@@ -1828,14 +1871,19 @@ def _parse_request_size(value):
 
 
 def _parse_model_id(value):
-    if value.count("/") != 1:
+    repo_id, separator, variant = value.partition(":")
+    if repo_id.count("/") != 1:
         raise argparse.ArgumentTypeError(
-            "use a full Hugging Face repository ID: owner/repo"
+            "use a full Hugging Face repository ID: owner/repo[:variant]"
         )
     try:
-        validate_repo_id(value)
+        validate_repo_id(repo_id)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from None
+    if separator and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", variant):
+        raise argparse.ArgumentTypeError(
+            "model variant must be a short name such as UD-Q4_K_M"
+        )
     return value
 
 
@@ -1874,6 +1922,12 @@ def parse_args(argv=None):
         default=DEFAULT_MAX_REQUEST_BYTES,
         help="maximum HTTP request body size (default: 128M); "
         "shared input budget is max(512M, twice this limit)",
+    )
+    parser.add_argument(
+        "--max-cache-disk",
+        dest="max_cache_disk",
+        type=_parse_max_cache_disk,
+        default=0,
     )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
     parser.add_argument("--max-new-tokens", type=int, default=32768)
@@ -1931,6 +1985,8 @@ def _native_command(args):
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
+    if args.max_cache_disk:
+        command.append(str(args.max_cache_disk))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
     return command
@@ -1943,6 +1999,7 @@ def _interrupt(_signum, _frame):
 def main():
     args = parse_args()
     server = None
+    runtime = None
     backend = None
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
@@ -1970,6 +2027,8 @@ def main():
             args.tokenizer, local_files_only=True, trust_remote_code=False
         )
         validate_tokenizer(tokenizer)
+        chat_templates = ChatTemplates(tokenizer)
+        print_status(f"Chat template · {chat_templates.describe()}")
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(args),
             startup_timeout=NATIVE_START_TIMEOUT,
@@ -2005,11 +2064,13 @@ def main():
             args.max_new_tokens,
             args.request_timeout,
             readiness.max_concurrent_requests,
-            constraint_factory,
+            constraint_factory=constraint_factory,
+            chat_templates=chat_templates,
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,
             default_reasoning_effort=args.default_reasoning_effort,
+            vision=readiness.vision,
         )
         server.app = app
         server.server_activate()
@@ -2019,9 +2080,14 @@ def main():
             if effective_context % 1024 == 0
             else f"{effective_context:,}"
         )
-        print_status(f"Ready · {args.model} · context {context} · {address}")
+        mode = "" if readiness.vision else " · language only"
+        print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
-    except (engine_runtime.EngineUnhealthy, ThinkingKeyError) as error:
+    except (
+        engine_runtime.EngineRuntimeError,
+        ThinkingKeyError,
+        ChatTemplateError,
+    ) as error:
         print_status(f"Error · {error}", error=True)
         raise SystemExit(1) from None
     except OSError as error:
@@ -2031,14 +2097,20 @@ def main():
         pass
     finally:
         # main owns this process. Keep stop signals idempotent through child
-        # cleanup and interpreter teardown, including after this function returns.
+        # cleanup and interpreter teardown, including after this function
+        # returns, except that a second Ctrl+C during cleanup stops the engine
+        # without waiting for its paced release of memory.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(
+            signal.SIGINT,
+            signal.SIG_IGN if runtime is None else lambda *_: runtime.kill(),
+        )
         try:
             if backend is not None:
                 print_status("Stopping · releasing engine resources")
                 backend.close()
         finally:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
                 server.server_close()
 

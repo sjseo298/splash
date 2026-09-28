@@ -4,6 +4,7 @@
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "model/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
 #include "model/ModelFactory.hpp"
 #include "engine/MemoryAudit.hpp"
@@ -63,6 +64,10 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view buildId,
                          kv::Layout targetKvLayout);
 
+// The memory plan counts each weight category from the loaded package, so
+// every category the model has must report its allocation and identity.
+void requireLoadedModel(const model::ModelPackage &package);
+
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
   std::filesystem::path metallibPath;
@@ -70,8 +75,11 @@ struct RuntimeResourcesConfig {
   model::ModelDescriptor model;
   std::string buildId;
   uint64_t maximumMemoryBytes = 0;
-  // Patches per image the vision scratch covers; the protocol limit and the
-  // engine's request validation use the same value.
+  // Disk quota shared by cached KV pages and states; zero disables the tier.
+  uint64_t maximumCacheDiskBytes = 0;
+  // Patches per image the vision scratch covers. The engine admits images up
+  // to it when the model loaded vision and none otherwise; the wire parser's
+  // limit defaults to the same constant.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
@@ -166,6 +174,11 @@ public:
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
   }
+  // What other applications left, measured before the engine took any;
+  // empty when the host could not be measured.
+  [[nodiscard]] std::optional<uint64_t> hostAvailableAtStart() const noexcept {
+    return hostAvailableAtStart_;
+  }
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   [[nodiscard]] ActualMemoryReport
@@ -189,9 +202,11 @@ private:
                    std::unique_ptr<MemoryGovernor> memoryGovernor,
                    std::unique_ptr<kv::PageStorage> kvPages,
                    std::unique_ptr<model::StateStorage> stateStorage,
+                   std::unique_ptr<model::KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   uint32_t maximumImagePatches);
+                   uint32_t maximumImagePatches,
+                   std::optional<uint64_t> hostAvailableAtStart);
 
   std::unique_ptr<metal::MetalBackend> backend_;
   model::ModelPackage model_;
@@ -202,9 +217,11 @@ private:
   std::unique_ptr<MemoryGovernor> memoryGovernor_;
   std::unique_ptr<kv::PageStorage> kvPages_;
   std::unique_ptr<model::StateStorage> stateStorage_;
+  std::unique_ptr<model::KvPageTier> kvTier_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   uint32_t maximumImagePatches_ = 0;
+  std::optional<uint64_t> hostAvailableAtStart_;
 };
 
 } // namespace splash::engine

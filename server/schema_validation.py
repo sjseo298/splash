@@ -8,6 +8,7 @@ from functools import lru_cache
 
 import regex
 from jsonschema import ValidationError, validators
+from jsonschema.exceptions import UndefinedTypeCheck
 
 if __package__:
     from .errors import APIError
@@ -61,6 +62,26 @@ def _additional_properties(validator, additional, instance, schema):
                     yield from validator.descend(value, additional, path=key)
 
 
+def json_objects(value):
+    """Yield every object in a JSON document."""
+    pending = [value]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            yield value
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+
+
+def _known_type(base, name):
+    try:
+        base.TYPE_CHECKER.is_type(None, name)
+    except UndefinedTypeCheck:
+        return False
+    return True
+
+
 @lru_cache(maxsize=8)
 def _bounded_class(base):
     return validators.extend(
@@ -95,6 +116,24 @@ def build_validator(schema, nodes, registry):
             return cached[2]
     base = validators.validator_for(schema)
     base.check_schema(schema)
+    # Draft 3 accepts any type name, and validation fails on one the dialect
+    # does not define with an error that is not a validation error.
+    for node in nodes(schema):
+        if not isinstance(node, dict):
+            continue
+        for keyword in ("type", "disallow"):
+            names = node.get(keyword)
+            for name in names if isinstance(names, list) else (names,):
+                if isinstance(name, str) and not _known_type(base, name):
+                    raise APIError(400, f"unknown schema type: {name}")
+    # jsonschema matches patternProperties with the unbounded standard-library
+    # engine to find the properties unevaluatedProperties applies to. A
+    # reference can reach any object, so one document cannot use both.
+    keywords = {key for node in json_objects(schema) for key in node}
+    if {"patternProperties", "unevaluatedProperties"} <= keywords:
+        raise APIError(
+            400, "unevaluatedProperties with patternProperties is not supported"
+        )
     validated = copy.deepcopy(schema)
     # A document uses one dialect. Removing identical declarations prevents
     # jsonschema.evolve from replacing the bounded class at a local reference.

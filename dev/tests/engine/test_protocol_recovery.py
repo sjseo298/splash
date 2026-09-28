@@ -160,11 +160,12 @@ class ProtocolRecoveryTests(unittest.TestCase):
             )
             self.assertEqual(chat["messages"][2]["tool_call_id"], "t1")
 
-    def test_visible_foreign_thinking_can_continue_but_hidden_content_needs_its_key(
-        self,
-    ):
-        foreign_signature = ThinkingCodec().encode("foreign reasoning")
-        for visible in ("visible reasoning", ""):
+    def test_foreign_thinking_keeps_visible_history_and_drops_hidden_content(self):
+        # Other providers' signatures, and ours under another key, are opaque.
+        for signature, visible in product(
+            ("malformed-client-token", ThinkingCodec().encode("private reasoning")),
+            ("visible reasoning", ""),
+        ):
             harness = self.harness(FakeRuntime(Plan([[4]])))
             body = request_body(
                 messages=[
@@ -175,7 +176,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
                             {
                                 "type": "thinking",
                                 "thinking": visible,
-                                "signature": foreign_signature,
+                                "signature": signature,
                             },
                             {"type": "text", "text": "hello"},
                         ],
@@ -184,16 +185,16 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 ]
             )
             for path in ("/v1/messages/count_tokens", "/v1/messages"):
-                with self.subTest(visible=bool(visible), path=path):
+                with self.subTest(
+                    signature=signature[:16], visible=bool(visible), path=path
+                ):
                     status, _, payload = harness.request("POST", path, body)
-                    self.assertEqual(status, 200 if visible else 400, payload)
-                    if not visible:
-                        self.assertIn(b"invalid signature in thinking block", payload)
-            if visible:
-                converted = anthropic_to_chat_prompt(
-                    body, thinking_resolver=harness.app.thinking_codec.decode
-                )
-                self.assertEqual(converted["messages"][1]["reasoning_content"], visible)
+                    self.assertEqual(status, 200, payload)
+                    history = harness.tokenizer.templates[-1][0]
+                    self.assertEqual(history[1]["content"], "hello")
+                    self.assertEqual(
+                        history[1].get("reasoning_content"), visible or None
+                    )
 
     def test_hidden_thinking_survives_display_changes_and_tool_roundtrips(self):
         harness = self.harness(
@@ -258,14 +259,9 @@ class ProtocolRecoveryTests(unittest.TestCase):
             sum(message["role"] == "tool" for message in rendered_history), 3
         )
 
-    def test_hidden_history_rejects_invalid_or_other_instance_signatures_before_submit(
-        self,
-    ):
+    def test_hidden_history_rejects_malformed_signatures_before_submit(self):
         harness = self.harness(FakeRuntime())
-        for signature in (
-            "malformed-client-token",
-            ThinkingCodec().encode("private reasoning"),
-        ):
+        for signature in (7, None, ["token"]):
             for path in ("/v1/messages", "/v1/messages/count_tokens"):
                 body = request_body(
                     messages=[
@@ -287,8 +283,6 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 self.assertEqual(status, 400, payload)
                 error = json.loads(payload)["error"]
                 self.assertEqual(error["type"], "invalid_request_error")
-                self.assertNotIn("private reasoning", error["message"])
-                self.assertNotIn(signature, error["message"])
         self.assertFalse(harness.backend.runtime.requests)
 
     def test_thinking_signature_authentication_and_size_limits(self):
@@ -339,7 +333,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
             {"role": "tool", "tool_call_id": "interrupted", "content": "interrupted"},
         ]
         original = copy.deepcopy(source)
-        normalized = normalize_messages(source)
+        normalized = normalize_messages(source, vision=True)
         projected = template_messages(normalized)
         self.assertEqual(source, original)
         self.assertEqual(

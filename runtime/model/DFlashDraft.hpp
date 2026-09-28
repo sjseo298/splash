@@ -12,10 +12,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <array>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace splash::model {
@@ -148,28 +150,28 @@ struct DFlashSelectionBuffers final {
 };
 
 struct DFlashDraftLayerWeights final {
-  metal::MetalBuffer inputNorm;
+  ops::NormWeights inputNorm;
   metal::MetalBuffer attentionConvolution;
-  ops::Q4Projection attentionDynamic;
-  ops::Q4Projection qkvProjection;
+  ops::Projection attentionDynamic;
+  ops::Projection qkvProjection;
   metal::MetalBuffer queryNorm;
   metal::MetalBuffer keyNorm;
-  ops::Q4Projection outputProjection;
-  metal::MetalBuffer postAttentionNorm;
+  ops::Projection outputProjection;
+  ops::NormWeights postAttentionNorm;
   metal::MetalBuffer mlpConvolution;
-  ops::Q4Projection mlpDynamic;
-  ops::Q4Projection gateProjection;
-  ops::Q4Projection upProjection;
-  ops::Q4Projection downProjection;
+  ops::Projection mlpDynamic;
+  ops::Projection gateProjection;
+  ops::Projection upProjection;
+  ops::Projection downProjection;
 };
 
 struct DFlashDraftWeights final {
   DFlashDraftLayout layout;
   std::vector<DFlashDraftLayerWeights> layers;
-  ops::Q4Projection contextProjection;
-  metal::MetalBuffer hiddenNorm;
-  metal::MetalBuffer finalNorm;
-  ops::Q4Projection selectorProjection;
+  ops::Projection contextProjection;
+  ops::NormWeights hiddenNorm;
+  ops::NormWeights finalNorm;
+  ops::Projection selectorProjection;
   metal::MetalBuffer predecessorCodebook;
   metal::MetalBuffer successorCodebook;
   std::vector<WeightFileRecord> files;
@@ -179,9 +181,23 @@ struct DFlashDraftWeights final {
 
 inline constexpr std::string_view kDFlashLayerMagic = "MDFD0004";
 
+// A Splash package's draft files: layer-<N>.bin and model.bin.
+struct PackedDraftFiles final {
+  metal::MetalBackend &backend;
+  std::filesystem::path directory;
+  const DFlashDraftLayout &layout;
+  [[nodiscard]] WeightFile layer(uint32_t index) const;
+  [[nodiscard]] WeightFile model() const;
+};
+
+class DraftCheckpointLoader;
+
+// The files a draft is read from: a package's packed files, or the cached
+// files DraftCheckpointLoader prepares from a DFlash2 checkpoint.
+using DraftFiles = std::variant<PackedDraftFiles, std::reference_wrapper<DraftCheckpointLoader>>;
+
 [[nodiscard]] DFlashDraftWeights
-loadDFlashDraftWeights(metal::MetalBackend &backend,
-                       const std::filesystem::path &directory,
+loadDFlashDraftWeights(metal::MetalBackend &backend, const DraftFiles &files,
                        DFlashDraftLayout layout = {});
 
 // Builds the draft layer graph from packed buffers and persistent context.
@@ -196,9 +212,9 @@ public:
                          std::span<const DFlashPrefillSpan> spans) const;
 
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-                 const ops::Q4Projection &vocabularyProjection,
+                 const ops::Projection &vocabularyProjection,
                  std::span<const uint32_t> cacheLengths, uint32_t lanes,
-                 ops::Q4DispatchStats &stats) const;
+                 ops::LinearDispatchStats &stats) const;
   void addSelection(metal::CommandGraph &graph,
                     DFlashSelectionBuffers buffers,
                     std::span<const uint32_t> anchors,
@@ -208,7 +224,7 @@ public:
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions,
                         uint32_t lanes,
-                        ops::Q4DispatchStats &stats) const;
+                        ops::LinearDispatchStats &stats) const;
 
 private:
   const DFlashDraftWeights &weights_;

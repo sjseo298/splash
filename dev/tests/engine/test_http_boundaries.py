@@ -37,29 +37,42 @@ class HttpBoundaryTests(unittest.TestCase):
 
     def test_authority_and_origin_validation(self):
         allowed = {"localhost", "127.0.0.1", "::1", "serving.example"}
+        cross_origin = "cross-origin requests are not allowed"
         cases = (
-            ("localhost:8000", "http://localhost:8000", True),
-            ("[::1]:8000", "http://[::1]:8000", True),
-            ("serving.example", "https://serving.example", True),
-            ("127.0.0.1:8000", None, True),
-            ("unconfigured.example:8000", None, False),
-            ("localhost:8000", "http://localhost:9000", False),
-            ("localhost:8000", "http://other.example:8000", False),
-            ("localhost:8000", "null", False),
-            ("localhost:8000", "http://user@localhost:8000", False),
-            ("localhost:8000", "http://localhost:8000/path", False),
+            ("localhost:8000", "http://localhost:8000", None),
+            ("[::1]:8000", "http://[::1]:8000", None),
+            ("serving.example", "https://serving.example", None),
+            ("127.0.0.1:8000", None, None),
+            (
+                "unconfigured.example:8000",
+                None,
+                "Host unconfigured.example is not allowed; restart the server "
+                "with --allowed-host unconfigured.example to accept it",
+            ),
+            ("user@localhost:8000", None, "invalid Host header"),
+            ("localhost:8000", "http://localhost:9000", cross_origin),
+            ("localhost:8000", "http://other.example:8000", cross_origin),
+            ("localhost:8000", "null", "invalid Origin header"),
+            ("localhost:8000", "http://user@localhost:8000", "invalid Origin header"),
+            ("localhost:8000", "http://localhost:8000/path", "invalid Origin header"),
+            ("localhost:8000", "http://localhost:99999", "invalid Origin header"),
         )
-        for host, origin, valid in cases:
+        for host, origin, rejection in cases:
             with self.subTest(host=host, origin=origin):
                 headers = Message()
                 headers["Host"] = host
                 if origin is not None:
                     headers["Origin"] = origin
-                if valid:
+                if rejection is None:
                     http_security.validate_headers(headers, allowed)
-                else:
-                    with self.assertRaises(APIError):
-                        http_security.validate_headers(headers, allowed)
+                    continue
+                with self.assertRaises(APIError) as caught:
+                    http_security.validate_headers(headers, allowed)
+                error = caught.exception
+                self.assertEqual(
+                    (error.status, error.code, error.message),
+                    (403, "forbidden", rejection),
+                )
         for name in ("Host", "Origin"):
             headers = Message()
             headers["Host"] = "localhost"
@@ -75,7 +88,9 @@ class HttpBoundaryTests(unittest.TestCase):
             "GET", "/health", headers={"Host": "unconfigured.example"}
         )
         self.assertEqual(status, 403)
-        self.assertEqual(json.loads(body)["error"]["code"], "forbidden")
+        error = json.loads(body)["error"]
+        self.assertEqual(error["code"], "forbidden")
+        self.assertIn("--allowed-host unconfigured.example", error["message"])
         self.assertEqual(harness.request("GET", "/health")[0], 200)
         self.assertEqual(harness.backend.runtime.requests, [])
 

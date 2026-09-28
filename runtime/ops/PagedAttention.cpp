@@ -68,6 +68,16 @@ std::string_view pipeline(KernelLayout layout, std::string_view kv4Group6,
   return layout == KernelLayout::Kv4Group6 ? kv4Group6 : kv2Group8;
 }
 
+// One dispatch normalizes both the queries and the keys, so their norms must
+// share a stored type.
+std::string qkNormKernel(std::string_view name, const NormWeights &queryNorm,
+                         const NormWeights &keyNorm, uint32_t headDimension) {
+  std::string kernel = normKernel(name, queryNorm, headDimension);
+  if (normKernel(name, keyNorm, headDimension) != kernel)
+    throw std::invalid_argument("query and key norms differ in type");
+  return kernel;
+}
+
 AttentionWorkspace attentionWorkspace(uint64_t rows, uint32_t headDimension) {
   return {rows * headDimension * sizeof(float), rows * 2 * sizeof(float)};
 }
@@ -271,7 +281,7 @@ AttentionWorkspace PagedAttention::verifyWorkspace(
 
 void PagedAttention::addPrefillProjection(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
-    metal::MetalBuffer queryNorm, metal::MetalBuffer keyNorm,
+    const NormWeights &queryNorm, const NormWeights &keyNorm,
     metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
     metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
     metal::MetalBuffer chunkValues, uint32_t tokens, uint32_t cacheStride,
@@ -280,9 +290,10 @@ void PagedAttention::addPrefillProjection(
   if (!tokens || !cacheStride || !rowStride)
     throw std::invalid_argument("invalid paged prefill projection geometry");
   const FullPrefillParams params{tokens, cacheStride, rowStride};
-  graph.add(std::string(pipeline(kernel, "prefill_attention_qkv",
-                                 "prefill_attention_qkv_kv2_g8")),
-            {std::move(packed), std::move(queryNorm), std::move(keyNorm),
+  graph.add(qkNormKernel(pipeline(kernel, "prefill_attention_qkv",
+                                  "prefill_attention_qkv_kv2_g8"),
+                         queryNorm, keyNorm, layout.headDimension),
+            {std::move(packed), queryNorm.buffer, keyNorm.buffer,
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
              std::move(chunkKeys), std::move(chunkValues)},
             params,
@@ -306,7 +317,7 @@ void PagedAttention::addPrefillGate(
 
 void PagedAttention::addVerifyProjection(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
-    metal::MetalBuffer queryNorm, metal::MetalBuffer keyNorm,
+    const NormWeights &queryNorm, const NormWeights &keyNorm,
     metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
     metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
     metal::MetalBuffer chunkValues, uint32_t rowsPerLane,
@@ -318,41 +329,50 @@ void PagedAttention::addVerifyProjection(
     throw std::invalid_argument("invalid paged verify projection geometry");
   const FullDecodeBatchParams params{rowsPerLane, cacheStride, rowStride,
                                      lanes};
-  graph.add(std::string(pipeline(kernel, "verify_attention_qkv",
-                                 "verify_attention_qkv_kv2_g8")),
-            {std::move(packed), std::move(queryNorm), std::move(keyNorm),
+  graph.add(qkNormKernel(pipeline(kernel, "verify_attention_qkv",
+                                  "verify_attention_qkv_kv2_g8"),
+                         queryNorm, keyNorm, layout.headDimension),
+            {std::move(packed), queryNorm.buffer, keyNorm.buffer,
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
              std::move(chunkKeys), std::move(chunkValues)},
             params,
             {uint64_t{rowsPerLane} * (queryHeads + layout.kvHeads), lanes, 1});
 }
 
-void PagedAttention::addVerifyGate(
+PreparedInput PagedAttention::addVerifyGate(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
     metal::MetalBuffer attention, metal::MetalBuffer hidden,
     uint32_t rowsPerLane, uint32_t cacheStride, uint32_t rowStride,
-    uint32_t queryHeads, kv::Layout layout, uint32_t lanes, LinearScratch scratch) {
+    uint32_t queryHeads, kv::Layout layout, uint32_t lanes, LinearScratch scratch,
+    LinearInput input) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!rowsPerLane || !cacheStride || !rowStride || !lanes ||
       lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid paged verify gate geometry");
   const FullDecodeBatchParams params{rowsPerLane, cacheStride, rowStride,
                                      lanes};
-  if (scratch.input && rowsPerLane == SPLASH_TARGET_VERIFY_ROWS) {
+  if (input != LinearInput::Plain && scratch.input && rowsPerLane == SPLASH_TARGET_VERIFY_ROWS) {
     const uint32_t width = queryHeads * layout.headDimension;
-    if (scratch.input.sizeBytes() < uint64_t{width} * 16 * lanes || scratch.sums.sizeBytes() < uint64_t{width} / 2 * lanes)
+    const uint32_t rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
+    if (scratch.input.sizeBytes() < tableBytes(width, rows) ||
+        scratch.sums.sizeBytes() < tableSumsBytes(input, width, rows))
       throw std::invalid_argument("Q4 attention gate scratch is below requirement");
-    graph.add(std::string(pipeline(kernel, "verify_attention_gate_q4", "verify_attention_gate_q4_kv2_g8")),
+    graph.add(std::string(input == LinearInput::Table16
+                              ? pipeline(kernel, "verify_attention_gate_table16",
+                                         "verify_attention_gate_table16_kv2_g8")
+                              : pipeline(kernel, "verify_attention_gate_table64",
+                                         "verify_attention_gate_table64_kv2_g8")),
               {packed, attention, hidden, scratch.input, scratch.sums}, params,
               {width / 64 * lanes, 1, 1}, {256, 1, 1});
-    return;
+    return {std::move(hidden), input};
   }
   graph.add(std::string(pipeline(kernel, "verify_attention_gate",
                                  "verify_attention_gate_kv2_g8")),
-            {std::move(packed), std::move(attention), std::move(hidden)}, params,
+            {std::move(packed), std::move(attention), hidden}, params,
             {gateGroups(uint64_t{rowsPerLane} * lanes, queryHeads,
                         layout.headDimension),
              1, 1});
+  return {};
 }
 
 kv::Q8ChunkedPrefillParams PagedAttention::prefillParams(

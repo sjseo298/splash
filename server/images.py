@@ -99,14 +99,30 @@ def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
 
 def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
     """Decode, convert to RGB, resize into the grid, and digest the pixels."""
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     try:
         with Image.open(io.BytesIO(payload), formats=IMAGE_FORMATS) as decoded:
             if decoded.height * decoded.width > MAX_SOURCE_PIXELS:
                 raise ImageError("source image exceeds the pixel limit")
+            stored = decoded.size
             height, width = smart_resize(decoded.height, decoded.width, max_pixels)
-            image = decoded.convert("RGB")
+            try:
+                # Cameras store the sensor's orientation and an EXIF tag that
+                # turns it upright for display; show the model the upright one.
+                ImageOps.exif_transpose(decoded, in_place=True)
+            except Exception:
+                pass  # A malformed tag leaves the stored orientation.
+            if decoded.size != stored:
+                height, width = width, height
+            if decoded.has_transparency_data:
+                # Composite onto white as Qwen's preprocessing does: transparent
+                # pixels usually store black, which hides dark content.
+                rgba = decoded.convert("RGBA")
+                image = Image.new("RGB", rgba.size, (255, 255, 255))
+                image.paste(rgba, mask=rgba)
+            else:
+                image = decoded.convert("RGB")
             if (image.height, image.width) != (height, width):
                 image = image.resize((width, height), Image.Resampling.BICUBIC)
             pixels = image.tobytes()

@@ -255,7 +255,8 @@ class PartialToolOutputTests(unittest.TestCase):
         for value in objects:
             for ascii_only in (True, False):
                 text = json.dumps(value, ensure_ascii=ascii_only)
-                for end in range(len(text)):
+                # An empty string is a complete call without arguments.
+                for end in range(1, len(text)):
                     arguments = text[:end]
                     with self.subTest(arguments=arguments):
                         call = {
@@ -276,7 +277,8 @@ class PartialToolOutputTests(unittest.TestCase):
                             [
                                 call,
                                 {"role": "user", "content": "Continue"},
-                            ]
+                            ],
+                            vision=True,
                         )
                         actual = normalized[0]["tool_calls"][0]["function"]
                         self.assertEqual(actual["arguments"], arguments)

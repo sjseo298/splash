@@ -32,6 +32,10 @@ constexpr std::array matrices{
     LinearMatrix{17408, 5120}, LinearMatrix{6144, 5120},
     LinearMatrix{6144, 2048}, LinearMatrix{512, 2048},
     LinearMatrix{768, 768}};
+// The affine gate/up projection of `matrix`, which gateUpWorkspace sizes.
+constexpr ProjectionShape affineGateUp(LinearMatrix matrix) {
+  return {matrix.outputSize, matrix.inputSize, WeightLayout::Affine64};
+}
 constexpr std::array attentionFields{
     &AttentionWorkspace::partialsBytes, &AttentionWorkspace::statisticsBytes};
 constexpr std::array draftFields{
@@ -40,12 +44,6 @@ constexpr std::array draftFields{
     &DraftAttentionWorkspace::groupedQueriesBytes,
     &DraftAttentionWorkspace::queryKeysBytes,
     &DraftAttentionWorkspace::queryValuesBytes};
-constexpr std::array moeFields{
-    &MoeWorkspace::selectedExpertsBytes, &MoeWorkspace::routingWeightsBytes,
-    &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
-    &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
-    &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes};
 
 kv::Layout layout(AttentionShape shape, uint32_t layers = 1) {
   return {layers, shape.kvHeads, shape.headDimension, shape.format};
@@ -72,7 +70,7 @@ void covers(const Workspace &stride, const Workspace &needed, uint32_t lanes,
 void baselinePlans() {
   for (uint32_t family : {9U, 10U, 11U}) {
     const ExecutionPlans plans(device(family));
-    const Q4Linear baseline(device(family));
+    const Linear baseline(device(family));
     for (auto matrix : matrices) {
       uint64_t gateBound = 0;
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
@@ -86,7 +84,7 @@ void baselinePlans() {
             gateBound = std::max(gateBound, baseline.plan(w).gateScratchBytes());
         }
       }
-      require(plans.gateUpWorkspace(matrix) == gateBound &&
+      require(plans.gateUpWorkspace(affineGateUp(matrix)) == gateBound &&
                   gateBound == (family == 9 ? 0 : uint64_t{32} * matrix.outputSize * 2),
               "gate/up workspace disagrees with fused or decomposed baseline");
       for (uint32_t rows : {1U, 17U, 2048U})
@@ -150,16 +148,16 @@ void baselinePlans() {
     }
     for (auto shape : moeShapes) {
       const auto stride = plans.moeDecodeWorkspacePerLane(shape);
-      equalWorkspace(stride, MoE::decodePlan(shape, 1).workspace(), moeFields);
+      require(stride == plans.moeDecode(shape, 1).workspace(), "workspace bound changed");
       const auto prefill = plans.moePrefillWorkspace(shape, 2048);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
-        covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, moeFields);
+        covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, kMoeWorkspaceFields);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const auto selected = plans.moeDecode(shape, lanes);
         require(selected.tileRows() == 8 &&
-                    selected.config().m8Simdgroups == moeDecodeSimdgroups(family),
+                    selected.configuration().m8Simdgroups == moeDecodeSimdgroups(family),
                 "MoE decode baseline changed");
-        covers(stride, selected.workspace(), lanes, moeFields);
+        covers(stride, selected.workspace(), lanes, kMoeWorkspaceFields);
       }
     }
   }
@@ -179,37 +177,117 @@ void moeDeviceTiles() {
     for (auto shape : moeShapes) {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const MoeWorkload workload{shape, lanes * 8, MoePhase::Decode};
-        require(plans.moeDecode(shape, lanes).config().m8Simdgroups == expected,
+        require(plans.moeDecode(shape, lanes).configuration().m8Simdgroups == expected,
                 "MoE decode plan departed from the device tile policy");
         for (const auto &candidate : plans.moeCandidates(workload)) {
-          require(candidate.config().m8Simdgroups == expected,
+          require(candidate.configuration().m8Simdgroups == expected,
                   "MoE decode candidate departed from the device tile policy");
           OperatorChoices choices;
-          choices.moe.push_back({workload, candidate.config()});
+          choices.moe.push_back({workload, candidate.configuration()});
           choices.moe.back().configuration.m8Simdgroups =
               expected == MoeExpertSimdgroups::Four ? MoeExpertSimdgroups::Eight
                                                     : MoeExpertSimdgroups::Four;
           plans.install(choices);
-          require(plans.moeDecode(shape, lanes).config() == candidate.config(),
+          require(plans.moeDecode(shape, lanes).configuration() == candidate.configuration(),
                   "installed MoE choice overrode the device tile policy");
         }
       }
       for (uint32_t rows : {1U, 8U, 17U, 2048U}) {
-        require(plans.moePrefill(shape, rows).config().m8Simdgroups ==
+        require(plans.moePrefill(shape, rows).configuration().m8Simdgroups ==
                     MoeExpertSimdgroups::Eight,
                 "MoE prefill plan left the shipped expert tile");
         for (const auto &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
-          require(candidate.config().m8Simdgroups == MoeExpertSimdgroups::Eight,
+          require(candidate.configuration().m8Simdgroups == MoeExpertSimdgroups::Eight,
                   "MoE prefill candidate left the shipped expert tile");
       }
     }
   }
 }
 
+// GGUF MoE plans (Block32 weights) run the three expert passes: the
+// exact register tile on Apple9, with its Table16 row sums in the workspace
+// bounds, staged tiles everywhere else (32-row tiles for prefill chunks past
+// one route per expert), and no installed choices.
+void ggufMoePlans() {
+  MoeShape shape = routedShape;
+  shape.weightLayout = WeightLayout::Block32;
+  for (uint32_t family : {0U, 9U, 10U, 11U}) {
+    ExecutionPlans plans(device(family));
+    const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
+    require(moeGgufTile(family, shape) == expected, "GGUF expert tile is not gated on GPU family 9");
+    // GGUF plans are not tuned: a table may not hold a choice for them.
+    OperatorChoices choices;
+    choices.moe.push_back({MoeWorkload{shape, 16, MoePhase::Decode}, MoeConfig{MoeExpertTile::M8}});
+    rejects([&] { plans.install(choices); });
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const MoePlan plan = plans.moeDecode(shape, lanes);
+      require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 && plan.splitExperts() &&
+                  plan.configuration().ggufRouterTile == FloatTile::Simdgroup,
+              "GGUF MoE decode plan left its device tile");
+      for (const MoePlan &candidate : plans.moeCandidates({shape, lanes * 8, MoePhase::Decode}))
+        require(candidate.configuration() == plan.configuration(), "GGUF MoE decode candidate is not the device's plan");
+      // Sums of the widest input (hidden, 3 K / 4 fp32) per 8-row tile.
+      require(plan.workspace().groupedSumsBytes ==
+                  (expected == MoeGgufTile::Register ? uint64_t{plan.maximumTiles()} * 2048 * 3 : 0),
+              "GGUF register plan sums its Table16 tiles");
+      covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, kMoeWorkspaceFields);
+      require(plans.moeDecode(routedShape, lanes).configuration().ggufTile == MoeGgufTile::Staged &&
+                  plans.moeDecode(routedShape, lanes).workspace().groupedSumsBytes == 0,
+              "affine MoE plan took the GGUF register tile");
+    }
+    // Apple9 stages experts mostly in a format it stages (IQ2_XS: UD-Q2_K_XL)
+    // and keeps the register tile for the others (Q4_K: UD-Q4_K_M).
+    MoeShape staged = shape, q4k = shape;
+    staged.expertFormat = GGUF_FMT_IQ2XS;
+    q4k.expertFormat = GGUF_FMT_Q4K;
+    require(moeGgufTile(family, staged) == MoeGgufTile::Staged && moeGgufTile(family, q4k) == expected,
+            "GGUF expert tile does not follow the experts' format on GPU family 9");
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const MoePlan plan = plans.moeDecode(staged, lanes);
+      require(plan.configuration().ggufTile == MoeGgufTile::Staged && plan.workspace().groupedSumsBytes == 0,
+              "GGUF MoE plan of staged experts took the register tile");
+      covers(plans.moeDecodeWorkspacePerLane(staged), plan.workspace(), lanes, kMoeWorkspaceFields);
+    }
+    // Prefill: the register tile's 8 rows, or staged 8-row tiles while the
+    // routes average at most one row per expert (32 rows of 8 of 256
+    // experts). The router's float tile follows Linear::ggufFloatTile (32
+    // assumed cores: the neural accelerator from 321 rows, never on Apple9).
+    for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 100U, 256U, 257U, 320U, 321U, 2048U}) {
+      const MoePlan plan = plans.moePrefill(shape, rows);
+      const uint32_t tileRows = expected == MoeGgufTile::Register || rows <= 32 ? 8 : 32;
+      const FloatTile router = family != 9 && rows > 320 ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
+      require(plan.configuration().ggufTile == expected && plan.tileRows() == tileRows && plan.splitExperts() &&
+                  (plan.workspace().groupedSumsBytes > 0) == (expected == MoeGgufTile::Register) &&
+                  plan.configuration().ggufRouterTile == router,
+              "GGUF MoE prefill plan left the device's tile");
+      covers(plans.moePrefillWorkspace(shape, 2048), plan.workspace(), 1, kMoeWorkspaceFields);
+      for (const MoePlan &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
+        require(candidate.configuration() == plan.configuration(), "GGUF MoE prefill candidate is not the device's plan");
+    }
+    // The prefill bound holds the device's plans and nothing else: on Apple9
+    // the register tile's 8-row tiles (20480 grouped rows at 2048 rows), not
+    // the staged 32-row tiles it never runs (26624).
+    MoeWorkspace devicePlans;
+    for (uint32_t rows = 1; rows <= 2048; ++rows) {
+      const MoeWorkspace workspace = plans.moePrefill(shape, rows).workspace();
+      for (const auto field : kMoeWorkspaceFields) devicePlans.*field = std::max(devicePlans.*field, workspace.*field);
+    }
+    require(plans.moePrefillWorkspace(shape, 2048) == devicePlans,
+            "GGUF MoE prefill bound is not the bound of the device's plans");
+  }
+  // The register tile reads GGUF 8-row tiles only.
+  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M8, kMoeRouteWideRows,
+                                                       MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
+  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32, kMoeRouteWideRows,
+                                                 MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
+  // GGUF kernels exist for 8-row tiles and 32-row prefill tiles only.
+  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); });
+}
+
 void allCandidates() {
   ExecutionPlans plans(device());
   const ExecutionPlans shipped(device());
-  const Q4Linear baseline(device());
+  const Linear baseline(device());
   for (auto matrix : matrices) {
     for (uint32_t rows : {1U, 17U, 2048U, 8U, 16U, 24U, 32U}) {
       const auto phase = rows == 1 || rows == 17 || rows == 2048
@@ -234,10 +312,10 @@ void allCandidates() {
                         selected.sumsBytes() == original.sumsBytes() &&
                         selected.gateScratchBytes() == original.gateScratchBytes() &&
                         selected.downSumsBytes() == original.downSumsBytes() &&
-                        plans.gateUpWorkspace(matrix) == shipped.gateUpWorkspace(matrix),
+                        plans.gateUpWorkspace(affineGateUp(matrix)) == shipped.gateUpWorkspace(affineGateUp(matrix)),
                     "four-SIMDgroup choice changed an external workspace requirement");
           }
-          require(plans.gateUpWorkspace(matrix) >= candidate.gateScratchBytes() ||
+          require(plans.gateUpWorkspace(affineGateUp(matrix)) >= candidate.gateScratchBytes() ||
                       phase == LinearPhase::Prefill,
                   "gate scratch omitted a selected decode width");
         }
@@ -287,22 +365,22 @@ void allCandidates() {
     for (uint32_t rows : {1U, 17U, 2048U})
       for (const auto &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill})) {
         OperatorChoices choices;
-        choices.moe.push_back({{shape, rows, MoePhase::Prefill}, candidate.config()});
+        choices.moe.push_back({{shape, rows, MoePhase::Prefill}, candidate.configuration()});
         plans.install(choices);
-        require(plans.moePrefill(shape, rows).config() == candidate.config(),
+        require(plans.moePrefill(shape, rows).configuration() == candidate.configuration(),
                 "MoE prefill candidate not selected");
         covers(plans.moePrefillWorkspace(shape, 2048), candidate.workspace(), 1,
-               moeFields);
+               kMoeWorkspaceFields);
       }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes)
       for (const auto &candidate : plans.moeCandidates({shape, lanes * 8, MoePhase::Decode})) {
         OperatorChoices choices;
-        choices.moe.push_back({{shape, lanes * 8, MoePhase::Decode}, candidate.config()});
+        choices.moe.push_back({{shape, lanes * 8, MoePhase::Decode}, candidate.configuration()});
         plans.install(choices);
-        require(plans.moeDecode(shape, lanes).config() == candidate.config(),
+        require(plans.moeDecode(shape, lanes).configuration() == candidate.configuration(),
                 "MoE decode candidate not selected");
         covers(plans.moeDecodeWorkspacePerLane(shape), candidate.workspace(), lanes,
-               moeFields);
+               kMoeWorkspaceFields);
       }
   }
 }
@@ -419,8 +497,8 @@ void policyKeysAndBounds() {
               moe.expertIntermediateBytes == 2108075 && moe.groupedRoutesBytes == 8235 &&
               moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 4,
           "B3 MoE workspace must use componentwise ceiling, including baseline");
-  require(plans.gateUpWorkspace(matrices[0]) == 1114112 &&
-              plans.gateUpWorkspace(matrices[1]) == 393216,
+  require(plans.gateUpWorkspace(affineGateUp(matrices[0])) == 1114112 &&
+              plans.gateUpWorkspace(affineGateUp(matrices[1])) == 393216,
           "B1 gate choice hid the B3/B4 baseline requirement");
   const auto draft = plans.draftAttentionWorkspacePerLane(draftShapes[0]);
   // Grouped queries per lane plus eight heads x four splits of 32 x 130 fp32
@@ -523,6 +601,7 @@ int main() {
   try {
     baselinePlans();
     moeDeviceTiles();
+    ggufMoePlans();
     allCandidates();
     policyKeysAndBounds();
     atomicInvalidChoices();

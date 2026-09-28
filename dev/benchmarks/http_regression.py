@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import statistics
 import sys
 import time
@@ -16,6 +17,8 @@ import uuid
 from collections import defaultdict
 from pathlib import Path
 
+from dev.benchmarks import abba
+from dev.benchmarks import prepared as prepared_weights
 from dev.tests import smoke_real as smoke
 
 
@@ -120,7 +123,13 @@ def measure(server, model, content, output_tokens, scenario, context, timeout):
     }
 
 
-def summarize(records: list[dict], maximum_regression: float) -> list[dict]:
+ROUNDS = ("baseline", "candidate", "candidate", "baseline")
+
+
+def summarize(records: list[dict]) -> list[dict]:
+    """Per context and scenario, the ABBA verdict (abba.compare) of the
+    median latency of each of the four rounds; the matched transcripts of
+    both versions must be identical."""
     groups = defaultdict(lambda: defaultdict(list))
     outputs = {}
     for row in records:
@@ -142,26 +151,25 @@ def summarize(records: list[dict], maximum_regression: float) -> list[dict]:
             )
         else:
             latency = row["metrics"]["request_latency"]["ttft_ms"]
-        groups[row["context"], row["scenario"]][row["version"]].append(latency)
+        groups[row["context"], row["scenario"]][row["round"]].append(latency)
     results = []
     if any(set(pair) != {"baseline", "candidate"} for pair in outputs.values()):
         raise ValueError("unpaired request samples")
-    for (context, scenario), versions in sorted(groups.items()):
-        if len(versions["baseline"]) != len(versions["candidate"]):
-            raise ValueError("unpaired performance samples")
-        baseline = statistics.median(versions["baseline"])
-        candidate = statistics.median(versions["candidate"])
-        ratio = candidate / baseline
+    for (context, scenario), rounds in sorted(groups.items()):
+        if sorted(rounds) != list(range(len(ROUNDS))):
+            raise ValueError(f"a round has no samples: {context} {scenario}")
+        comparison = abba.compare_samples(rounds[index] for index in range(len(ROUNDS)))
         results.append(
             {
                 "context": context,
                 "scenario": scenario,
                 "metric": "decode_ms_per_token" if scenario == "decode" else "ttft_ms",
-                "samples_per_binary": len(versions["baseline"]),
-                "baseline_median": baseline,
-                "candidate_median": candidate,
-                "ratio": ratio,
-                "pass": ratio <= 1 + maximum_regression,
+                "samples_per_round": [
+                    len(rounds[index]) for index in range(len(ROUNDS))
+                ],
+                "baseline_median": statistics.median(rounds[0] + rounds[3]),
+                "candidate_median": statistics.median(rounds[1] + rounds[2]),
+                **comparison,
             }
         )
     return results
@@ -173,7 +181,6 @@ def parse_args(argv=None):
     parser.add_argument("--baseline-binary", required=True, type=Path)
     parser.add_argument("--contexts", default="2048,10000")
     parser.add_argument("--samples", type=int, default=5)
-    parser.add_argument("--maximum-regression", type=float, default=0.02)
     parser.add_argument("--request-timeout", type=float, default=1800)
     parser.add_argument(
         "--output", type=Path, default=Path("build/release/http-regression.json")
@@ -182,22 +189,50 @@ def parse_args(argv=None):
     args.contexts = [int(value) for value in args.contexts.split(",")]
     if args.samples < 2 or not args.contexts or min(args.contexts) < 256:
         parser.error("at least two samples and contexts >= 256 are required")
-    if args.maximum_regression < 0 or args.request_timeout <= 0:
-        parser.error("regression must be nonnegative and timeout positive")
+    if args.request_timeout <= 0:
+        parser.error("the request timeout must be positive")
     if len(set(args.contexts)) != len(args.contexts):
         parser.error("contexts must be unique")
     for binary in (args.baseline_binary, args.binary):
         for path in (binary, binary.parent / "splash.metallib"):
             if not path.is_file():
                 parser.error(f"missing retained executable/library: {path}")
-    for path in (args.package / "manifest.json", args.package / "tokenizer"):
-        if not path.exists():
-            parser.error(f"missing installed package: {path}")
+    args.kind = smoke.model_artifacts.installation_kind(args.package)
+    if args.kind is None:
+        parser.error(f"missing installed model: {args.package}")
     return args
+
+
+def check_identity(status: dict, version: str, rounds: list[dict], shared: bool):
+    """Every round serves the same model and KV format. A build's rounds
+    load the same executable and prepared files; builds of one preparation
+    identity load the same prepared files too, while builds of different
+    identities prepare under different keys, so their bytes are compared
+    after the rounds instead (prepared.compare)."""
+    identity = status["identity"]
+    for previous in rounds:
+        expected = previous["identity"]
+        smoke.require(
+            smoke.kv_identity(identity) == smoke.kv_identity(expected),
+            "KV identity changed",
+        )
+        same_layout = (
+            identity["cache"]["loaded_model_layout_sha256"]
+            == expected["cache"]["loaded_model_layout_sha256"]
+        )
+        if previous["version"] == version:
+            smoke.require(
+                identity["cache"]["build_id"] == expected["cache"]["build_id"],
+                "executable source changed between rounds",
+            )
+            smoke.require(same_layout, f"the {version} loaded another model layout")
+        elif shared:
+            smoke.require(same_layout, "loaded target/draft changed")
 
 
 def main(argv=None):
     args = parse_args(argv)
+    smoke.hold_package(args)
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -206,6 +241,16 @@ def main(argv=None):
     nonce = uuid.uuid4().hex
     prepared = prompts(tokenizer, [128, *args.contexts], args.samples, nonce)
     binaries = {"baseline": args.baseline_binary, "candidate": args.binary}
+    shared = prepared_weights.preparation_identity(
+        args.baseline_binary.resolve().parent
+    ) == prepared_weights.preparation_identity(args.binary.resolve().parent)
+    environments = {"baseline": None, "candidate": None}
+    if not shared:
+        # Builds of different preparation identities must not share a cache;
+        # the candidate keeps its own, which its other steps use.
+        environments["baseline"] = prepared_weights.baseline_environment(
+            args.output.parent
+        )
     document = {
         "schema_version": 1,
         "timing": "HTTP/native wall; not GPU time",
@@ -216,31 +261,14 @@ def main(argv=None):
         "performance_pass": False,
     }
     try:
-        for round_id, version in enumerate(
-            ("baseline", "candidate", "candidate", "baseline")
-        ):
+        for round_id, version in enumerate(ROUNDS):
             run_args = argparse.Namespace(**vars(args))
             run_args.binary = binaries[version]
-            server = smoke.RealServer(run_args)
+            server = smoke.RealServer(run_args, environments[version])
             try:
                 status = server.wait_ready(args.startup_timeout)
                 smoke.validate_status(status, args.kv_format)
-                if document["rounds"]:
-                    expected = document["rounds"][0]["identity"]
-                    smoke.require(
-                        smoke.kv_identity(status["identity"])
-                        == smoke.kv_identity(expected)
-                        and status["identity"]["cache"]["loaded_model_layout_sha256"]
-                        == expected["cache"]["loaded_model_layout_sha256"],
-                        "loaded target/draft or KV identity changed",
-                    )
-                for previous in document["rounds"]:
-                    if previous["version"] == version:
-                        smoke.require(
-                            status["identity"]["cache"]["build_id"]
-                            == previous["identity"]["cache"]["build_id"],
-                            "executable source changed between rounds",
-                        )
+                check_identity(status, version, document["rounds"], shared)
                 document["rounds"].append(
                     {
                         "version": version,
@@ -284,7 +312,25 @@ def main(argv=None):
                 raise
             finally:
                 server.close()
-        document["comparison"] = summarize(document["samples"], args.maximum_regression)
+        document["comparison"] = summarize(document["samples"])
+        document["prepared"] = (
+            {"shared_identity": True, "pass": True}
+            if shared
+            else {
+                "shared_identity": False,
+                **prepared_weights.compare(
+                    prepared_weights.cache_root(environments["baseline"]),
+                    prepared_weights.cache_root(os.environ),
+                    # The model root RealServer gives both builds.
+                    package=args.package.resolve(),
+                    required=args.kind == smoke.model_artifacts.ASSEMBLY,
+                ),
+            }
+        )
+        smoke.require(
+            document["prepared"]["pass"],
+            f"prepared bytes differ: {document['prepared'].get('failures')}",
+        )
         document["correctness_pass"] = True
         document["performance_pass"] = all(
             row["pass"] for row in document["comparison"]

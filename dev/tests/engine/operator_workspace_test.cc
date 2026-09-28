@@ -1,3 +1,5 @@
+#include "metal/abi/MoE.h"
+#include "model/WeightLayout.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/Sampling.hpp"
@@ -73,26 +75,31 @@ void attention() {
   }
 }
 
-// The split prefill plan parks its gate in expertOutput, so that field spans
-// the wider of the hidden and intermediate widths.
+// Expert ids, route rows and grouped routes are uint32, routing weights fp32
+// and activations bf16. The grouped input first holds the router's fp32
+// scores, one row of 256 per token. The split prefill plan parks its gate in
+// expertOutput, so that field spans the wider of the hidden and intermediate
+// widths.
 void checkMoe(splash::ops::MoeWorkspace workspace,
               splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows,
               uint32_t outputWidth) {
-  const uint64_t routed = uint64_t{rows} * shape.expertsPerToken;
-  const uint64_t routes = uint64_t{rows} * (shape.expertsPerToken + 1);
-  const uint64_t tiles = std::min(routed / tileRows + shape.experts, routed) +
-                         (rows + tileRows - 1) / tileRows;
+  using splash::model::kBFloat16Bytes;
+  constexpr uint64_t kRouterScores = 256;
+  const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
+  const uint64_t tiles = splash::ops::moeMaximumTiles(rows, shape, tileRows);
   const uint64_t grouped = tiles * tileRows;
-  require(workspace.selectedExpertsBytes == routes * 4 &&
-              workspace.routingWeightsBytes == routes * 2 &&
-              workspace.tileDescriptorsBytes == tiles * 8 &&
-              workspace.tileCountBytes == 4 &&
-              workspace.groupedRoutesBytes == grouped * 4 &&
-              workspace.routeRowsBytes == routes * 4 &&
-              workspace.groupedInputBytes == grouped * shape.hiddenSize * 2 &&
+  require(workspace.selectedExpertsBytes == routes * sizeof(uint32_t) &&
+              workspace.routingWeightsBytes == routes * sizeof(float) &&
+              workspace.tileDescriptorsBytes == tiles * sizeof(MoeTileDescriptor) &&
+              workspace.tileCountBytes == sizeof(uint32_t) &&
+              workspace.groupedRoutesBytes == grouped * sizeof(uint32_t) &&
+              workspace.routeRowsBytes == routes * sizeof(uint32_t) &&
+              workspace.groupedInputBytes == std::max(grouped * shape.hiddenSize * kBFloat16Bytes,
+                                                      uint64_t{rows} * kRouterScores * sizeof(float)) &&
               workspace.expertIntermediateBytes ==
-                  grouped * shape.expertIntermediateSize * 2 &&
-              workspace.expertOutputBytes == grouped * outputWidth * 2,
+                  grouped * shape.expertIntermediateSize * kBFloat16Bytes &&
+              workspace.expertOutputBytes == grouped * outputWidth * kBFloat16Bytes &&
+              workspace.groupedSumsBytes == 0,
           "MoE workspace changed from baseline");
 }
 
@@ -103,22 +110,22 @@ void moe() {
     const uint32_t splitWidth =
         std::max(shape.hiddenSize, shape.expertIntermediateSize);
     for (uint32_t rows = 1; rows <= 2048; ++rows)
-      checkMoe(MoE::prefillPlan(shape, rows).workspace(), shape, rows, 32, splitWidth);
-    const auto single = MoE::decodePlan(shape, 1).workspace();
+      checkMoe(MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32, splitWidth);
+    const auto single = MoE::decodePlan(shape, 1, {MoeExpertTile::M8}).workspace();
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto workspace = MoE::decodePlan(shape, lanes).workspace();
+      const auto workspace = MoE::decodePlan(shape, lanes, {MoeExpertTile::M8}).workspace();
       checkMoe(workspace, shape, lanes * 8, 8, shape.hiddenSize);
       require(workspace.groupedInputBytes <= lanes * single.groupedInputBytes &&
                   workspace.tileDescriptorsBytes <=
                       lanes * single.tileDescriptorsBytes,
               "packed decode workspace exceeds per-lane allocation bound");
     }
-    rejects([&] { return MoE::prefillPlan(shape, 0); });
-    rejects([&] { return MoE::prefillPlan(shape, 2049); });
-    rejects([&] { return MoE::decodePlan(shape, 0); });
-    rejects([&] { return MoE::decodePlan(shape, 5); });
+    rejects([&] { return MoE::prefillPlan(shape, 0, {MoeExpertTile::M32}); });
+    rejects([&] { return MoE::prefillPlan(shape, 2049, {MoeExpertTile::M32}); });
+    rejects([&] { return MoE::decodePlan(shape, 0, {MoeExpertTile::M8}); });
+    rejects([&] { return MoE::decodePlan(shape, 5, {MoeExpertTile::M8}); });
   }
-  rejects([] { return MoE::prefillPlan({}, 1); });
+  rejects([] { return MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); });
 }
 
 void sampling() {
@@ -146,7 +153,7 @@ void sampling() {
     require(workspace.partialIdsBytes == count * 8 * 16 * 4 &&
                 workspace.partialValuesBytes == count * (8 + 16) * 16 * 4 &&
                 workspace.candidatesBytes == count * 16 * 4 &&
-                workspace.unaryBytes == count * 16 * 2 &&
+                workspace.unaryBytes == count * 16 * 4 &&
                 workspace.proposalProbabilitiesBytes == count * 16 * 4,
             "draft sampling workspace changed from the shipped 8-shard ABI");
   }

@@ -4,9 +4,11 @@
 #include "engine/RuntimeResources.hpp"
 #include "engine/Status.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -55,6 +57,37 @@ public:
 private:
     RuntimeBootstrapReport report_;
 };
+
+// Startup retries a temporary host or driver allocation failure for a
+// bounded time. The window opens at the first such failure, not at process
+// start, since a cold start can prepare weights for minutes before one; a
+// failure at a later stage than the last one follows progress and opens a
+// new window.
+class StartupRetryWindow final {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    explicit StartupRetryWindow(Clock::duration length) noexcept
+        : length_(length) {}
+
+    // Until when startup may retry after this failure; nothing when the
+    // failure is not temporary or its window has closed.
+    [[nodiscard]] std::optional<Clock::time_point>
+    retryUntil(const RuntimeBootstrapReport &failure, Clock::time_point now);
+
+private:
+    Clock::duration length_;
+    std::optional<Clock::time_point> deadline_;
+    RuntimeBootstrapStage stage_ = RuntimeBootstrapStage::ResourceAssembly;
+};
+
+// Whether memory may not hold a request of contextTokens: the plan within
+// what the host had available at startup, beyond its reserve and the warning
+// margin, holds less. The estimate is conservative, since macOS compresses
+// other applications further once the engine loads.
+[[nodiscard]] bool memoryMayNotHold(const EngineMemoryPlan &plan,
+                                    uint64_t hostAvailableBytes,
+                                    uint32_t contextTokens);
 
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;

@@ -8,16 +8,18 @@ import unittest
 from unittest import mock
 
 from dev.tests.engine.test_runtime import FakeFactory
+from dev.tests.test_server import make_frontend
 from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
-from server import frontend as request_frontend
 from server import images, runtime
 from server import protocol as wire
 
 
 class FakeTokenizer:
     backend_tokenizer = None
+    # Rendering ignores it; only the startup probe reads it.
+    chat_template = "{%- for message in messages %}{{- message.content }}{%- endfor %}"
 
     @staticmethod
     def decode(token_ids, **_kwargs):
@@ -191,7 +193,7 @@ def make_job(request_id=101, *, constraint=None, temperature=0.0):
 
 def success_result(call, *, reason=wire.FinishReason.STOP, tokens=()):
     done = wire.DoneEvent(call.request_id, reason, 4, len(tokens), 1_250, 2_500, 4_000)
-    return runtime.GenerationResult(call.request_id, None, tuple(tokens), done)
+    return runtime.GenerationResult(call.request_id, None, done)
 
 
 class NativeBackendContractTests(unittest.TestCase):
@@ -248,8 +250,8 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_http_fields_reach_native_generation_request(self):
         transport, runtime = self.make_transport()
-        app = request_frontend.Frontend(
-            FakeTokenizer(), transport, "test-model", 128, 32, 10, 2
+        app = make_frontend(
+            FakeTokenizer(), transport, "test-model", 128, 32, 10, 2, vision=True
         )
         job, _thinking, _tools = app.prepare(
             {
@@ -883,6 +885,14 @@ class NativeBackendContractTests(unittest.TestCase):
             ),
             (runtime.EngineUnhealthy("gpu failed"), (503, "runtime_unavailable")),
             (runtime.ProtocolFatal("bad frame"), (500, "protocol_error")),
+            (
+                runtime.MaskComputationFailed("grammar has no valid token"),
+                (400, "constraint_error"),
+            ),
+            (
+                runtime.MaskComputationFailed("queue is full", retryable=True),
+                (503, "runtime_busy"),
+            ),
         )
         for native, expected in cases:
             with self.subTest(native=native):

@@ -23,11 +23,12 @@ struct EngineConfig final {
   // Zero disables progress checkpoints without changing reusable end states.
   uint32_t prefillCheckpointTokens =
       2 * model::ExecutionLimits::draftContextTokens;
-  // Patches per image the model's vision scratch covers.
+  // Patches per image the model's vision scratch covers; zero rejects images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   double resourceWaitTimeoutMilliseconds = 30000.0;
   // Host growth admission, supplied by the runtime governor. Queried only on
-  // failed allocation, never on the successful decode path.
+  // failed allocation and, after a suspension the pause caused, while
+  // resident lanes drain; never on the ordinary decode path.
   std::function<bool()> growthPaused;
 };
 
@@ -54,6 +55,8 @@ struct EngineSnapshot final {
   uint64_t deduplicatedStatePublications = 0;
   // Publications completed after reclaiming a cached state.
   uint64_t recycledStatePublications = 0;
+  // Publications written straight to disk because no cache slot was free.
+  uint64_t diskStatePublications = 0;
   uint64_t replayStatePublicationFailures = 0;
   uint64_t junctionMaterializations = 0;
   uint64_t junctionMaterializationFailures = 0;
@@ -96,8 +99,10 @@ public:
   // state/KV in LRU order.
   // Live command buffers are never eviction candidates. Physical KV release
   // is paced one extent at a time; reclaimDeferred() reports that the pass
-  // stopped behind an in-flight release and should run again shortly.
-  [[nodiscard]] uint64_t reclaimMemory(const MemoryReclaimDirective &directive);
+  // stopped behind an in-flight release and should run again shortly. The
+  // result says whether the directive's target is met, waits for transfers
+  // or a release in flight, or finds nothing left to reclaim.
+  [[nodiscard]] MemoryReclaimResult reclaimMemory(const MemoryReclaimDirective &directive);
   [[nodiscard]] bool reclaimDeferred() const noexcept {
     return cache_.releaseDeferred();
   }
@@ -115,6 +120,8 @@ private:
     double deadlineMilliseconds = 0.0;
     double retryMilliseconds = 0.0;
     uint64_t epoch = 0;
+    // Memory is on its way back; the limit fires only without progress.
+    bool pending = false;
   };
 
   struct Request final {
@@ -145,12 +152,33 @@ private:
     bool replaying = false;
     // Captured once the final prompt chunk completes; emitted with Done.
     std::vector<float> scoreLogits;
+    // A restore that could not fit alone released its prefix pin:
+    // admissions ignore the cache until one succeeds.
+    bool skipCache = false;
+    // Admission that waits for its state's read, its KV pages' restores,
+    // or both, before the lane runs.
+    struct Restore {
+      CacheLookup lookup;
+      DraftContextPlan draft;
+      // Null when the state was in RAM.
+      std::unique_ptr<StateRestore> ticket;
+    };
+    std::optional<Restore> restore;
   };
 
-
+  // An empty plan carries only KV copies for the disk tier.
   struct Pending final {
     BatchPlan plan;
     std::unique_ptr<ModelBatchTicket> ticket;
+  };
+  enum class Prepared : uint8_t {
+    // Some lanes were admitted and the plan runs with them.
+    Runnable,
+    // Every lane was denied and one yielded its memory or failed.
+    Yielded,
+    // Every lane was denied while pages are on their way back; nothing
+    // changed, the lanes retry when the pages land.
+    Waiting,
   };
   double nextHealthCheckMilliseconds_ = 0.0;
 
@@ -161,6 +189,8 @@ private:
                                                       const Request &right);
   [[nodiscard]] bool pendingSharedPrefill(const Request &request,
                                           uint32_t resumeBoundary) const;
+  void completeAdmission(Request &request, CacheLookup &lookup, DraftContextPlan draft);
+  [[nodiscard]] bool pollRestores(double nowMilliseconds);
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);
@@ -172,27 +202,57 @@ private:
   [[nodiscard]] bool retireCheckpoint(Request &request);
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed);
-  [[nodiscard]] bool prepare(BatchPlan &plan,
-                             std::vector<ModelBatchItem> &items,
-                             double nowMilliseconds);
-  [[nodiscard]] bool reclaimForGrowth(
+  [[nodiscard]] Prepared prepare(BatchPlan &plan,
+                                 std::vector<ModelBatchItem> &items,
+                                 double nowMilliseconds);
+  [[nodiscard]] CacheReclaimResult reclaimForGrowth(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
   [[nodiscard]] bool reclaimIdleState() noexcept;
-  [[nodiscard]] bool reuseIdleBackingWhilePaused(const TokenAdmission &admission);
+  [[nodiscard]] CacheReclaimResult reuseIdleBackingWhilePaused(
+      const TokenAdmission &admission);
   [[nodiscard]] bool growthPaused() const;
+  // Memory a lane could not get, and what the engine knows about its return.
+  struct Denial {
+    metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
+    // On its way back: pages whose copies are being written, or a reclaim
+    // that waits for the transfer in flight. The lane waits; nobody yields.
+    bool pending = false;
+    // Still moving: a release or a reclaim in progress, or a budget that
+    // can recover. Waiting or yielding beats failing.
+    bool retryable = false;
+  };
   struct KvAdmission {
     TokenAdmission allocation;
-    bool retryableBudget = false;
+    Denial denial;
   };
-  [[nodiscard]] KvAdmission admitKv(Request &request, uint64_t workEnd);
+  // What a lane does about memory it could not get. Pending memory returns
+  // by itself: the lane waits. Otherwise a lane fails only when it is alone
+  // with nothing left to reclaim; while other lanes hold memory, growth is
+  // paused or the budget may recover, a running lane yields its memory and
+  // a lane being admitted waits.
+  enum class Verdict : uint8_t { Wait, Yield, Fail };
+  [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
+  [[nodiscard]] bool anotherResident(uint64_t requestId) const;
+  // Runs one page admission, reclaiming cache between attempts while that
+  // makes progress.
+  [[nodiscard]] KvAdmission admitKv(const std::function<TokenAdmission()> &attempt);
   [[nodiscard]] bool budgetMayRecover(metal::AllocationFailure failure,
                                       uint64_t generation, bool reclaimed) const;
   void suspendForGrowth(Request &request, uint64_t workEnd,
+                        metal::AllocationFailure failure,
                         double nowMilliseconds);
   [[nodiscard]] bool resourceRetryReady(const Request &request,
                                         double nowMilliseconds) const noexcept;
+  // With `pending`, memory is on its way back (pages of demoted blocks land
+  // within commands): the wait limit measures time without progress, so it
+  // moves out with every retry that follows progress and never fires while
+  // progress has been made since the last attempt.
   void deferResourceRetry(Request &request, double nowMilliseconds,
-                          StateFailure reason = StateFailure::MemoryPressure) noexcept;
+                          StateFailure reason = StateFailure::MemoryPressure,
+                          bool pending = false) noexcept;
+  // The wait limit tick() enforces, or zero while it enforces none: a
+  // pending wait that has seen progress waits for its next attempt.
+  [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
              double wallMilliseconds, bool representativePrefillTiming);
@@ -209,12 +269,19 @@ private:
   EngineEventSink &events_;
   Scheduler scheduler_;
   std::unordered_map<uint64_t, Request> requests_;
-  // Pressure preempted work and a resident lane still holds its state cell.
+  // Pressure preempted work, a resident lane still holds its state cell, and
+  // memory is still short (growth is paused or allocationFailed_), up to the
+  // drain's end.
   [[nodiscard]] bool drainingForRecovery() const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
   uint64_t resourceEpoch_ = 1;
-  bool recoveringResources_ = false;
+  // The resource wait limit after the latest suspension; zero once passed
+  // or when no request is suspended.
+  double drainEndMilliseconds_ = 0.0;
+  // An allocation failed since the latest suspension, or the suspension
+  // itself met a limit that only freed memory lifts, unlike a host pause.
+  bool allocationFailed_ = false;
   EngineSnapshot counters_;
 };
 

@@ -159,6 +159,32 @@ class HttpBodyBudgetTests(unittest.TestCase):
         )
         self.wait_bytes(harness, 0)
 
+    def test_rejections_before_the_body_reach_a_client_still_uploading(self):
+        # Closing with the upload unread would reset the connection under a
+        # client that sends the whole body before reading the response.
+        harness = self.harness(max_request_bytes=1024, api_key="test-key")
+        body = b" " * (8 * 1024 * 1024)
+        authorized = {"Authorization": "Bearer test-key"}
+        for path, headers, status in (
+            ("/v1/chat/completions", {}, 401),
+            ("/v1/chat/completions", authorized, 413),
+            ("/v1/unknown", authorized, 404),
+        ):
+            with self.subTest(status=status):
+                connection = http.client.HTTPConnection(
+                    *harness.server.server_address, timeout=5
+                )
+                self.addCleanup(connection.close)
+                connection.request(
+                    "POST",
+                    path,
+                    body,
+                    {"Content-Type": "application/json", **headers},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, status)
+                response.read()
+
     def test_parsed_bodies_stay_charged_while_preparation_is_pending(self):
         with mock.patch.object(api, "DEFAULT_REQUEST_BODY_BUDGET", 4096):
             harness = self.harness(max_request_bytes=1024, queue_size=8)

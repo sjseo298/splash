@@ -10,6 +10,7 @@ from referencing import Registry
 
 from server import schema_validation as validation
 from server import tool_schema
+from server.errors import APIError
 
 
 class ValidatorCacheTests(unittest.TestCase):
@@ -74,6 +75,27 @@ class ValidatorCacheTests(unittest.TestCase):
                 self.build({"type": "invalid"})
         self.assertFalse(validation._validator_cache)
         self.assertEqual(validation._validator_cache_bytes, 0)
+
+    def test_unevaluated_properties_cannot_reach_unbounded_patterns(self):
+        # jsonschema matches these patterns with the standard-library engine,
+        # which has no time limit, however the keywords are connected.
+        patterns = {"patternProperties": {"^(a+)+$": {"type": "integer"}}}
+        closed = {"unevaluatedProperties": False}
+        draft = {"$schema": "https://json-schema.org/draft/2019-09/schema"}
+        for schema in (
+            {**patterns, **closed},
+            {"allOf": [patterns], **closed},
+            {"$ref": "#/x-stash", "x-stash": patterns, **closed},
+            {**draft, **patterns, **closed},
+        ):
+            with self.subTest(schema=schema), self.assertRaises(APIError) as caught:
+                self.build(schema)
+            self.assertEqual(caught.exception.status, 400)
+        self.assertFalse(validation._validator_cache)
+        self.assertFalse(self.build(patterns).is_valid({"aa": "1"}))
+        validator = self.build({"properties": {"a": {}}, **closed})
+        self.assertTrue(validator.is_valid({"a": 1}))
+        self.assertFalse(validator.is_valid({"b": 1}))
 
     def test_caller_mutation_does_not_change_cached_validator(self):
         schema = {"properties": {"x": {"type": "integer"}}}

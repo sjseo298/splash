@@ -1,8 +1,8 @@
+#include "AffineQ4Fixture.hpp"
 #include "tuning/MoeTuning.hpp"
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -49,28 +49,28 @@ void devicePolicyPlans() {
         // and every other family keep the shipped eight.
         const auto simdgroups = workload.phase == MoePhase::Decode && family == 9
             ? MoeExpertSimdgroups::Four : MoeExpertSimdgroups::Eight;
-        require(candidates.front().config() == baseline.config() &&
-                    baseline.config().expertTile == (workload.phase == MoePhase::Prefill
+        require(candidates.front().configuration() == baseline.configuration() &&
+                    baseline.configuration().expertTile == (workload.phase == MoePhase::Prefill
                         ? MoeExpertTile::M32 : MoeExpertTile::M8) &&
-                    baseline.config().m8Simdgroups == simdgroups,
+                    baseline.configuration().m8Simdgroups == simdgroups,
                 "MoE measurement/reporting baseline differs from production");
         for (const auto &candidate : candidates) {
-          const auto route = moeRouteTile(workload.rows, candidate.config().routeWideRows);
+          const auto route = moeRouteTile(workload.rows, candidate.configuration().routeWideRows);
           const bool wide = workload.rows >= threshold;
-          require(candidate.config().routeWideRows == threshold &&
+          require(candidate.configuration().routeWideRows == threshold &&
                       route.rows == (wide ? 32U : 8U) && route.experts == (wide ? 128U : 32U) &&
-                      candidate.config().m8Simdgroups == simdgroups,
+                      candidate.configuration().m8Simdgroups == simdgroups,
                   "MoE candidate departed from device router or expert-tile policy");
           OperatorChoices choices;
-          choices.moe.push_back({workload, candidate.config()});
+          choices.moe.push_back({workload, candidate.configuration()});
           production.install(choices);
           const auto selected = lookup();
-          require(selected.config() == candidate.config() &&
+          require(selected.configuration() == candidate.configuration() &&
                       selected.rows() == candidate.rows() &&
                       selected.splitExperts() == candidate.splitExperts() &&
                       selected.maximumTiles() == candidate.maximumTiles(),
                   "installed MoE candidate differs from its measured plan");
-          require(production.moeCandidates(workload).front().config() == baseline.config(),
+          require(production.moeCandidates(workload).front().configuration() == baseline.configuration(),
                   "installed choice changed the shipped tuning baseline");
           // Imported expert choices must retain this device's router and
           // expert-tile policy.
@@ -79,7 +79,7 @@ void devicePolicyPlans() {
               simdgroups == MoeExpertSimdgroups::Four ? MoeExpertSimdgroups::Eight
                                                       : MoeExpertSimdgroups::Four;
           production.install(choices);
-          require(lookup().config() == candidate.config(),
+          require(lookup().configuration() == candidate.configuration(),
                   "installed MoE choice overrode the device router or tile policy");
         }
       };
@@ -93,12 +93,6 @@ void devicePolicyPlans() {
 }
 
 void fixtureBounds() {
-  constexpr std::array fields{
-      &MoeWorkspace::selectedExpertsBytes, &MoeWorkspace::routingWeightsBytes,
-      &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
-      &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
-      &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-      &MoeWorkspace::expertOutputBytes};
   for (const MoeShape shape : {MoeShape{256, 4, 2, 256},
                                MoeShape{2048, 256, 8, 512},
                                MoeShape{1024, 32, 4, 2048}}) {
@@ -109,9 +103,9 @@ void fixtureBounds() {
                                    uint32_t rows) {
       const uint64_t rowBytes = uint64_t{rows} * shape.hiddenSize * 2;
       uint64_t expected = 3 * aligned(rowBytes, 256) + aligned(2 * rowBytes, 256);
-      for (auto field : fields)
-        expected += aligned(std::max(candidates[0].workspace().*field,
-                                     candidates[1].workspace().*field), 256);
+      for (const MoeScratchField &field : kMoeScratchFields)
+        expected += aligned(std::max(candidates[0].workspace().*field.bytes,
+                                     candidates[1].workspace().*field.bytes), 256);
       return aligned(expected, 16 * 1024);
     };
     for (uint32_t cores : {0U, 1U, 20U, 80U}) {
@@ -161,12 +155,6 @@ void fixtureBounds() {
     }
 }
 
-uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return static_cast<uint16_t>(bits >> 16);
-}
-
 MetalBuffer zeroed(MetalBackend &backend, uint64_t bytes) {
   auto buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, "moe-tuning-test");
   std::memset(buffer.contents(), 0, static_cast<size_t>(bytes));
@@ -176,40 +164,35 @@ MetalBuffer zeroed(MetalBackend &backend, uint64_t bytes) {
 Q8Projection router(MetalBackend &backend, bool shared, uint32_t representative = 0) {
   constexpr uint32_t hidden = 256;
   constexpr uint64_t elements = 256 * hidden;
-  Q8Projection result{zeroed(backend, elements), zeroed(backend, elements / 32),
-                       zeroed(backend, elements / 32), 256, hidden};
+  Q8Projection result{{zeroed(backend, elements), zeroed(backend, elements / 32),
+                        zeroed(backend, elements / 32)},
+                       256, hidden};
   if (!shared) {
-    auto *weights = static_cast<uint8_t *>(result.weights.contents());
-    auto *scales = static_cast<uint16_t *>(result.scales.contents());
+    auto *weights = static_cast<uint8_t *>(result.planes.weights.contents());
+    auto *scales = static_cast<uint16_t *>(result.planes.scales.contents());
     for (uint32_t expert = 0; expert < 4; ++expert) {
       weights[expert * 64 + expert + representative * 4] = 1;
-      scales[expert] = bf16(4.0F);
+      scales[expert] = floatToBf16(4.0F);
     }
   }
   return result;
 }
 
-ExpertQ4Projection experts(MetalBackend &backend, uint32_t count, uint32_t salt = 0) {
+ExpertProjection experts(MetalBackend &backend, uint32_t count, uint32_t salt = 0) {
   constexpr uint32_t width = 256;
-  constexpr uint64_t elements = uint64_t{width} * width;
-  constexpr uint64_t stride = elements / 2 + elements / 16;
-  ExpertQ4Projection result{zeroed(backend, count * stride), count, width, width, stride};
-  auto *base = static_cast<uint8_t *>(result.packed.contents());
-  for (uint32_t expert = 0; expert < count; ++expert) {
-    auto *slab = base + expert * stride;
-    uint32_t seed = 12345U + expert + salt;
-    for (uint64_t offset = 0; offset < elements / 2; ++offset) {
-      seed = seed * 1664525U + 1013904223U;
-      slab[offset] = static_cast<uint8_t>(seed >> 24);
-    }
-    auto *scales = reinterpret_cast<uint16_t *>(slab + elements / 2);
-    auto *biases = reinterpret_cast<uint16_t *>(slab + elements / 2 + elements / 32);
-    for (uint64_t index = 0; index < elements / 64; ++index) {
-      scales[index] = bf16(0.0078125F);
-      biases[index] = bf16(-0.05859375F);
-    }
-  }
-  return result;
+  constexpr uint64_t parameters = uint64_t{width} * width / 64;
+  return splash::test::expertSlabs(
+      backend, count, width, width, "moe-tuning-test", [&](uint32_t expert, const splash::test::AffineQ4Planes &planes) {
+        uint32_t seed = 12345U + expert + salt;
+        for (uint64_t offset = 0; offset < parameters * 32; ++offset) {
+          seed = seed * 1664525U + 1013904223U;
+          planes.weights[offset] = static_cast<uint8_t>(seed >> 24);
+        }
+        for (uint64_t index = 0; index < parameters; ++index) {
+          planes.scales[index] = floatToBf16(0.0078125F);
+          planes.biases[index] = floatToBf16(-0.05859375F);
+        }
+      });
 }
 
 void nativeMeasurement(const char *library) {
@@ -225,7 +208,7 @@ void nativeMeasurement(const char *library) {
   const auto deniedResult = tuneMoe(backend, denied, input);
   require(admissions == 1 && !deniedResult.complete && !deniedResult.failure &&
               deniedResult.choice.configuration == ExecutionPlans(backend.capabilities())
-                  .moeDecode(workload.shape, workload.rows / 8).config(),
+                  .moeDecode(workload.shape, workload.rows / 8).configuration(),
           "allocation denial did not retain baseline");
   admissions = 0;
   const auto cancelled = tuneMoe(backend, denied, input, {}, {}, [] { return true; });
@@ -265,7 +248,7 @@ void nativeMeasurement(const char *library) {
   input.weights.clear();
   for (uint32_t representative = 0; representative < 3; ++representative) {
     const uint32_t salt = representative * 101;
-    input.weights.push_back({router(backend, false, representative),
+    input.weights.push_back(AffineMoeWeights{router(backend, false, representative),
         experts(backend, 4, salt), experts(backend, 4, salt + 1),
         experts(backend, 4, salt + 2), experts(backend, 1, salt + 3),
         experts(backend, 1, salt + 4), experts(backend, 1, salt + 5),
@@ -323,7 +306,7 @@ void nativeMeasurement(const char *library) {
           "MoE tuning retained temporary backing");
   // A malformed LAST representative must stop at the finite-value gate
   // before timing. Checking only the first layer would incorrectly pass.
-  auto *slab = static_cast<uint8_t *>(input.weights.back().sharedDown.packed.contents());
+  auto *slab = static_cast<uint8_t *>(input.weights.back().affine().sharedDown.packed.contents());
   auto *scale = reinterpret_cast<uint16_t *>(slab + 256 * 256 / 2);
   scale[0] = 0x7fc0;
   const auto notFinite = tuneMoe(backend, allowed, input, options);

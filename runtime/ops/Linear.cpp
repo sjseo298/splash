@@ -1,7 +1,9 @@
 #include "Linear.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
 #include "metal/abi/Linear.h"
+#include "ops/ChoiceTable.hpp"
 
 #include <algorithm>
 #include <array>
@@ -14,9 +16,8 @@
 namespace splash::ops {
 namespace {
 
-constexpr uint32_t kPrefillRows = 32;
+constexpr uint32_t kAffinePrefillTileRows = 32;
 constexpr uint32_t kQuantGroup = 64;
-constexpr uint32_t kMaximumSimdgroupSplits = 8;
 static_assert(SPLASH_TARGET_VERIFY_ROWS == 8,
               "simdgroup Q4 tiles require eight verify rows per lane");
 // Split tiles hold four K partitions, each a whole number of the kernels'
@@ -41,57 +42,46 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
   case LinearTile::Split64: return LinearSimdgroups::Eight;
   case LinearTile::N128:
   case LinearTile::N256:
-  case LinearTile::Paired128: return std::nullopt;
+  case LinearTile::Paired128:
+  case LinearTile::GgufStaged:
+  case LinearTile::GgufRegister: return std::nullopt;
   }
   return std::nullopt;
 }
 
 void validate(LinearWorkload w) {
+  if (w.weightLayout != WeightLayout::Affine64 && w.weightLayout != WeightLayout::Block32)
+    throw std::invalid_argument("invalid linear weight layout");
   if (!w.matrix.outputSize || w.matrix.outputSize % 256 ||
       !w.matrix.inputSize || w.matrix.inputSize % kQuantGroup)
-    throw std::invalid_argument("invalid Q4 linear matrix");
+    throw std::invalid_argument("invalid linear matrix");
   if (w.phase == LinearPhase::Prefill) {
     if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
         w.epilogue == LinearEpilogue::GateUp)
-      throw std::invalid_argument("invalid Q4 prefill workload");
+      throw std::invalid_argument("invalid linear prefill workload");
   } else if (w.phase == LinearPhase::Decode) {
     if (w.matrix.inputSize % 256 || !w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
         w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
-      throw std::invalid_argument("invalid Q4 decode workload");
+      throw std::invalid_argument("invalid linear decode workload");
   } else {
-    throw std::invalid_argument("invalid Q4 linear phase");
+    throw std::invalid_argument("invalid linear phase");
   }
   if (w.epilogue != LinearEpilogue::None && w.epilogue != LinearEpilogue::Residual &&
       w.epilogue != LinearEpilogue::GateUp && w.epilogue != LinearEpilogue::UpWithGate)
-    throw std::invalid_argument("invalid Q4 linear epilogue");
+    throw std::invalid_argument("invalid linear epilogue");
 }
 
-void requireBytes(const metal::MetalBuffer &buffer, uint64_t bytes) {
+// A buffer a plan does not use needs no bytes and may be absent.
+void requireBytes(const metal::MetalBuffer &buffer, uint64_t bytes, const char *what) {
   if (bytes && (!buffer || buffer.sizeBytes() < bytes))
-    throw std::invalid_argument("Q4 buffer is below plan requirement");
-}
-
-void requireProjection(const Q4Projection &p, LinearMatrix matrix) {
-  if (p.outputSize != matrix.outputSize || p.inputSize != matrix.inputSize)
-    throw std::invalid_argument("Q4 projection does not match plan");
-  requireBytes(p.weights, uint64_t{matrix.outputSize} * matrix.inputSize / 2);
-  const uint64_t bytes = uint64_t{matrix.outputSize} * (matrix.inputSize / kQuantGroup) * 2;
-  requireBytes(p.scales, bytes);
-  requireBytes(p.biases, bytes);
-}
-
-void account(Q4DispatchStats &stats, uint32_t lanes, uint32_t count) noexcept {
-  if (lanes == 1) return;
-  stats.fusedSourceOperations += uint64_t{lanes} * count;
-  if (lanes == 2) stats.m16Dispatches += count;
-  else if (lanes == 3) stats.m24Dispatches += count;
-  else stats.m32Dispatches += count;
+    throw std::invalid_argument(std::string("projection ") + what + " buffer holds " +
+                                std::to_string(buffer.sizeBytes()) + " bytes, needs " + std::to_string(bytes));
 }
 
 LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
-    throw std::invalid_argument("invalid Q4 decode batch width");
+    throw std::invalid_argument("invalid linear decode batch width");
   return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
 }
 
@@ -115,15 +105,35 @@ bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
 
 } // namespace
 
+// Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a lane's rows.
+uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
+  return layout == LinearInput::Table16
+             ? rows / SPLASH_TARGET_VERIFY_ROWS * table16_sums_per_tile(width) * sizeof(float)
+       : layout == LinearInput::Table64 ? uint64_t{width} * rows / 16 : 0;
+}
+
+void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
+  if (p.layout() != WeightLayout::Affine64 || p.outputSize != matrix.outputSize ||
+      p.inputSize != matrix.inputSize)
+    throw std::invalid_argument("affine projection does not match plan");
+  requireBytes(p.affine().weights, uint64_t{matrix.outputSize} * matrix.inputSize / 2, "weight");
+  const uint64_t bytes = uint64_t{matrix.outputSize} * (matrix.inputSize / kQuantGroup) * 2;
+  requireBytes(p.affine().scales, bytes, "scale");
+  requireBytes(p.affine().biases, bytes, "bias");
+}
+
 uint32_t LinearPlan::storageRows() const noexcept {
-  return workload_.phase == LinearPhase::Prefill
-      ? ((workload_.rows + kPrefillRows - 1) / kPrefillRows) * kPrefillRows : workload_.rows;
+  if (workload_.weightLayout == WeightLayout::Block32) return blockStorageRows();
+  if (workload_.phase != LinearPhase::Prefill) return workload_.rows;
+  return ((workload_.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows) * kAffinePrefillTileRows;
 }
 uint32_t LinearPlan::tileColumns() const noexcept {
   switch (config_.tile) {
   case LinearTile::Simdgroup: return workload_.epilogue == LinearEpilogue::GateUp ? 32 : 64;
   case LinearTile::Split32: return 32;
-  case LinearTile::Split64: return 64;
+  case LinearTile::Split64:
+  case LinearTile::GgufStaged:
+  case LinearTile::GgufRegister: return 64;
   case LinearTile::N256:
   case LinearTile::Paired256: return 256;
   case LinearTile::N128:
@@ -135,38 +145,59 @@ uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
   return static_cast<uint32_t>(config_.simdgroups) * 32;
 }
 uint32_t LinearPlan::partialSums() const noexcept {
-  return usesSimdgroup() ? config_.splits : splitTile(config_.tile) ? kSplitPartitions : 1;
+  if (usesSimdgroup() || config_.tile == LinearTile::GgufStaged ||
+      config_.tile == LinearTile::GgufRegister)
+    return config_.splits;
+  return splitTile(config_.tile) ? kSplitPartitions : 1;
 }
 bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
+LinearInput LinearPlan::input() const noexcept {
+  if (config_.tile == LinearTile::GgufRegister) return LinearInput::Table16;
+  return usesSimdgroup() ? LinearInput::Table64 : LinearInput::Plain;
+}
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
+  if (workload_.weightLayout == WeightLayout::Block32) return blockScratchSize();
   if (!usesSimdgroup()) return {};
   const auto [n, k] = workload_.matrix;
   const uint64_t rows = workload_.rows;
   const uint64_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
   // Each row tile owns two fp32 fragment streams per K partition and one
   // completion counter per column tile. Single-partition kernels use neither.
-  return {rows * k * sizeof(uint16_t), rows * (k / kQuantGroup) * sizeof(float),
+  return {tableBytes(k, workload_.rows), tableSumsBytes(LinearInput::Table64, k, workload_.rows),
           config_.splits > 1 ? config_.splits * 2 * rows * n * sizeof(float) : sizeof(float),
           config_.splits > 1 ? lanes * (n / tileColumns()) * sizeof(uint32_t) : sizeof(uint32_t)};
 }
 
 uint64_t LinearPlan::sumsBytes() const noexcept {
-  return workload_.phase == LinearPhase::Prefill
+  return workload_.phase == LinearPhase::Prefill && workload_.weightLayout == WeightLayout::Affine64
       ? uint64_t{storageRows()} * (workload_.matrix.inputSize / kQuantGroup) * 4 : 0;
 }
 uint64_t LinearPlan::gateScratchBytes() const noexcept {
+  // GGUF tiles run gate/up as a gate pass and an up-with-gate pass.
   const bool needed = workload_.epilogue == LinearEpilogue::UpWithGate ||
-      (workload_.epilogue == LinearEpilogue::GateUp && !secondPipeline_.empty());
+      (workload_.epilogue == LinearEpilogue::GateUp &&
+       (!secondPipeline_.empty() || workload_.weightLayout == WeightLayout::Block32));
   return needed ? uint64_t{storageRows()} * workload_.matrix.outputSize * 2 : 0;
 }
 uint64_t LinearPlan::downSumsBytes() const noexcept {
-  return workload_.epilogue == LinearEpilogue::UpWithGate
+  return workload_.epilogue == LinearEpilogue::UpWithGate && workload_.weightLayout == WeightLayout::Affine64
       ? uint64_t{storageRows()} * (workload_.matrix.outputSize / kQuantGroup) * 4 : 0;
 }
 
-LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
-    : workload_(w), config_(config) {
+LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destination)
+    : workload_(w), config_(config), destination_(destination) {
   validate(w);
+  if (destination == FloatOutput::Float32 &&
+      (w.phase != LinearPhase::Decode || w.epilogue != LinearEpilogue::None))
+    throw std::invalid_argument("an fp32 destination takes a plain decode projection");
+  const bool ggufTile = config.tile == LinearTile::GgufStaged || config.tile == LinearTile::GgufRegister;
+  if (ggufTile != (w.weightLayout == WeightLayout::Block32))
+    throw std::invalid_argument("block projections run the GGUF tiles, affine ones the Q4 tiles");
+  if (ggufTile) {
+    // Kernel names follow the segment formats (LinearGguf.cpp).
+    requireBlockConfiguration();
+    return;
+  }
   if (config.tile != LinearTile::Simdgroup && config.splits != 1)
     throw std::invalid_argument("K splits require the simdgroup Q4 tile");
   if (config.tile != LinearTile::N128 && config.tile != LinearTile::N256 &&
@@ -211,9 +242,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
     throw std::invalid_argument("paired or split Q4 tile requires one lane and paired columns");
   if (usesSimdgroup()) {
     const uint32_t groups = w.matrix.inputSize / kQuantGroup;
-    if (config.groups != w.matrix.outputSize / tileColumns() ||
-        !config.splits || config.splits > kMaximumSimdgroupSplits || (config.splits & (config.splits - 1)) ||
-        groups % config.splits)
+    if (config.groups != w.matrix.outputSize / tileColumns() || !config.validSplits() || groups % config.splits)
       throw std::invalid_argument("simdgroup Q4 requires full column grid and whole power-of-two K partitions");
     pipeline_ = w.epilogue == LinearEpilogue::GateUp ? "decode_linear_q4_sg_gate_up" :
         residual ? "decode_linear_q4_sg_residual" : "decode_linear_q4_sg";
@@ -369,20 +398,34 @@ std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t core
 
 } // namespace
 
-Q4Linear::Q4Linear(const DeviceCapabilities &device) noexcept
+Linear::Linear(const DeviceCapabilities &device) noexcept
     : appleGpuFamily_(device.appleGpuFamily),
       gpuCores_(device.gpuCoreCount ? device.gpuCoreCount : kAssumedGpuCores) {}
 
+uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
+  return plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, LinearEpilogue::None, shape.layout})
+      .storageRows();
+}
+
+void Linear::account(LinearDispatchStats &stats, uint32_t lanes, uint32_t dispatches) noexcept {
+  if (lanes == 1) return;
+  stats.fusedSourceOperations += uint64_t{lanes} * dispatches;
+  if (lanes == 2) stats.m16Dispatches += dispatches;
+  else if (lanes == 3) stats.m24Dispatches += dispatches;
+  else stats.m32Dispatches += dispatches;
+}
+
 // GPU family selects variants; core count and workload tile counts determine
 // parallelism.
-LinearConfig Q4Linear::baseline(LinearWorkload w) const {
+LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *const> projections) const {
   validate(w);
+  if (w.weightLayout == WeightLayout::Block32) return ggufBaseline(w, projections);
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
   if (w.phase == LinearPhase::Prefill) {
     if (appleGpuFamily_ >= 10 || gpuCores_ <= kApple9MeasuredPrefillCores)
       return {LinearTile::N128, 0, LinearSimdgroups::Four};
-    const uint32_t rowTiles = (w.rows + kPrefillRows - 1) / kPrefillRows;
+    const uint32_t rowTiles = (w.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
     const bool wide = double(rowTiles) * tiles256 >=
         kApple9WidePrefillGroupsPerCore * gpuCores_;
     return {w.epilogue == LinearEpilogue::UpWithGate || wide ? LinearTile::N256
@@ -400,7 +443,7 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
     uint32_t splits = 1;
     // Aim for sixteen independent column/K groups per core, retaining at
     // least twelve quant groups per partition to amortize the reduction.
-    while (splits < kMaximumSimdgroupSplits && uint64_t(grid) * splits < 16ULL * gpuCores_ &&
+    while (splits < LinearConfig::kMaximumSplits && uint64_t(grid) * splits < 16ULL * gpuCores_ &&
            groups % (2 * splits) == 0 && groups / (2 * splits) >= 12)
       splits *= 2;
     return {LinearTile::Simdgroup, grid, LinearSimdgroups::Four, splits};
@@ -434,38 +477,38 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
       (appleGpuFamily_ == 9 && w.epilogue == LinearEpilogue::None)))
     return {LinearTile::N128, groups(tiles128, kFourSimdgroupGroups),
             LinearSimdgroups::Four};
-  if (lanes >= 3 && w.epilogue == LinearEpilogue::None &&
-      tiles256 >= kWideDecodeTilesPerCore * gpuCores_)
-    return {LinearTile::N256, groups(tiles256, kN256Groups)};
+  if (widePlain) return {LinearTile::N256, groups(tiles256, kN256Groups)};
   return {LinearTile::N128,
           groups(tiles128, lanes == 2 ? kN128M16Groups : kN128Groups)};
 }
 
-LinearPlan Q4Linear::plan(LinearWorkload workload) const {
-  const auto found = std::lower_bound(choices_.begin(), choices_.end(), workload,
-      [](const LinearChoice &choice, LinearWorkload key) { return choice.workload < key; });
-  return LinearPlan(workload, found != choices_.end() && found->workload == workload
-      ? found->configuration : baseline(workload));
+LinearPlan Linear::plan(LinearWorkload workload) const {
+  return LinearPlan(workload, chosenConfiguration(choices_, workload, baseline(workload)));
 }
-LinearPlan Q4Linear::plan(LinearWorkload workload, LinearConfig config) {
-  return LinearPlan(workload, config);
+LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutput destination) {
+  return LinearPlan(workload, config, destination);
 }
-void Q4Linear::setChoices(std::span<const LinearChoice> choices) {
+LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
+  w.weightLayout = p.layout();
+  const std::array<const Projection *, 2> projections{&p, gate};
+  return LinearPlan(w, chosenConfiguration(choices_, w, baseline(w, projections)), p.destination);
+}
+void Linear::setChoices(std::span<const LinearChoice> choices) {
   std::vector<LinearChoice> pending(choices.begin(), choices.end());
-  for (const auto &choice : pending) (void)plan(choice.workload, choice.configuration);
-  std::sort(pending.begin(), pending.end(), [](const auto &a, const auto &b) {
-    return a.workload < b.workload;
-  });
-  for (size_t i = 1; i < pending.size(); ++i)
-    if (pending[i - 1].workload == pending[i].workload)
-      throw std::invalid_argument("duplicate Q4 linear choice");
+  for (const auto &choice : pending) {
+    if (choice.workload.weightLayout == WeightLayout::Block32)
+      throw std::invalid_argument("block projection plans are not tuned");
+    (void)plan(choice.workload, choice.configuration);
+  }
+  sortUniqueChoices(pending);
   choices_ = std::move(pending);
 }
 
-std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
+std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
   std::vector<LinearPlan> result;
   result.reserve(kMaximumCandidates);
   result.push_back(LinearPlan(w, baseline(w)));
+  if (w.weightLayout == WeightLayout::Block32) return result;
   const auto append = [&](LinearConfig config) {
     for (const auto &existing : result)
       if (existing.configuration() == config) return;
@@ -500,7 +543,7 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
   if (w.phase == LinearPhase::Decode && appleGpuFamily_ == 9) {
     const uint32_t n = w.matrix.outputSize;
     const uint32_t columns = w.epilogue == LinearEpilogue::GateUp ? 32 : 64;
-    for (uint32_t splits = 1; splits <= kMaximumSimdgroupSplits; splits *= 2)
+    for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2)
       if ((w.matrix.inputSize / kQuantGroup) % splits == 0)
         append({LinearTile::Simdgroup, n / columns, LinearSimdgroups::Four, splits});
   }
@@ -520,136 +563,172 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
   return result;
 }
 
-LinearScratchSize Q4Linear::decodeScratchSize(LinearWorkload w) const {
-  auto size = LinearPlan(w, baseline(w)).scratchSize();
-  const auto selected = plan(w).scratchSize();
-  size.input = std::max(size.input, selected.input);
-  size.sums = std::max(size.sums, selected.sums);
-  size.partials = std::max(size.partials, selected.partials);
-  size.counters = std::max(size.counters, selected.counters);
-  return size;
+LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
+                              const Projection *gate) const {
+  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
+}
+LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue) const {
+  return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);
 }
 
-void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
-    const Q4Projection &p, const LinearPlan &selected, const Q4Projection *gate,
-    Q4DispatchStats *stats) const {
+LinearScratchSize Linear::decodeScratchSize(LinearWorkload w) const {
+  if (w.weightLayout == WeightLayout::Block32) return ggufDecodeScratchSize(w);
+  return LinearPlan(w, baseline(w)).scratchSize().include(plan(w).scratchSize());
+}
+
+
+PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
+    const Projection &p, const LinearPlan &selected, const Projection *gate,
+    LinearDispatchStats *stats) const {
   const LinearWorkload w = selected.workload();
   const auto [n, k] = w.matrix;
-  requireProjection(p, w.matrix);
-  requireBytes(b.input, uint64_t{selected.storageRows()} * k * 2);
-  requireBytes(b.output, uint64_t{selected.storageRows()} * n * 2);
-  requireBytes(b.sums, selected.sumsBytes());
-  requireBytes(b.gateScratch, selected.gateScratchBytes());
-  requireBytes(b.downSums, selected.downSumsBytes());
-  if (w.epilogue == LinearEpilogue::Residual)
-    requireBytes(b.residual, uint64_t{selected.storageRows()} * n * 2);
-  if (w.epilogue == LinearEpilogue::GateUp) {
-    if (!gate) throw std::invalid_argument("Q4 gate projection is missing");
-    requireProjection(*gate, w.matrix);
-  } else if (gate) throw std::invalid_argument("unexpected Q4 gate projection");
+  if (p.layout() != w.weightLayout || (gate && gate->layout() != w.weightLayout))
+    throw std::invalid_argument("projection layout does not match execution plan");
+  if ((w.epilogue == LinearEpilogue::GateUp) != (gate != nullptr))
+    throw std::invalid_argument("a gate/up plan takes a gate projection and no other plan does");
+  const uint64_t rows = selected.storageRows();
+  requireBytes(b.input, rows * k * 2, "input");
+  requireBytes(b.output, rows * n * elementBytes(selected.destination()), "output");
+  if (w.epilogue == LinearEpilogue::Residual) requireBytes(b.residual, rows * n * 2, "residual");
+  requireBytes(b.sums, selected.sumsBytes(), "sums");
+  requireBytes(b.gateScratch, selected.gateScratchBytes(), "gate scratch");
+  requireBytes(b.downSums, selected.downSumsBytes(), "down sums");
+  const LinearScratchSize scratch = selected.scratchSize();
+  requireBytes(b.scratch.input, scratch.input, "scratch table");
+  requireBytes(b.scratch.sums, scratch.sums, "scratch sums");
+  requireBytes(b.scratch.partials, scratch.partials, "partials");
+  requireBytes(b.scratch.counters, scratch.counters, "counters");
+  if (p.layout() == WeightLayout::Block32) {
+    if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "rotated input");
+    addGguf(graph, b, p, selected, gate, stats);
+    // A rotated projection's plan prepares its table, if any, from the
+    // rotated rows, which no other plan reads.
+    if (p.rotation) return {};
+    // Only quantized segments run the plan's tile: float segments alone
+    // leave the scratch table as it was.
+    const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+    const bool tiled =
+        std::any_of(segments.begin(), segments.end(), [](const QuantizedSegment &s) { return !s.isFloat(); });
+    return tiled && selected.input() != LinearInput::Plain ? PreparedInput{b.input, selected.input()} : b.prepared;
+  }
+  requireAffineProjection(p, w.matrix);
+  if (gate) requireAffineProjection(*gate, w.matrix);
+  const AffineWeights &weights = p.affine();
   if (selected.usesSimdgroup()) {
-    const auto size = selected.scratchSize();
-    requireBytes(b.scratch.input, size.input);
-    requireBytes(b.scratch.sums, size.sums);
-    requireBytes(b.scratch.partials, size.partials);
-    requireBytes(b.scratch.counters, size.counters);
-    if (!b.inputPrepared)
+    if (b.prepared.layout != LinearInput::Table64 || !b.prepared.source.sameView(b.input))
       graph.add("decode_linear_q4_prepare", {b.input, b.scratch.input, b.scratch.sums},
                 k, {k / 32, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1}, {128, 1, 1});
-    const auto &first = gate ? *gate : p;
-    std::vector<metal::MetalBuffer> bindings{b.scratch.input, first.weights,
-        first.scales, first.biases, b.output, b.scratch.sums,
-        b.scratch.partials, b.scratch.counters};
-    if (gate) bindings.insert(bindings.end(), {p.weights, p.scales, p.biases});
+    const AffineWeights &first = gate ? gate->affine() : weights;
+    std::vector<metal::MetalBuffer> bindings{b.scratch.input, first.weights, first.scales, first.biases,
+                                             b.output, b.scratch.sums, b.scratch.partials, b.scratch.counters};
+    if (gate) bindings.insert(bindings.end(), {weights.weights, weights.scales, weights.biases});
     else if (w.epilogue == LinearEpilogue::Residual) bindings.push_back(b.residual);
-    graph.add(std::string(selected.pipeline()), std::move(bindings),
+    graph.add(kernelInstance(selected.pipeline(), selected.destination()), std::move(bindings),
         Q4Params{n, k, selected.configuration().splits},
         {selected.configuration().groups, selected.configuration().splits,
          w.rows / SPLASH_TARGET_VERIFY_ROWS}, {128, 1, 1});
     if (stats) account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1);
-    return;
+    return {b.input, LinearInput::Table64};
   }
   const auto dispatch = [&](std::string_view name,
       std::initializer_list<metal::MetalBuffer> bindings) {
     if (w.phase == LinearPhase::Prefill)
       graph.add(std::string(name), bindings,
           Q4PrefillParams{w.matrix.outputSize, w.matrix.inputSize},
-          {selected.storageRows() / kPrefillRows, n / selected.tileColumns(), 1},
+          {selected.storageRows() / kAffinePrefillTileRows, n / selected.tileColumns(), 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     else {
       const uint32_t groups = selected.configuration().groups;
-      graph.add(std::string(name), bindings, Q4Params{n, k, groups}, {groups, 1, 1},
+      graph.add(kernelInstance(name, selected.destination()), bindings, Q4Params{n, k, groups}, {groups, 1, 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     }
   };
+  const bool prefill = w.phase == LinearPhase::Prefill;
   if (w.epilogue == LinearEpilogue::GateUp) {
+    const AffineWeights &g = gate->affine();
     if (selected.secondPipeline().empty())
-      dispatch(selected.pipeline(), {b.input, gate->weights, gate->scales, gate->biases,
-          b.output, p.weights, p.scales, p.biases});
+      dispatch(selected.pipeline(), {b.input, g.weights, g.scales, g.biases,
+                                     b.output, weights.weights, weights.scales, weights.biases});
     else {
-      dispatch(selected.pipeline(), {b.input, gate->weights, gate->scales, gate->biases, b.gateScratch});
-      dispatch(selected.secondPipeline(), {b.input, p.weights, p.scales, p.biases, b.gateScratch, b.output});
+      dispatch(selected.pipeline(), {b.input, g.weights, g.scales, g.biases, b.gateScratch});
+      dispatch(selected.secondPipeline(),
+               {b.input, weights.weights, weights.scales, weights.biases, b.gateScratch, b.output});
     }
   } else if (w.epilogue == LinearEpilogue::UpWithGate)
-    dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases,
-        b.gateScratch, b.output, b.sums, b.downSums});
+    dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases,
+                                   b.gateScratch, b.output, b.sums, b.downSums});
   else if (w.epilogue == LinearEpilogue::Residual) {
-    if (w.phase == LinearPhase::Prefill)
-      dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases, b.residual, b.output, b.sums});
-    else dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases, b.residual, b.output});
-  } else if (w.phase == LinearPhase::Prefill)
-    dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases, b.output, b.sums});
-  else dispatch(selected.pipeline(), {b.input, p.weights, p.scales, p.biases, b.output});
-  if (stats && w.phase == LinearPhase::Decode)
+    if (prefill)
+      dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases,
+                                     b.residual, b.output, b.sums});
+    else
+      dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases,
+                                     b.residual, b.output});
+  } else if (prefill)
+    dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases, b.output, b.sums});
+  else dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases, b.output});
+  if (stats && !prefill)
     account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, selected.secondPipeline().empty() ? 1 : 2);
+  return b.prepared;
 }
 
-void Q4Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input,
-    metal::MetalBuffer sums, LinearMatrix matrix, uint32_t rows) const {
-  validate({matrix, rows, LinearPhase::Prefill, LinearEpilogue::None});
-  const uint32_t tiles = (rows + kPrefillRows - 1) / kPrefillRows;
-  const uint64_t storageRows = uint64_t{tiles} * kPrefillRows;
-  requireBytes(input, storageRows * matrix.inputSize * 2);
-  requireBytes(sums, storageRows * (matrix.inputSize / kQuantGroup) * 4);
+void Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer sums,
+                            const Projection &consumer, uint32_t rows) const {
+  validate({{consumer.outputSize, consumer.inputSize}, rows, LinearPhase::Prefill});
+  const uint32_t tiles = (rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
+  const uint64_t storageRows = uint64_t{tiles} * kAffinePrefillTileRows;
+  requireBytes(input, storageRows * consumer.inputSize * 2, "input");
+  requireBytes(sums, storageRows * (consumer.inputSize / kQuantGroup) * 4, "sums");
   graph.add("prefill_linear_q4_sums32", {input, sums},
-      Q4PrefillParams{matrix.outputSize, matrix.inputSize}, {tiles, 1, 1});
+            Q4PrefillParams{consumer.outputSize, consumer.inputSize}, {tiles, 1, 1});
 }
-void Q4Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input,
-    const Q4Projection &p, metal::MetalBuffer output, metal::MetalBuffer sums,
-    LinearMatrix matrix, uint32_t rows) const {
-  add(graph, {input, output, sums, {}, {}, {}}, p,
-      plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::None}));
+void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
+                        metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
+                        LinearScratch scratch) const {
+  add(graph, {.input = input, .output = output, .sums = sums, .scratch = scratch}, p,
+      prefillPlan(p, rows, LinearEpilogue::None));
 }
-void Q4Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input,
-    const Q4Projection &p, metal::MetalBuffer residual, metal::MetalBuffer output,
-    metal::MetalBuffer sums, LinearMatrix matrix, uint32_t rows) const {
-  add(graph, {input, output, sums, residual, {}, {}}, p,
-      plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::Residual}));
+void Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
+                                metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer sums,
+                                uint32_t rows, LinearScratch scratch) const {
+  add(graph, {.input = input, .output = output, .sums = sums, .residual = residual, .scratch = scratch}, p,
+      prefillPlan(p, rows, LinearEpilogue::Residual));
 }
-void Q4Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input,
-    const Q4Projection &up, metal::MetalBuffer gateScratch, metal::MetalBuffer output,
-    metal::MetalBuffer sums, metal::MetalBuffer downSums, LinearMatrix matrix, uint32_t rows) const {
-  add(graph, {input, output, sums, {}, gateScratch, downSums}, up,
-      plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate}));
+void Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
+                                  metal::MetalBuffer gateScratch, metal::MetalBuffer output,
+                                  metal::MetalBuffer sums, metal::MetalBuffer downSums, uint32_t rows,
+                                  LinearScratch scratch) const {
+  add(graph,
+      {.input = input, .output = output, .sums = sums, .gateScratch = gateScratch, .downSums = downSums,
+       .scratch = scratch},
+      up, prefillPlan(up, rows, LinearEpilogue::UpWithGate));
 }
-void Q4Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer input,
-    const Q4Projection &p, metal::MetalBuffer output, LinearMatrix matrix, LinearScratch scratch) const {
-  add(graph, {input, output, {}, {}, {}, {}, scratch}, p, plan(decode(matrix, 1, LinearEpilogue::None)));
+PreparedInput Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
+                                metal::MetalBuffer output, LinearScratch scratch) const {
+  return add(graph, {.input = input, .output = output, .scratch = scratch}, p, decodePlan(p, 1));
 }
-void Q4Linear::addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
-    const Q4Projection &p, metal::MetalBuffer output, LinearMatrix matrix,
-    uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, bool inputPrepared) const {
-  add(graph, {input, output, {}, {}, {}, {}, scratch, inputPrepared}, p, plan(decode(matrix, lanes, LinearEpilogue::None)), nullptr, &stats);
+PreparedInput Linear::addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
+                                     metal::MetalBuffer output, uint32_t lanes, LinearDispatchStats &stats,
+                                     LinearScratch scratch, PreparedInput prepared) const {
+  return add(graph, {.input = input, .output = output, .scratch = scratch, .prepared = prepared}, p,
+             decodePlan(p, lanes), nullptr, &stats);
 }
-void Q4Linear::addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
-    const Q4Projection &p, metal::MetalBuffer residual, metal::MetalBuffer output,
-    LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, bool inputPrepared) const {
-  add(graph, {input, output, {}, residual, {}, {}, scratch, inputPrepared}, p, plan(decode(matrix, lanes, LinearEpilogue::Residual)), nullptr, &stats);
+PreparedInput Linear::addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
+                                       metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t lanes,
+                                       LinearDispatchStats &stats, LinearScratch scratch,
+                                       PreparedInput prepared) const {
+  return add(graph,
+             {.input = input, .output = output, .residual = residual, .scratch = scratch, .prepared = prepared},
+             p, decodePlan(p, lanes, LinearEpilogue::Residual), nullptr, &stats);
 }
-void Q4Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
-    const Q4Projection &gate, const Q4Projection &up, metal::MetalBuffer gateScratch,
-    metal::MetalBuffer output, LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, bool inputPrepared) const {
-  add(graph, {input, output, {}, {}, gateScratch, {}, scratch, inputPrepared}, up, plan(decode(matrix, lanes, LinearEpilogue::GateUp)), &gate, &stats);
+PreparedInput Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &gate,
+                                     const Projection &up, metal::MetalBuffer gateScratch,
+                                     metal::MetalBuffer output, uint32_t lanes, LinearDispatchStats &stats,
+                                     LinearScratch scratch, PreparedInput prepared) const {
+  return add(graph,
+             {.input = input, .output = output, .gateScratch = gateScratch, .scratch = scratch,
+              .prepared = prepared},
+             up, decodePlan(up, lanes, LinearEpilogue::GateUp, &gate), &gate, &stats);
 }
 
 } // namespace splash::ops

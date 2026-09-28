@@ -2,6 +2,7 @@
 """Serve in the foreground, or connect an installed agent to the local server."""
 
 import argparse
+import errno
 import fcntl
 import http.client
 import json
@@ -13,9 +14,10 @@ import urllib.error
 import urllib.request
 
 try:
-    from . import catalog, clients, paths
+    from . import assembly, catalog, clients, paths
     from . import models as model_artifacts
 except ImportError:  # Executed directly by the source or packaged entry point.
+    import assembly
     import catalog
     import clients
     import models as model_artifacts
@@ -23,9 +25,10 @@ except ImportError:  # Executed directly by the source or packaged entry point.
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
+PROFILES_DIR = paths.PROFILES
 PORT = 8000
+# A copy: the launcher runs before .venv exists; server/chat_templates imports Jinja2.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-BASE_URL = f"http://127.0.0.1:{PORT}"
 
 
 class LauncherError(RuntimeError):
@@ -36,8 +39,8 @@ def _base_url(port):
     return f"http://127.0.0.1:{port}"
 
 
-def _runtime_dir(port):
-    return RUNTIME_DIR if port == PORT else RUNTIME_DIR / "ports" / str(port)
+def _profiles_dir(port):
+    return PROFILES_DIR if port == PORT else PROFILES_DIR / "ports" / str(port)
 
 
 def _request_json(path, timeout=2, *, port=PORT):
@@ -70,7 +73,7 @@ def _running_status(port=PORT):
     return status
 
 
-def _ensure_installed(model_id):
+def _ensure_installed(selection):
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
         with (RUNTIME_DIR / "build.lock").open("a+") as lock:
@@ -83,15 +86,37 @@ def _ensure_installed(model_id):
                     command, cwd=ROOT, pass_fds=(lock.fileno(),)
                 ).returncode:
                     raise LauncherError("source build failed; see the output above")
+    # The engine refuses an unsupported Mac only once the model is prepared;
+    # its own check refuses it before tens of GB are downloaded.
+    check = subprocess.run(
+        [str(paths.BINARY), "device-check"], capture_output=True, text=True
+    )
+    if check.returncode:
+        # The binary's own refusal is its last line; one that dies before
+        # main() (dyld on an older macOS) leaves a report worth showing whole.
+        report = check.stderr.strip()
+        raise LauncherError(
+            report.splitlines()[-1].removeprefix("error: ")
+            if check.returncode > 0 and report
+            else f"the engine's device check failed: {report or f'status {check.returncode}'}"
+        )
     command = [
         str(paths.PYTHON),
         str(ROOT / "install/models.py"),
         "--models",
-        str(paths.MODELS),
+        str(selection.models_root),
         "--model",
-        model_id,
+        selection.model,
         "prepare",
     ]
+    for flag, value in (
+        ("--revision", selection.revision),
+        ("--draft-model", selection.draft_model),
+    ):
+        if value is not None:
+            command[-1:-1] = [flag, value]
+    if selection.language_only:
+        command.insert(-1, "--language-only")
     if subprocess.run(command, cwd=ROOT).returncode:
         raise LauncherError("model download or verification failed")
 
@@ -116,6 +141,29 @@ def _serve_lock_owner(lock):
     ):
         return ""
     return f" (PID {pid}, model {model}, port {port})"
+
+
+def _check_port(host, port):
+    """Raise OSError if another process owns host:port. The probe binds with
+    SO_REUSEADDR, as the HTTP listener does, so closed connections in
+    TIME_WAIT do not block a restart; a live listener at the address still
+    refuses the bind. The option also lets the bind succeed beside another
+    process's listener at a wider or narrower address of the port (0.0.0.0
+    or a dual-stack :: beside 127.0.0.1, or the reverse), and the two would
+    then split the address's connections, so a listener that accepts one
+    there owns the port too."""
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((host, port))
+        address = probe.getsockname()[0]
+    # A wildcard address is tried on loopback, where the launcher's clients
+    # connect.
+    if address == "0.0.0.0":
+        address = "127.0.0.1"
+    with socket.socket() as client:
+        client.settimeout(1)
+        if client.connect_ex((address, port)) == 0:
+            raise OSError(errno.EADDRINUSE, os.strerror(errno.EADDRINUSE))
 
 
 def serve(args):
@@ -146,18 +194,26 @@ def serve(args):
         lock.flush()
         # Fail before downloads/builds if another service owns the selected port.
         # The HTTP server also binds before loading weights, closing the race.
-        with socket.socket() as probe:
-            # Match the HTTP listener: closed connections in TIME_WAIT must
-            # not block a restart; a live listener still owns the address.
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                probe.bind((args.host, args.port))
-            except OSError as error:
-                raise LauncherError(
-                    f"cannot bind {args.host}:{args.port}: {error}"
-                ) from None
-        _ensure_installed(args.model)
-        root = model_artifacts.installed_root(paths.MODELS, args.model)
+        try:
+            _check_port(args.host, args.port)
+        except OSError as error:
+            raise LauncherError(
+                f"cannot bind {args.host}:{args.port}: {error}"
+            ) from None
+        selection = model_artifacts.Selection.of(
+            paths.MODELS,
+            args.model,
+            revision=args.revision,
+            language_only=args.language_only,
+            draft_model=args.draft_model,
+        )
+        _ensure_installed(selection)
+        # A concurrent install may advance the selection link. Keep this
+        # process's tokenizer, draft and target on one immutable assembly,
+        # held until the server exits.
+        root, record = assembly.hold(selection.link, selection.models_root)
+        if record is not None:
+            os.set_inheritable(record.fileno(), True)
         command = [
             str(paths.PYTHON),
             "-u",
@@ -189,6 +245,8 @@ def serve(args):
             )
         if args.max_request_size is not None:
             command.extend(["--max-request-size", str(args.max_request_size)])
+        if args.max_cache_disk:
+            command.extend(["--max-cache-disk", str(args.max_cache_disk)])
         if args.max_image_pixels is not None:
             command.extend(["--max-image-pixels", str(args.max_image_pixels)])
         if args.no_webui:
@@ -217,8 +275,8 @@ def coding_client(args):
             "Run 'splash serve --model <HF_REPO_ID>' "
             "in another terminal first."
         )
-    catalog = _request_json("/v1/models", port=args.port)
-    models = catalog.get("data", []) if isinstance(catalog, dict) else []
+    listing = _request_json("/v1/models", port=args.port)
+    models = listing.get("data", []) if isinstance(listing, dict) else []
     if (
         not isinstance(models, list)
         or not models
@@ -242,7 +300,8 @@ def coding_client(args):
         _base_url(args.port),
         model,
         context,
-        _runtime_dir(args.port),
+        _profiles_dir(args.port),
+        input_modalities=models[0].get("input_modalities"),
         client_args=args.client_args,
         client_version=client_version,
     )
@@ -272,6 +331,18 @@ def _parse_port(value):
     if not 1 <= port <= 65535:
         raise argparse.ArgumentTypeError("port must be between 1 and 65535")
     return port
+
+
+def _parse_max_cache_disk(value):
+    if value.strip() == "0":
+        return 0
+    try:
+        result = _parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        result = None
+    if result is None:
+        raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
+    return result
 
 
 def _parse_max_memory(value):
@@ -367,7 +438,7 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Quick start:\n"
-            "  splash serve --model incoai/Qwen3.8-27B-Splash\n"
+            "  splash serve --model mlx-community/Qwen3.8-27B-4bit\n"
             "  splash opencode  # in another terminal, after Ready\n\n"
             "Use splash serve --help for server settings. Client arguments,\n"
             "including --help, are passed through to the installed agent."
@@ -378,12 +449,12 @@ def parse_args(argv=None):
     server = commands.add_parser(
         "serve",
         help="run the local server; Ctrl+C stops it",
-        description="Download a Splash model package if needed, then serve in the foreground.",
+        description="Load an upstream model, automatically select its DFlash2 draft, and serve in the foreground.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  splash serve --model incoai/Qwen3.8-27B-Splash\n"
-            "  splash serve --model incoai/Qwen3.6-35B-A3B-Splash --max-context 128K\n\n"
+            "  splash serve --model mlx-community/Qwen3.8-27B-4bit\n"
+            "  splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M --max-context 128K\n\n"
             "After Ready, open http://127.0.0.1:8000 or connect an installed agent.\n"
             "The startup summary and /status report the effective context limit.\n"
             "A client may impose a smaller limit. Keep this terminal open; Ctrl+C stops serving."
@@ -392,7 +463,8 @@ def parse_args(argv=None):
     server.add_argument(
         "--host",
         default="127.0.0.1",
-        help="HTTP bind address (default: 127.0.0.1; 0.0.0.0 for all IPv4 interfaces)",
+        help="HTTP bind address (default: 127.0.0.1; 0.0.0.0 for all IPv4 interfaces); "
+        "clients use an IP address, localhost or a name given with --allowed-host",
     )
     server.add_argument(
         "--port",
@@ -402,10 +474,24 @@ def parse_args(argv=None):
     )
     server.add_argument(
         "--model",
-        type=model_artifacts.parse_repo_id,
+        type=model_artifacts.parse_model_id,
         required=True,
-        metavar="OWNER/REPO",
-        help="Hugging Face repository containing a Splash package",
+        metavar="OWNER/REPO[:VARIANT]",
+        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+    )
+    server.add_argument(
+        "--revision",
+        help="optional model branch, tag or commit (default: repository default)",
+    )
+    server.add_argument(
+        "--draft-model",
+        type=model_artifacts.parse_draft_model,
+        help="override the automatically selected DFlash2 repository or local directory",
+    )
+    server.add_argument(
+        "--language-only",
+        action="store_true",
+        help="skip vision preparation and loading",
     )
     server.add_argument(
         "--served-model-name",
@@ -432,6 +518,13 @@ def parse_args(argv=None):
         help="Metal budget ceiling, e.g. 28G (default: auto)",
     )
     server.add_argument(
+        "--max-cache-disk",
+        dest="max_cache_disk",
+        type=_parse_max_cache_disk,
+        default=0,
+        help="SSD quota for cached KV pages and states, e.g. 5G (default: 0, disabled)",
+    )
+    server.add_argument(
         "--max-context",
         type=_parse_max_context,
         help="context token limit, up to 256K (K = 1024; default: auto within the memory budget)",
@@ -441,8 +534,8 @@ def parse_args(argv=None):
         action="append",
         default=[],
         metavar="HOST",
-        help="additional HTTP Host name to accept; does not change the bind address "
-        "(repeatable)",
+        help="additional HTTP Host name to accept, e.g. mymac.local; does not change "
+        "the bind address (repeatable)",
     )
     server.add_argument(
         "--max-request-size",

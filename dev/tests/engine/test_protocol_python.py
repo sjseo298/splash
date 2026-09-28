@@ -92,7 +92,8 @@ int main() {
                     uint64_t(FeatureCancellation) |
                         uint64_t(FeatureTokenMasks) |
                         uint64_t(FeatureStatusJson) |
-                        uint64_t(FeatureMultiplexing)});
+                        uint64_t(FeatureMultiplexing) |
+                        uint64_t(FeatureVision)});
     show(StartEvent{91, CacheDisposition::PrefixHit, 2, 4096, 131072});
     show(PromptProgressEvent{91, 2048, 123456});
     show(TokensEvent{91, 17, {10, 11, 12}});
@@ -175,6 +176,7 @@ def all_messages():
                 | p.ReadyFeature.TOKEN_MASKS
                 | p.ReadyFeature.STATUS_JSON
                 | p.ReadyFeature.MULTIPLEXING
+                | p.ReadyFeature.VISION
             ),
         ),
         p.StartEvent(91, p.CacheDisposition.PREFIX_HIT, 2, 4096, 131_072),
@@ -361,6 +363,20 @@ class ProtocolPythonTests(unittest.TestCase):
             result.stdout.splitlines(),
             [p.serialize_message(message).hex() for message in all_messages()],
         )
+
+    def test_ready_vision_feature_is_bit_four(self):
+        common = int(
+            p.ReadyFeature.CANCELLATION
+            | p.ReadyFeature.TOKEN_MASKS
+            | p.ReadyFeature.STATUS_JSON
+            | p.ReadyFeature.MULTIPLEXING
+        )
+        for bits, vision in ((common, False), (common | 1 << 4, True)):
+            with self.subTest(vision=vision):
+                wire = p.serialize_message(p.ReadyEvent(1, 4, 131_072, bits))
+                self.assertEqual(struct.unpack_from("<Q", wire, len(wire) - 8)[0], bits)
+                ready = p.decode_frame(parse_all(wire)[0])
+                self.assertIs(ready.vision, vision)
 
     def test_progress_wire_validation(self):
         request = replace(example_request(), return_progress=True)
@@ -640,6 +656,41 @@ class ProtocolPythonTests(unittest.TestCase):
         )
         self.assertEqual(wire[span_offset + 32 :], image.image_pixels)
         self.assertEqual(p.decode_frame(parse_all(wire)[0]), image)
+
+    def test_token_words_must_be_exact_uint32_ints(self):
+        base = example_request()
+        bad_values = (
+            True,
+            p.Cohort.GREEDY,
+            -1,
+            0x100000000,
+            1.0,
+            "1",
+            None,
+        )
+        for field, message in (
+            ("prompt_tokens", "prompt tokens element"),
+            ("score_tokens", "score tokens element"),
+        ):
+            # A bad word is caught wherever it sits, including the last one.
+            for position in (0, 4):
+                for bad in bad_values:
+                    words = [*range(5)]
+                    words[position] = bad
+                    with self.subTest(field=field, position=position, bad=bad):
+                        request = replace(base, **{field: tuple(words)})
+                        with self.assertRaises(p.ProtocolError) as raised:
+                            p.serialize_message(request)
+                        self.assertEqual(
+                            raised.exception.issue.code, p.IssueCode.LIMIT_EXCEEDED
+                        )
+                        self.assertIn(
+                            f"{message} must be an integer in [0, 4294967295]",
+                            raised.exception.issue.message,
+                        )
+        with self.assertRaises(p.ProtocolError) as raised:
+            p.serialize_message(replace(base, prompt_tokens=[1, 2, 3]))
+        self.assertIn("must be a tuple of uint32", raised.exception.issue.message)
 
     def test_refresh_request_deadline_changes_only_the_absolute_deadline(self):
         request = example_request()

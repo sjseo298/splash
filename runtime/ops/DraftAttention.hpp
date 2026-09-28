@@ -4,6 +4,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 
 #include <array>
+#include <compare>
 #include <cstdint>
 #include <span>
 
@@ -18,7 +19,7 @@ struct DraftAttentionShape final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
 
-  bool operator==(const DraftAttentionShape &) const = default;
+  auto operator<=>(const DraftAttentionShape &) const = default;
 };
 
 // These configurations vary the surrounding convolution, QKV preparation and

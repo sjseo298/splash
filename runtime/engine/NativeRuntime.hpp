@@ -62,6 +62,10 @@ public:
     return closeConnection_;
   }
   [[nodiscard]] bool engineHealthy() const noexcept { return engineHealthy_; }
+  // Code and message of the failure that stopped the engine, for the log.
+  [[nodiscard]] const std::string &engineFailure() const noexcept {
+    return engineFailure_;
+  }
   [[nodiscard]] bool idle() const { return core_.idle(); }
   [[nodiscard]] bool commandInFlight() const noexcept {
     return core_.commandInFlight();
@@ -75,7 +79,7 @@ public:
   [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const {
     return core_.resourceWaitSnapshot(clocks_.monotonicMilliseconds());
   }
-  [[nodiscard]] uint64_t
+  [[nodiscard]] MemoryReclaimResult
   reclaimMemory(const MemoryReclaimDirective &directive) {
     return core_.reclaimMemory(directive);
   }
@@ -146,6 +150,7 @@ private:
   bool ready_ = false;
   bool closeConnection_ = false;
   bool engineHealthy_ = true;
+  std::string engineFailure_;
 };
 
 } // namespace splash::engine

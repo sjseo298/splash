@@ -12,10 +12,10 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
+#include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
@@ -50,11 +50,6 @@ constexpr size_t kTensorCount = tensorIndex(Tensor::Count);
 
 uint64_t aligned(uint64_t bytes) {
   return (bytes + kAlignment - 1) & ~(kAlignment - 1);
-}
-uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return uint16_t(bits >> 16);
 }
 
 struct Plan final {
@@ -228,8 +223,8 @@ private:
               keys[ki] = key;
               values[vi] = value;
             } else {
-              static_cast<uint16_t *>(get(Tensor::Keys).contents())[ki] = bf16(key * 0.006f);
-              static_cast<uint16_t *>(get(Tensor::Values).contents())[vi] = bf16(value * 0.007f);
+              static_cast<uint16_t *>(get(Tensor::Keys).contents())[ki] = tuning::floatToBf16(key * 0.006f);
+              static_cast<uint16_t *>(get(Tensor::Values).contents())[vi] = tuning::floatToBf16(value * 0.007f);
             }
           }
         }
@@ -240,9 +235,9 @@ private:
               (uint64_t{lane} * plan_.shape.kvHeads + head) * plan_.stride * kDimension;
           for (uint32_t d = 0; d < kDimension; ++d) {
             chunkKeys[base + row * kDimension + d] =
-                bf16(float(int((row * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127) * 0.006f);
+                tuning::floatToBf16(float(int((row * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127) * 0.006f);
             chunkValues[base + d * plan_.stride + row] =
-                bf16(float(int((row * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127) * 0.007f);
+                tuning::floatToBf16(float(int((row * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127) * 0.007f);
           }
         }
         for (uint32_t head = 0; head < plan_.shape.queryHeads; ++head)
@@ -253,7 +248,7 @@ private:
                  head % group) *
                     kDimension +
                 d;
-            queries[index] = bf16(
+            queries[index] = tuning::floatToBf16(
                 float(int((row * 43 + head * 67 + d * 11 + head * d * 7 + lane * 29) % 1019) -
                       509) /
                 1018.0f);

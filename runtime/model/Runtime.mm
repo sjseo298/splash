@@ -1,4 +1,5 @@
 #include "model/Runtime.hpp"
+#include "model/KvPageTier.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -14,7 +15,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -33,11 +33,6 @@
 
 namespace splash::model {
 namespace {
-
-// Fixed reserves the memory plan carries beside the planned arenas: Metal
-// pipeline objects and encoder scratch, and the process's own runtime overhead.
-constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
-constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
 
 using metal::BufferStorage;
 using metal::CommandGraph;
@@ -253,6 +248,7 @@ struct Runtime::Impl {
   const ops::ExecutionPlans &operators;
   kv::PageStorage &kvPages;
   QwenStateStorage &states;
+  KvPageTier *kvTier;
   std::unique_ptr<PrefillArena> prefillArena;
   std::unique_ptr<DecodeArena> decodeArena;
   std::unordered_map<uint64_t, Request> requests;
@@ -288,6 +284,7 @@ struct Runtime::Impl {
         operators(value.operators),
         kvPages(value.kvPages),
         states(requireQwenStateStorage(value.stateStorage)),
+        kvTier(value.kvTier),
         maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
@@ -444,6 +441,9 @@ struct Runtime::Impl {
   metal::AllocationResult stageImages(const ModelRequest &request) {
     if (request.images.empty() || stagedImages.contains(request.id))
       return true;
+    // The engine rejects image requests at submission when there is no vision.
+    if (!package.descriptor.hasVision())
+      throw std::logic_error("image request reached a model without vision");
     std::vector<ImageState> staged;
     staged.reserve(request.images.size());
     uint64_t bytes = 0;
@@ -459,24 +459,34 @@ struct Runtime::Impl {
         image.data = std::make_shared<ImageData>();
         image.data->embeddings = cachedEmbeddings(span);
         image.data->encoded = static_cast<bool>(image.data->embeddings);
-        if (image.data->encoded)
-          ++counters.imageEmbeddingReuses;
-        else
+        if (!image.data->encoded)
           bytes += span.pixelBytes() + embeddingBytes(span);
       }
       staged.push_back(std::move(image));
     }
     // Keep cache references alive during admission. Only misses need the
     // encoder; cached rows can be injected after its arena has been reclaimed.
-    if (bytes && !vision) {
+    const uint64_t encoderBytes =
+        bytes && !vision ? ops::Vision::scratchBytes(
+                               package.vision.tensors.layout,
+                               maximumImagePatches)
+                         : 0;
+    // At the budget the engine retries a denied admission after each reclaim
+    // step. Checking the whole attempt first, with the GDN cells and draft
+    // ring the lane needs beyond the idle pool, keeps a denial from building
+    // and dropping the encoder arena and image buffers every time.
+    if (bytes) {
+      if (auto admission = admitAllocation(
+              encoderBytes + bytes + states.activationBytes(), [] {});
+          !admission)
+        return admission;
+    }
+    if (encoderBytes) {
       std::unique_ptr<ops::Vision> candidate;
-      const auto admission = admitAllocation(
-              ops::Vision::scratchBytes(package.vision.tensors.layout,
-                                        maximumImagePatches),
-              [&] {
-                candidate = std::make_unique<ops::Vision>(
-                    backend, package.vision.tensors, maximumImagePatches);
-              });
+      const auto admission = admitAllocation(encoderBytes, [&] {
+        candidate = std::make_unique<ops::Vision>(
+            backend, package.vision.tensors, maximumImagePatches);
+      });
       if (!admission)
         return admission;
       vision = std::move(candidate);
@@ -502,6 +512,24 @@ struct Runtime::Impl {
     }
     stagedImages.emplace(request.id, std::move(staged));
     return true;
+  }
+
+  // Hands an admitted request its staged images. Only then do its embedding
+  // cache hits count as reuses; the engine retries denied admissions.
+  void takeStagedImages(Request &entry) {
+    const auto staged = stagedImages.find(entry.id);
+    if (staged == stagedImages.end())
+      return;
+    entry.images = std::move(staged->second);
+    stagedImages.erase(staged);
+    for (auto image = entry.images.begin(); image != entry.images.end();
+         ++image) {
+      const bool repeated = std::any_of(
+          entry.images.begin(), image,
+          [&](const ImageState &first) { return first.data == image->data; });
+      if (image->data->encoded && !repeated)
+        ++counters.imageEmbeddingReuses;
+    }
   }
 
   [[nodiscard]] bool visionIdle() const noexcept {
@@ -574,6 +602,7 @@ struct Runtime::Impl {
     add(prefillArena->bytes(), "warmup prefill arena");
     add(decodeArena->bytes(), "warmup decode arena");
     add(kvPages.actualAllocatedBytes(), "warmup KV pool");
+    add(kvTier ? kvTier->actualAllocatedBytes() : 0, "warmup KV staging");
     add(pipelineReserveBytes, "warmup pipeline reserve");
     add(runtimeOverheadReserveBytes, "warmup runtime reserve");
     return result;
@@ -795,10 +824,9 @@ struct Runtime::Impl {
     uint32_t capturedRows = 0;
   };
 
-  MetalBuffer prefillU16(PrefillTensor tensor, uint32_t begin, uint32_t rows,
-                         uint32_t width) const {
-    return backend.view(prefillArena->get(tensor),
-                        bytesFor<uint16_t>(uint64_t{begin} * width),
+  MetalBuffer prefillU16(const MetalBuffer &tensor, uint32_t begin,
+                         uint32_t rows, uint32_t width) const {
+    return backend.view(tensor, bytesFor<uint16_t>(uint64_t{begin} * width),
                         bytesFor<uint16_t>(uint64_t{rows} * width));
   }
 
@@ -991,6 +1019,10 @@ struct Runtime::Impl {
       }
     }
     QwenTargetPrefillBuffers buffers;
+    // Prefill plans read plain bf16 rows, so there is no input table or sums.
+    buffers.linearScratch = {.partials = p(PrefillTensor::LinearPartials),
+                             .counters = p(PrefillTensor::LinearCounters),
+                             .rotated = p(PrefillTensor::LinearRotated)};
     buffers.hidden = {p(PrefillTensor::Hidden0), p(PrefillTensor::Hidden1)};
     buffers.normalized = p(PrefillTensor::Normalized);
     buffers.captured = p(PrefillTensor::Captured);
@@ -1018,20 +1050,12 @@ struct Runtime::Impl {
     buffers.ropeSin = p(PrefillTensor::RopeSin);
     buffers.chunkKeys = p(PrefillTensor::ChunkKeys);
     buffers.chunkValues = p(PrefillTensor::ChunkValues);
-    buffers.selectedExperts = p(PrefillTensor::MoeSelectedExperts);
-    buffers.routingWeights = p(PrefillTensor::MoeRoutingWeights);
-    buffers.tileDescriptors = p(PrefillTensor::MoeTileDescriptors);
-    buffers.tileCount = p(PrefillTensor::MoeTileCount);
-    buffers.groupedRoutes = p(PrefillTensor::MoeGroupedRoutes);
-    buffers.routeRows = p(PrefillTensor::MoeRouteRows);
-    buffers.groupedInput = p(PrefillTensor::MoeGroupedInput);
-    buffers.expertIntermediate = p(PrefillTensor::MoeExpertIntermediate);
-    buffers.expertOutput = p(PrefillTensor::MoeExpertOutput);
+    buffers.moe = prefillArena->moeScratch();
     std::vector<kv::LayerStorage> kvLayers(
         geometry.target.kvLayout.attentionLayers);
     for (uint32_t layer = 0; layer < kvLayers.size(); ++layer)
       kvLayers[layer] = kvPages.layer(layer);
-    targetModel.addPrefill(
+    const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
         kvLayers);
@@ -1050,8 +1074,8 @@ struct Runtime::Impl {
       const uint32_t lastRows = std::min(item.tokenCount, kDecodeRows);
       ops::DraftAttention::gatherLastRows(
           graph,
-          prefillU16(PrefillTensor::Hidden0, sequence.rowBegin,
-                     item.tokenCount, geometry.target.hiddenSize),
+          prefillU16(finalHidden, sequence.rowBegin, item.tokenCount,
+                     geometry.target.hiddenSize),
           d(DecodeTensor::Hidden0), item.tokenCount,
           geometry.target.hiddenSize);
       if (scoring) {
@@ -1137,14 +1161,16 @@ struct Runtime::Impl {
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
-                             ops::Q4DispatchStats &stats) {
+                             ops::LinearDispatchStats &stats) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != logicalPositions.size()) {
       throw std::invalid_argument("invalid draft decode batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    // The draft shares the target's vocabulary head and its storage rows.
+    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, lanes);
+      return decodeArena->packed(tensor, storage);
     };
     std::array<uint32_t, kLaneCount> cacheLengths{};
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
@@ -1201,14 +1227,15 @@ struct Runtime::Impl {
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,
-                                      ops::Q4DispatchStats &stats) {
+                                      ops::LinearDispatchStats &stats) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, lanes);
+      return decodeArena->packed(tensor, storage);
     };
     auto paddedItem = [&](uint32_t lane) -> const ModelBatchItem & {
       return items[std::min(lane, lanes - 1)];
@@ -1254,15 +1281,7 @@ struct Runtime::Impl {
     buffers.gdnBeta = gdnBeta;
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
-    buffers.selectedExperts = d(DecodeTensor::MoeSelectedExperts);
-    buffers.routingWeights = d(DecodeTensor::MoeRoutingWeights);
-    buffers.tileDescriptors = d(DecodeTensor::MoeTileDescriptors);
-    buffers.tileCount = d(DecodeTensor::MoeTileCount);
-    buffers.groupedRoutes = d(DecodeTensor::MoeGroupedRoutes);
-    buffers.routeRows = d(DecodeTensor::MoeRouteRows);
-    buffers.groupedInput = d(DecodeTensor::MoeGroupedInput);
-    buffers.expertIntermediate = d(DecodeTensor::MoeExpertIntermediate);
-    buffers.expertOutput = d(DecodeTensor::MoeExpertOutput);
+    buffers.moe = decodeArena->moeScratch(storage);
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       const ModelBatchItem &item = paddedItem(lane);
       q8[lane] = q8Params(item.logicalPosition, kDecodeRows, kTileRows,
@@ -1284,20 +1303,20 @@ struct Runtime::Impl {
     }
     for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
       gdnPacked[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyPackedBase, layer, lanes);
+          DecodeTensor::VerifyPackedBase, layer, storage);
       gdnMixed[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyMixedBase, layer, lanes);
+          DecodeTensor::VerifyMixedBase, layer, storage);
       gdnDecay[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyDecayBase, layer, lanes);
+          DecodeTensor::VerifyDecayBase, layer, storage);
       gdnBeta[layer] = decodeArena->gdnBatchSlice(
-          DecodeTensor::VerifyBetaBase, layer, lanes);
+          DecodeTensor::VerifyBetaBase, layer, storage);
     }
     std::vector<kv::LayerStorage> kvLayers(attentionLayers);
     for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
       chunkKeys[layer] = decodeArena->attentionBatchSlice(
-          DecodeTensor::ChunkKeysBase, layer, lanes);
+          DecodeTensor::ChunkKeysBase, layer, storage);
       chunkValues[layer] = decodeArena->attentionBatchSlice(
-          DecodeTensor::ChunkValuesBase, layer, lanes);
+          DecodeTensor::ChunkValuesBase, layer, storage);
       kvLayers[layer] = kvPages.layer(layer);
     }
     targetModel.addVerify(graph, std::move(buffers), kvLayers, q8, verify,
@@ -1336,7 +1355,7 @@ struct Runtime::Impl {
   void encodeDraftStateCommitBatch(CommandGraph &graph,
                                    std::span<Request *const> entries,
                                    std::span<const ModelBatchItem> items,
-                                   ops::Q4DispatchStats &stats) {
+                                   ops::LinearDispatchStats &stats) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid draft state commit batch");
@@ -1456,7 +1475,7 @@ struct Runtime::Impl {
 
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::vector<ModelStepResult> results,
-      std::span<const ModelBatchItem> items, const ops::Q4DispatchStats &stats,
+      std::span<const ModelBatchItem> items, const ops::LinearDispatchStats &stats,
       uint32_t planWidth, CommandTiming timing) {
     if (lanes.size() != items.size() || results.size() != items.size())
       throw std::logic_error("decode completion shape changed");
@@ -1540,20 +1559,44 @@ struct Runtime::Impl {
     return results;
   }
 
+  // Every asynchronous command the runtime submits goes through here and
+  // carries the KV copies queued so far. The engine sends a copy-only command
+  // only when no batch runs, so a command without them would leave a restore
+  // or demotion waiting for as long as the model stays busy.
+  CommandTicket submitWithCopies(CommandGraph &graph,
+                                 std::function<void()> completion) {
+    // The copies are reported before the engine wakes, so the tick the wake
+    // starts can retire their batch in poll().
+    std::function<void()> report = kvTier ? kvTier->encode(graph) : nullptr;
+    return backend.submitCommandAsync(
+        graph.dispatches(),
+        [report = std::move(report),
+         completion = std::move(completion)](uint64_t) {
+          if (report)
+            report();
+          if (completion)
+            completion();
+        });
+  }
+  [[nodiscard]] bool copiesQueued() const noexcept {
+    return kvTier && kvTier->copiesQueued();
+  }
+
   // A constrained DFlash cycle has one host dependency between three Metal
   // commands: draft proposals define the grammar simulation, while the target
   // forward is independent of the resulting mask.  This ticket keeps the
   // scheduler batch (and therefore its DecodeArena lanes) owned across that
   // dependency.  All state transitions run on the engine thread; completion
-  // handlers only wake it, so they capture the wake hook and never the ticket.
+  // handlers only report their KV copies and wake it, so they capture the
+  // wake hook and never the ticket.
   class ConstrainedDecodeTicket final : public ModelBatchTicket {
   public:
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
                             std::vector<ModelStepResult> results,
                             std::span<const ModelBatchItem> items,
-                            const ops::Q4DispatchStats &stats,
+                            const ops::LinearDispatchStats &stats,
                             uint32_t planWidth, CommandTiming priorTiming,
-                            const CommandGraph &draft,
+                            CommandGraph &draft,
                             std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)), results_(std::move(results)),
           items_(items.begin(), items.end()), stats_(stats),
@@ -1710,12 +1753,11 @@ struct Runtime::Impl {
       Done
     };
 
-    void submit(const CommandGraph &graph) {
-      command_ = impl_.backend.submitCommandAsync(
-          graph.dispatches(), [wake = wake_](uint64_t) {
-            if (*wake)
-              (*wake)();
-          });
+    void submit(CommandGraph &graph) {
+      command_ = impl_.submitWithCopies(graph, [wake = wake_] {
+        if (*wake)
+          (*wake)();
+      });
     }
 
     void addTiming(CommandTiming value) noexcept {
@@ -1727,7 +1769,7 @@ struct Runtime::Impl {
     std::vector<DecodeLaneResult> lanes_;
     std::vector<ModelStepResult> results_;
     std::vector<ModelBatchItem> items_;
-    ops::Q4DispatchStats stats_;
+    ops::LinearDispatchStats stats_;
     uint32_t planWidth_ = 0;
     Stage stage_ = Stage::Draft;
     CommandTicket command_;
@@ -1816,11 +1858,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.slot = *admission.cell;
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
-    if (auto staged = impl_->stagedImages.find(request.id);
-        staged != impl_->stagedImages.end()) {
-      entry.images = std::move(staged->second);
-      impl_->stagedImages.erase(staged);
-    }
+    impl_->takeStagedImages(entry);
   }
   images.committed = admission.granted();
   return admission;
@@ -1883,11 +1921,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
     return admission;
   entry.slot = stateSlot;
   entry.resident = true;
-  if (auto staged = impl_->stagedImages.find(request.id);
-      staged != impl_->stagedImages.end()) {
-    entry.images = std::move(staged->second);
-    impl_->stagedImages.erase(staged);
-  }
+  impl_->takeStagedImages(entry);
   try {
     auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
     if (!inserted) {
@@ -1912,6 +1946,25 @@ void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
         "reusable Qwen prefix must leave an input token to replay");
   }
   impl_->states.restore(entry.slot, *restoredState, restoreDraftState);
+  finishRestore(requestId, restoredPrefixLength, restoreDraftState);
+}
+
+std::unique_ptr<StateRestore> Runtime::beginRestore(
+    uint64_t requestId, uint32_t boundary,
+    std::shared_ptr<const CompositeState> state, bool restoreDraft,
+    std::function<void()> completion) {
+  Impl::Request &entry = impl_->request(requestId);
+  if (!entry.resident || !state || boundary >= entry.promptTokens)
+    throw std::invalid_argument("invalid state restore");
+  return impl_->states.beginRestore(entry.slot, *state, restoreDraft,
+      std::move(completion), [this, requestId, boundary, restoreDraft] {
+        finishRestore(requestId, boundary, restoreDraft);
+      });
+}
+
+void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
+                            bool restoreDraftState) {
+  Impl::Request &entry = impl_->request(requestId);
   if (!restoreDraftState)
     ++impl_->counters.draftStateRestoreSkipped;
   const QwenLogicalLengths &lengths =
@@ -1992,12 +2045,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  auto notify = [completion = std::move(completion)](uint64_t) {
-    if (completion)
-      completion();
-  };
-  CommandTicket command =
-      impl_->backend.submitCommandAsync(graph.dispatches(), std::move(notify));
+  CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));
   Impl *impl = impl_.get();
   auto finish = [impl, entries,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
@@ -2055,19 +2103,18 @@ Runtime::prefillAsync(const BatchPlan &plan,
       if (entry.promptComplete && !entry.replayingGeneration) {
         entry.pendingToken.reset();
         if (!entry.scoreTokens.empty()) {
-          // Score-only: read the raw bf16 logits at the final prompt position
+          // Score-only: read the raw fp32 logits at the final prompt position
           // (row lastRows-1 of the gathered head input) in requested order.
           const uint32_t lastRows = std::min(item.tokenCount, kDecodeRows);
-          const uint16_t *logits = contents<uint16_t>(
+          const float *logits = contents<float>(
               impl->decodeArena->get(lane, DecodeTensor::Logits),
               "score logits");
-          const uint16_t *row =
+          const float *row =
               logits + uint64_t{lastRows - 1} *
                            impl->geometry.target.vocabularySize;
           result.scoreLogits.reserve(entry.scoreTokens.size());
           for (uint32_t token : entry.scoreTokens) {
-            const float logit =
-                std::bit_cast<float>(uint32_t{row[token]} << 16);
+            const float logit = row[token];
             if (!std::isfinite(logit)) {
               // A numerical outcome for this request, not a broken invariant:
               // report it as a lane failure so the engine drops this request
@@ -2130,7 +2177,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   std::vector<Impl::DecodeLaneResult> lanes(items.size());
   std::vector<ModelStepResult> results(items.size());
-  ops::Q4DispatchStats batchStats;
+  ops::LinearDispatchStats batchStats;
   CommandTiming priorTiming;
   for (uint32_t lane = 0; lane < items.size(); ++lane) {
     const ModelBatchItem &item = items[lane];
@@ -2288,23 +2335,32 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                 planWidth, timing);
   };
 
-  if (commandGraph.empty()) {
+  // A mask stage encodes no work; while copies are queued it still submits a
+  // command for them, and the plan finishes with that command.
+  if (commandGraph.empty() && !impl_->copiesQueued()) {
     std::vector<ModelStepResult> ready = finish(CommandTiming{});
     return std::make_unique<ReadyModelTicket>(std::move(ready),
                                               priorTiming.wallSeconds * 1000.0);
   }
 
-  auto notify = [completion = std::move(completion)](uint64_t) {
-    if (completion)
-      completion();
-  };
-  CommandTicket command = impl_->backend.submitCommandAsync(
-      commandGraph.dispatches(), std::move(notify));
+  CommandTicket command =
+      impl_->submitWithCopies(commandGraph, std::move(completion));
   return std::make_unique<DeferredMetalTicket>(
       std::move(command), std::move(finish), priorTiming.wallSeconds * 1000.0);
 }
 
-std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
+std::unique_ptr<ModelBatchTicket>
+Runtime::submitTransfers(std::function<void()> completion) {
+  if (!impl_->copiesQueued())
+    return nullptr;
+  CommandGraph graph;
+  CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));
+  return std::make_unique<DeferredMetalTicket>(
+      std::move(command),
+      [](CommandTiming) { return std::vector<ModelStepResult>{}; });
+}
+
+uint32_t Runtime::committedStateSlot(uint64_t requestId) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident)
     throw std::logic_error("request is not resident");
@@ -2313,7 +2369,20 @@ std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
       metadata.lengths.targetTokens % kv::kPageTokens) {
     throw std::logic_error("cannot snapshot uncommitted draft state");
   }
-  return impl_->states.snapshot(entry.slot);
+  return entry.slot;
+}
+
+std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
+  return impl_->states.snapshot(committedStateSlot(requestId));
+}
+
+bool Runtime::canSnapshotToDisk() const noexcept {
+  return impl_->states.canSnapshotToDisk();
+}
+
+std::unique_ptr<StateOffload>
+Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
+  return impl_->states.snapshotToDisk(committedStateSlot(requestId), std::move(completion));
 }
 
 uint64_t Runtime::reclaimIdleState() noexcept {
@@ -2732,10 +2801,10 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
 std::unique_ptr<StateStorage>
 createStateStorage(metal::MetalBackend &backend,
                    metal::AllocationAdmission admitAllocation,
-                   const ModelPackage &package) {
+                   const ModelPackage &package, std::shared_ptr<SlotFile> file) {
   requireCompatibleModelPackage(package);
   return std::make_unique<QwenStateStorage>(
-      backend, std::move(admitAllocation), package.stateLayout());
+      backend, std::move(admitAllocation), package.stateLayout(), std::move(file));
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {

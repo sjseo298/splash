@@ -1,5 +1,7 @@
 import concurrent.futures
+import dataclasses
 import http.client
+import io
 import json
 import threading
 import time
@@ -9,11 +11,12 @@ from unittest import mock
 
 from dev.tests.engine.test_native_backend import FakeTokenizer as NativeTokenizer
 from dev.tests.engine.test_runtime import READY_FEATURES, FakeFactory
-from dev.tests.test_server import FakeRuntime, Harness, Plan
+from dev.tests.test_server import FakeRuntime, Harness, Plan, main_args
 from install import launcher
 from server import backend as backend_api
 from server import protocol as wire
 from server import runtime as engine_runtime
+from server import server as api
 
 
 class RecoveringRuntime(FakeRuntime):
@@ -308,9 +311,123 @@ class ServerRecoveryTests(unittest.TestCase):
         self.assertEqual(runtime.pending_count, 0)
         self.assertEqual(factory.processes[0].stdin.messages(wire.RequestFrame), [])
 
-    def test_restarted_native_context_must_match_the_original_ready_event(self):
-        for context in (65536, 131072):
-            with self.subTest(context=context):
+    def test_idle_engine_death_restarts_before_traffic_arrives(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        backend = backend_api.NativeBackend(runtime, NativeTokenizer())
+        self.addCleanup(backend.close)
+        factory.processes[0].kill()
+        self.wait_until(lambda: len(factory.processes) == 2 and runtime.ready, 2)
+        self.assertEqual(runtime.restart_count, 1)
+        self.assertTrue(backend.can_submit())
+
+    def test_engine_failure_and_failed_restart_are_reported(self):
+        factory = FakeFactory()
+
+        def launch():
+            if factory.processes:
+                raise FileNotFoundError("splash")
+            return factory()
+
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=launch)
+        backend = backend_api.NativeBackend(runtime, NativeTokenizer())
+        self.addCleanup(backend.close)
+        with mock.patch.object(backend_api, "print_status") as console:
+            factory.processes[0].kill()
+            self.wait_until(lambda: console.call_count >= 2)
+            transport = backend.status()["transport"]
+        failed, restart = (call.args[0] for call in console.call_args_list[:2])
+        self.assertEqual(failed, "Engine failed · native protocol reached EOF")
+        self.assertRegex(
+            restart, "^Engine restart failed · native engine executable is missing"
+        )
+        self.assertTrue(transport["recovering"])
+        self.assertIn("executable is missing", transport["error"])
+
+    def test_recovery_refusals_carry_the_last_engine_failure(self):
+        runtime = RecoveringRuntime([engine_runtime.EngineUnhealthy("GPU is gone")])
+        runtime.startup_release.set()
+        harness = self.harness(runtime)
+        clock = [100.0]
+        with (
+            mock.patch.object(
+                backend_api, "time", SimpleNamespace(monotonic=lambda: clock[0])
+            ),
+            mock.patch.object(backend_api, "print_status") as console,
+        ):
+            self.assertFalse(harness.backend.can_submit())
+            self.wait_until(lambda: not harness.backend.status_refresh_inflight)
+            console.assert_called_once_with(
+                "Engine restart failed · GPU is gone", error=True
+            )
+            status, _, payload = harness.request(
+                "POST", "/v1/chat/completions", self.body()
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(
+                json.loads(payload)["error"]["message"],
+                "engine is recovering; retry shortly (last failure: GPU is gone)",
+            )
+            transport = json.loads(harness.request("GET", "/status")[2])["transport"]
+            self.assertEqual(transport["error"], "GPU is gone")
+            clock[0] = harness.backend.status_refresh_after
+            self.assertFalse(harness.backend.can_submit())
+            self.wait_until(lambda: not harness.backend.status_refresh_inflight)
+            self.assertTrue(harness.backend.can_submit())
+            console.assert_called_with("Engine restarted")
+            transport = json.loads(harness.request("GET", "/status")[2])["transport"]
+            self.assertNotIn("error", transport)
+
+    def test_startup_protocol_failure_ends_with_one_error_line(self):
+        missing = READY_FEATURES & ~wire.ReadyFeature.MULTIPLEXING
+        runtime_type = engine_runtime.MultiplexedRuntime
+        for output, reason in (
+            (
+                wire.serialize_message(wire.ReadyEvent(1000, 4, 131072, missing)),
+                "missing required native protocol features",
+            ),
+            (b"not a frame".ljust(wire.FRAME_HEADER_BYTES, b"\0"), "bad_magic"),
+        ):
+            with self.subTest(reason=reason):
+                factory = FakeFactory(initial_output=output)
+                with (
+                    mock.patch.object(api, "parse_args", return_value=main_args()),
+                    mock.patch.object(api, "load_thinking_key", return_value=None),
+                    mock.patch.object(
+                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                    ),
+                    mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(api, "ChatTemplates"),
+                    mock.patch.object(
+                        api.engine_runtime,
+                        "MultiplexedRuntime",
+                        side_effect=lambda _command, **options: runtime_type(
+                            process_factory=factory, **options
+                        ),
+                    ),
+                    mock.patch.object(api, "FrontendServer"),
+                    mock.patch.object(api.signal, "signal"),
+                    mock.patch("sys.stdout", new_callable=io.StringIO),
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                    self.assertRaisesRegex(SystemExit, "1"),
+                ):
+                    api.main()
+                (line,) = stderr.getvalue().splitlines()
+                self.assertIn("Error · ", line)
+                self.assertIn(reason, line)
+                self.assertIsNotNone(factory.processes[0].poll())
+
+    def test_restarted_native_must_match_the_original_ready_event(self):
+        original = wire.ReadyEvent(1001, 4, 131072, READY_FEATURES)
+        for restarted in (
+            original,
+            dataclasses.replace(original, max_context_tokens=65536),
+            dataclasses.replace(original, max_concurrent_requests=1),
+            dataclasses.replace(
+                original, feature_bits=READY_FEATURES | wire.ReadyFeature.VISION
+            ),
+        ):
+            with self.subTest(restarted=restarted):
                 factory = FakeFactory()
                 runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
                 try:
@@ -318,16 +435,17 @@ class ServerRecoveryTests(unittest.TestCase):
                     with mock.patch.object(runtime._crash_trace, "dump"):
                         factory.processes[0].kill()
                         self.wait_until(lambda: not runtime.ready)
-                        factory.initial_output = wire.serialize_message(
-                            wire.ReadyEvent(1001, 4, context, READY_FEATURES)
-                        )
-                        if context == 131072:
+                        factory.initial_output = wire.serialize_message(restarted)
+                        if restarted is original:
                             self.assertTrue(runtime.wait_ready(1))
                         else:
-                            with self.assertRaisesRegex(
-                                engine_runtime.EngineUnhealthy, "context window changed"
-                            ):
-                                runtime.wait_ready(1)
+                            # The difference would recur on every relaunch.
+                            for _ in range(2):
+                                with self.assertRaisesRegex(
+                                    engine_runtime.EngineUnhealthy,
+                                    "restart the Splash server",
+                                ):
+                                    runtime.wait_ready(1)
                             self.assertFalse(runtime.ready)
                     self.assertEqual(runtime.pending_count, 0)
                     self.assertEqual(len(factory.processes), 2)

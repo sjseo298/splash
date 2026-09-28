@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 from dev.tests import test_server
-from dev.tests.engine.test_documents import document_block, pdf_bytes
+from dev.tests.engine.test_documents import pdf_bytes, render_pdf
 from dev.tests.test_server import FakeRuntime, Harness, Plan
 from server import api_shapes, documents
 from server.errors import APIError
@@ -30,10 +30,11 @@ class PdfProtocolTests(unittest.TestCase):
                 }
             ],
             **kwargs,
+            vision=True,
         )
 
     def test_protocols_share_rendered_pages_and_preserve_order(self):
-        expected = documents.document_content(document_block(pdf_bytes(pages=2)))
+        expected = render_pdf(pdf_bytes(pages=2))
         chat = self.chat()[0]["content"]
         self.assertEqual(chat, expected)
         response = api_shapes.responses_to_chat_body(
@@ -50,7 +51,9 @@ class PdfProtocolTests(unittest.TestCase):
                 ],
             }
         )
-        actual = api_shapes.normalize_messages(response["messages"])[0]["content"]
+        actual = api_shapes.normalize_messages(response["messages"], vision=True)[0][
+            "content"
+        ]
         self.assertEqual(
             actual,
             [
@@ -215,11 +218,17 @@ class PdfProtocolTests(unittest.TestCase):
         )
 
     def test_user_and_tool_files_share_one_request_budget(self):
-        parts = documents.file_content(self.file, budget=documents.DocumentBudget())
-        size = sum(
-            len(p.get("text", "")) * 4 + len(p.get("image_url", {}).get("url", ""))
-            for p in parts
-        )
+        budget = documents.DocumentBudget()
+        documents.file_content(self.file, budget=budget)
+        one_file = documents.MAX_REQUEST_DOCUMENT_BYTES - budget.remaining_bytes
+
+        def normalize(messages, remaining_bytes):
+            request_budget = documents.DocumentBudget(remaining_bytes=remaining_bytes)
+            with mock.patch.object(
+                api_shapes, "DocumentBudget", return_value=request_budget
+            ):
+                api_shapes.normalize_messages(messages, vision=True)
+
         for dialect in ("chat", "responses"):
             with self.subTest(dialect=dialect):
                 if dialect == "chat":
@@ -249,15 +258,9 @@ class PdfProtocolTests(unittest.TestCase):
                         ]
                     }
                     messages = api_shapes.responses_to_chat_body(body)["messages"]
-                with (
-                    mock.patch.object(
-                        api_shapes,
-                        "DocumentBudget",
-                        return_value=documents.DocumentBudget(remaining_bytes=size),
-                    ),
-                    self.assertRaisesRegex(APIError, "request size limit"),
-                ):
-                    api_shapes.normalize_messages(messages)
+                normalize(messages, 2 * one_file)
+                with self.assertRaisesRegex(APIError, "request size limit"):
+                    normalize(messages, 2 * one_file - 1)
 
     def test_deadline_applies_even_to_cached_pdf(self):
         self.chat()
@@ -285,7 +288,8 @@ class PdfProtocolTests(unittest.TestCase):
             for file in values:
                 with self.subTest(file=file), self.assertRaises(APIError):
                     api_shapes.normalize_messages(
-                        [{"role": "user", "content": [{"type": "file", "file": file}]}]
+                        [{"role": "user", "content": [{"type": "file", "file": file}]}],
+                        vision=True,
                     )
 
     def test_input_bound_checked_before_decode(self):

@@ -65,7 +65,7 @@ __attribute__((always_inline)) inline void top_shard_store(
 // choice is uniform across a threadgroup; greedy lanes need only one winner.
 template <uint K>
 __attribute__((always_inline)) inline void target_top_shard(
-    device const bfloat *source, uint vocabulary,
+    device const float *source, uint vocabulary,
     device const uint *token_mask, bool constrained, ulong mask_origin,
     device uint *partial_ids, device float *partial_values,
     uint group, uint thread_index, uint lane, uint simd_group,
@@ -82,7 +82,7 @@ __attribute__((always_inline)) inline void target_top_shard(
     if (constrained &&
         (token_mask[mask_origin + token / 32] & (1u << (token % 32))) == 0)
       continue;
-    top_insert<K>(values, ids, float(source[token]), token);
+    top_insert<K>(values, ids, source[token], token);
   }
   top_shard_store<K>(values, ids, group_values, group_ids,
                      partial_ids + ulong(group) * 32,
@@ -183,7 +183,7 @@ __attribute__((always_inline)) inline void top32_probs_row(
 }
 
 kernel void
-decode_sample_top32_sharded(device const bfloat *logits [[buffer(0)]],
+decode_sample_top32_sharded(device const float *logits [[buffer(0)]],
                      device uint *partial_ids [[buffer(1)]],
                      device float *partial_values [[buffer(2)]],
                      device const uint *token_mask [[buffer(3)]],
@@ -195,7 +195,7 @@ decode_sample_top32_sharded(device const bfloat *logits [[buffer(0)]],
   threadgroup float group_values[8 * 32];
   threadgroup uint group_ids[8 * 32];
   uint row = group / SPLASH_TARGET_SAMPLING_SHARDS;
-  device const bfloat *source =
+  device const float *source =
       logits + ulong(params.row_offset + row) * params.vocabulary;
   ulong mask_origin = ulong(params.mask_row_offset + row) * params.mask_words;
   if (params.top_k == 1)
@@ -245,7 +245,7 @@ kernel void decode_sample_top32_probs(device const uint *partial_ids [[buffer(0)
 }
 
 kernel void decode_sample_top32_sharded_batch(
-    device const bfloat *logits [[buffer(0)]],
+    device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
     device const uint *token_mask [[buffer(3)]],
@@ -261,7 +261,7 @@ kernel void decode_sample_top32_sharded_batch(
   uint row = global_row % params.rows_per_lane;
   if (batch >= params.lanes)
     return;
-  device const bfloat *source = logits + ulong(global_row) * params.vocabulary;
+  device const float *source = logits + ulong(global_row) * params.vocabulary;
   bool constrained = (params.constrained_mask & (1u << batch)) != 0;
   ulong mask_origin =
       ulong(batch) * (SPLASH_TARGET_VERIFY_ROWS + 1) * params.mask_words +
@@ -343,7 +343,7 @@ inline void simd_best_head(float value, uint token, thread float &best,
 // rank order. The (value desc, id asc) order is total, so the partial is the
 // same set in the same order whatever the thread partition.
 kernel void draft_select_top16_sharded(
-    device const bfloat *logits [[buffer(0)]],
+    device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
     constant uint &vocabulary [[buffer(3)]],
@@ -354,7 +354,7 @@ kernel void draft_select_top16_sharded(
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr uint K = 16, VectorTokens = 8, ChunkVectors = 16;
+  constexpr uint K = 16, VectorTokens = 4, ChunkVectors = 16;
   uint batch = group / (Positions * Shards);
   uint local = group % (Positions * Shards);
   uint position = local / Shards;
@@ -371,9 +371,9 @@ kernel void draft_select_top16_sharded(
   uint vectors = (end - begin - head) / VectorTokens;
   uint vector_begin = begin + head;
   uint tail_begin = vector_begin + vectors * VectorTokens;
-  device const bfloat *row = logits + row_start;
-  device const uint4 *vector_row =
-      reinterpret_cast<device const uint4 *>(row + vector_begin);
+  device const float *row = logits + row_start;
+  device const float4 *vector_row =
+      reinterpret_cast<device const float4 *>(row + vector_begin);
 
   float values[K];
   uint ids[K];
@@ -383,13 +383,13 @@ kernel void draft_select_top16_sharded(
   }
   if (thread_index < head) {
     uint token = begin + thread_index;
-    float value = float(row[token]);
+    float value = row[token];
     if (top_beats(value, token, values[K - 1], ids[K - 1]))
       top16_insert(values, ids, value, token);
   }
   if (thread_index < end - tail_begin) {
     uint token = tail_begin + thread_index;
-    float value = float(row[token]);
+    float value = row[token];
     if (top_beats(value, token, values[K - 1], ids[K - 1]))
       top16_insert(values, ids, value, token);
   }
@@ -397,20 +397,15 @@ kernel void draft_select_top16_sharded(
   threadgroup float maxima[256];
   threadgroup float thresholds[8];
   for (uint chunk = 0; chunk < vectors; chunk += 256 * ChunkVectors) {
-    uint4 loaded[ChunkVectors];
+    float4 loaded[ChunkVectors];
     float best = -INFINITY;
     for (uint i = 0; i < ChunkVectors; ++i) {
       uint index = chunk + thread_index + i * 256;
-      loaded[i] = index < vectors ? vector_row[index] : uint4(0u);
+      loaded[i] = index < vectors ? vector_row[index] : float4(0.0f);
       if (index < vectors) {
-        for (uint word = 0; word < 4; ++word) {
-          float low = as_type<float>(loaded[i][word] << 16);
-          float high = as_type<float>(loaded[i][word] & 0xffff0000u);
-          if (low > best)
-            best = low;
-          if (high > best)
-            best = high;
-        }
+        for (uint j = 0; j < VectorTokens; ++j)
+          if (loaded[i][j] > best)
+            best = loaded[i][j];
       }
     }
     // The 16th largest thread maximum: the minimum over the maxima that
@@ -433,15 +428,11 @@ kernel void draft_select_top16_sharded(
       if (index >= vectors)
         continue;
       uint token = vector_begin + index * VectorTokens;
-      for (uint word = 0; word < 4; ++word) {
-        float low = as_type<float>(loaded[i][word] << 16);
-        float high = as_type<float>(loaded[i][word] & 0xffff0000u);
-        if (low >= threshold &&
-            top_beats(low, token + 2 * word, values[K - 1], ids[K - 1]))
-          top16_insert(values, ids, low, token + 2 * word);
-        if (high >= threshold &&
-            top_beats(high, token + 2 * word + 1, values[K - 1], ids[K - 1]))
-          top16_insert(values, ids, high, token + 2 * word + 1);
+      for (uint j = 0; j < VectorTokens; ++j) {
+        float value = loaded[i][j];
+        if (value >= threshold &&
+            top_beats(value, token + j, values[K - 1], ids[K - 1]))
+          top16_insert(values, ids, value, token + j);
       }
     }
   }
@@ -521,7 +512,7 @@ kernel void draft_select_edges(
     device const uint *partial_ids [[buffer(0)]],
     device float *partial_values [[buffer(1)]],
     device uint *candidates [[buffer(2)]],
-    device bfloat *unary [[buffer(3)]],
+    device float *unary [[buffer(3)]],
     device const bfloat *hidden [[buffer(4)]],
     device const bfloat *predecessor_codebook [[buffer(5)]],
     device const bfloat *successor_codebook [[buffer(6)]],
@@ -547,7 +538,7 @@ kernel void draft_select_edges(
     top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
     if (lane < Candidates) {
       candidates[row * Candidates + lane] = token;
-      unary[row * Candidates + lane] = bfloat(value);
+      unary[row * Candidates + lane] = value;
       successors[lane] = token;
     }
   } else if (simd_group == 1) {
@@ -610,7 +601,7 @@ kernel void draft_select_edges(
 // from the table draft_select_edges left in the partial-values scratch.
 kernel void draft_select_dflash(
     device const uint *candidates [[buffer(0)]],
-    device const bfloat *unary [[buffer(1)]],
+    device const float *unary [[buffer(1)]],
     device const float *partial_values [[buffer(2)]],
     device const float *uniforms [[buffer(3)]],
     device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
@@ -638,7 +629,7 @@ kernel void draft_select_dflash(
         tables + (position * Candidates + predecessor_index) * Candidates;
     float scores[Candidates];
     for (uint i = 0; i < Candidates; ++i)
-      scores[i] = float(unary[position * Candidates + i]) + edges[i];
+      scores[i] = unary[position * Candidates + i] + edges[i];
     uint selected = 0;
     if (sampling) {
       float maximum = scores[0];
@@ -793,7 +784,7 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                     accepted_count);
 }
 
-kernel void decode_sample_argmax_sharded(device const bfloat *logits [[buffer(0)]],
+kernel void decode_sample_argmax_sharded(device const float *logits [[buffer(0)]],
                               device float *partial_values [[buffer(1)]],
                               device uint *partial_indices [[buffer(2)]],
                               constant uint &vocabulary [[buffer(3)]],
@@ -807,10 +798,10 @@ kernel void decode_sample_argmax_sharded(device const bfloat *logits [[buffer(0)
   uint shard = group % Shards;
   float best = -INFINITY;
   uint best_index = 0xffffffffu;
-  device const bfloat *source = logits + ulong(row) * vocabulary;
+  device const float *source = logits + ulong(row) * vocabulary;
   for (uint token = shard * 256 + thread_index; token < vocabulary;
        token += Shards * 256) {
-    float value = float(source[token]);
+    float value = source[token];
     if (value > best || (value == best && token < best_index)) {
       best = value;
       best_index = token;
