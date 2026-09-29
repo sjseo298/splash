@@ -921,7 +921,11 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
                     "type": "function",
                     "function": {
                         "name": "lookup",
-                        "parameters": {"type": "object", "properties": {}},
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": False,
+                        },
                     },
                 }
             ],

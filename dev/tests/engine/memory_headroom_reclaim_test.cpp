@@ -1,7 +1,28 @@
 #include "engine/MemoryGovernor.hpp"
-#include <iostream>
-#include <cassert>
+
 #include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <string>
+
+// The governor reads nothing from the backend but its memory statistics, so
+// this stand-in satisfies the linker without a GPU.
+namespace splash::metal {
+namespace {
+MetalMemoryStats statistics;
+} // namespace
+
+struct MetalBackend::Impl {};
+MetalBackend::MetalBackend(std::string, double, uint32_t, double)
+    : impl_(std::make_unique<Impl>()) {}
+MetalBackend::~MetalBackend() = default;
+MetalMemoryStats MetalBackend::memoryStats() const noexcept {
+  return statistics;
+}
+MetalMemoryStats MetalBackend::refreshMemoryStats() const noexcept {
+  return statistics;
+}
+} // namespace splash::metal
 
 using namespace splash;
 using namespace splash::engine;

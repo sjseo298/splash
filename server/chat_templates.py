@@ -23,6 +23,12 @@ marker. The outcome is one of:
   a BOS token), or its patch failed a probe. A request with a later system
   message fails with a 400 instead of losing it.
 
+The probe also records the generation prompt, the text a template appends
+for ``add_generation_prompt``, under each reasoning effort. A request's
+prompt must end with it, and it says whether generation starts in a think
+block. The next turn may render it differently, so the engine keeps a turn's
+reusable state before it. No chat format's markers are assumed.
+
 Requests and the probe share the reasoning efforts, template options and
 alias retry defined here, so the probe renders exactly as requests do.
 Tokenizer files and the tokenizer object are never modified.
@@ -96,6 +102,9 @@ class ChatTemplate:
     later_system: str
     # RENDERS, REJECTS, DROPS or MISPLACES.
     original: str
+    # The generation prompt's text and tokens by the options that shape it
+    # (_generation_key); absent where it is empty or the probes disagree.
+    generation_prompts: dict
 
     def accepts(self, messages):
         """Whether requests with these normalized messages are served: a
@@ -103,6 +112,11 @@ class ChatTemplate:
         return self.later_system != UNSUPPORTED or all(
             message["role"] != "system" for message in messages[1:]
         )
+
+    def generation_prompt(self, options):
+        """The text and tokens add_generation_prompt appends under these
+        request options; empty where the probe found none."""
+        return self.generation_prompts.get(_generation_key(options), ("", ()))
 
 
 class ChatTemplates:
@@ -117,11 +131,11 @@ class ChatTemplates:
             )
         if not all(isinstance(source, str) and source for source in named.values()):
             raise ChatTemplateError("the tokenizer defines no chat template")
-        render = _renderer(tokenizer)
+        render, encode = _renderer(tokenizer), _encoder(tokenizer)
         prepared = {}
         for source in named.values():
             if source not in prepared:
-                prepared[source] = _prepare(render, source)
+                prepared[source] = _prepare(render, encode, source)
         self.templates = {name: prepared[source] for name, source in named.items()}
 
     def select(self, tools):
@@ -146,6 +160,8 @@ class ChatTemplates:
         return " · ".join(
             ("" if name is None else f"{name} ")
             + _DESCRIPTIONS[template.later_system].format(template.original)
+            + ", "
+            + _generation_description(template.generation_prompts)
             for name, template in self.templates.items()
         )
 
@@ -165,6 +181,17 @@ _DESCRIPTIONS = {
 }
 
 
+def _generation_description(prompts):
+    """Startup log text for the generation prompts the probe found: their
+    token counts across reasoning efforts."""
+    counts = sorted({len(tokens) for _text, tokens in prompts.values()})
+    if not counts:
+        return "generation prompt unknown"
+    if counts[0] != counts[-1]:
+        return f"generation prompt {counts[0]}-{counts[-1]} tokens"
+    return f"generation prompt {counts[0]} {'token' if counts[0] == 1 else 'tokens'}"
+
+
 def _renderer(tokenizer):
     def render(source, messages, options):
         return render_chat_template(
@@ -174,15 +201,25 @@ def _renderer(tokenizer):
     return render
 
 
-def _prepare(render, source):
+def _encoder(tokenizer):
+    def encode(text):
+        return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    return encode
+
+
+def _prepare(render, encode, source):
     original = _original(render, source)
+    later_system = UNSUPPORTED
     if original == RENDERS:
-        return ChatTemplate(source, NATIVE, original)
-    if original in (REJECTS, DROPS):
+        later_system = NATIVE
+    elif original in (REJECTS, DROPS):
         patched = _patch(render, source, original)
         if patched is not None and _verified(render, source, patched):
-            return ChatTemplate(patched, PATCHED, original)
-    return ChatTemplate(source, UNSUPPORTED, original)
+            source, later_system = patched, PATCHED
+    return ChatTemplate(
+        source, later_system, original, _generation_prompts(render, encode, source)
+    )
 
 
 # Probe conversations. Leading system messages are already merged, as request
@@ -255,6 +292,47 @@ _OPTIONS = (
     ),
     {"add_generation_prompt": False},
 )
+
+
+# Conversations the generation prompt must be the same for: a question, a
+# follow-up after a reasoned answer, and a tool result.
+_FOLLOWED = ([_ASK], [_SYSTEM, _ASK, _THOUGHT, _NEXT], [_SYSTEM, _ASK, _CALL, _RESULT])
+
+
+def _generation_key(options):
+    """The template options that can shape the generation prompt."""
+    return options.get("enable_thinking"), options.get("reasoning_effort")
+
+
+def _generation_prompts(render, encode, source):
+    """What add_generation_prompt appends, with its tokens, for each reasoning
+    effort a request can pass: kept where every probe conversation renders
+    as a prefix of its prompt and gains the same non-empty text."""
+    prompts = {}
+    for effort in (None, *REASONING_EFFORTS):
+        options = template_options(
+            reasoning_effort=effort,
+            preserve_thinking=None,
+            tools=None,
+            add_generation_prompt=True,
+        )
+        texts = set()
+        for messages in _FOLLOWED:
+            prompt = _outcome(render, source, messages, options)
+            history = _outcome(
+                render, source, messages, {**options, "add_generation_prompt": False}
+            )
+            if not (
+                isinstance(prompt, str)
+                and isinstance(history, str)
+                and prompt.startswith(history)
+            ):
+                break
+            texts.add(prompt[len(history) :])
+        else:
+            if len(texts) == 1 and (text := texts.pop()):
+                prompts[_generation_key(options)] = (text, tuple(encode(text)))
+    return prompts
 
 
 def _outcome(render, source, messages, options):

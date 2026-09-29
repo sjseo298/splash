@@ -1,4 +1,5 @@
 #include "model/PreparedWeights.hpp"
+#include "StderrLine.hpp"
 
 #include <CommonCrypto/CommonDigest.h>
 #include <sys/file.h>
@@ -14,7 +15,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
-#include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <sstream>
@@ -203,8 +203,9 @@ std::string verifiedDigest(int fd, uint64_t from, const std::filesystem::path &p
   std::string digest = provenDigest(before, from, root);
   const bool missing = digest.empty();
   if (missing) {
-    std::clog << "Hashing " << path.string() << " (" << (uint64_t(before.st_size) - from) / (1024 * 1024)
-              << " MiB) once; later starts reuse the result" << std::endl;
+    writeStderrLine("Hashing " + path.string() + " (" +
+                    std::to_string((uint64_t(before.st_size) - from) / (1024 * 1024)) +
+                    " MiB) once; later starts reuse the result");
     digest = fileDigest(fd, from, check);
   }
   if (fstat(fd, &after)) fail("stat verified weights after read");
@@ -566,7 +567,7 @@ std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, con
   run(guards.check);
   run(guards.admitConversion);
   const auto started = std::chrono::steady_clock::now();
-  std::clog << "Preparing weights: " << weight.component << std::endl;
+  writeStderrLine("Preparing weights: " + weight.component);
   // This name belongs only to this key under the converter lock. An abandoned
   // staging directory is never a cache hit and is safe to replace.
   const auto staging = stagingPath(root_, weight.key);
@@ -583,7 +584,9 @@ std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, con
   }
   evictSuperseded(root_, weight);
   const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-  std::clog << "Prepared " << weight.component << " in " << seconds << " s" << std::endl;
+  std::ostringstream prepared;
+  prepared << "Prepared " << weight.component << " in " << seconds << " s";
+  writeStderrLine(prepared.str());
   run(guards.unchanged);
   return destination / "weights";
 }

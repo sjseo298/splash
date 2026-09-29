@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -322,6 +323,9 @@ def main(argv=None):
         import legacy
         import upstream
     try:
+        # The launcher starts this with the stop signals blocked, so that one
+        # sent while it starts is not lost; it arrives here.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         if args.command == "prepare":
             upstream.prepare(selection)
         else:
@@ -339,6 +343,8 @@ def main(argv=None):
     except (ModelError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        return 130
     return 0
 
 

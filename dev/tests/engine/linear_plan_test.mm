@@ -1062,7 +1062,7 @@ void ggufCoreLaws() {
   constexpr std::array<uint32_t, 16> widths{256, 512, 768, 1024, 1536, 2048, 3072, 4096, 5120,
                                             6144, 8192, 12288, 16384, 24576, 65536, 248320};
   constexpr std::array<uint32_t, 11> inputs{256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192, 12288, 17408};
-  for (const uint32_t family : {9U, 10U})
+  for (const uint32_t family : {9U, 10U, 11U})
     for (uint32_t cores = 0; cores <= 128; ++cores) {
       const Linear linear = gpu(family, cores), more = gpu(family, cores + 1), twice = gpu(family, 2 * cores);
       for (const uint32_t n : widths)
@@ -1110,14 +1110,16 @@ void ggufCoreLaws() {
   // on Apple9.
   for (uint32_t cores = 1; cores <= 128; ++cores)
     for (const uint32_t n : {16U, 64U, 256U, 1024U}) {
-      const Linear linear = gpu(10, cores), more = gpu(10, cores + 1);
-      bool accelerator = false;
-      for (uint32_t rows = 1; rows <= 2048; ++rows) {
-        const bool now = linear.ggufFloatTile(rows, n) == FloatTile::NeuralAccelerator;
-        require((!accelerator || now) && (!now || rows >= 16) &&
-                    (more.ggufFloatTile(rows, n) == FloatTile::Simdgroup || now),
-                "GGUF float tile is not monotone in rows and cores");
-        accelerator = now;
+      for (const uint32_t family : {10U, 11U}) {
+        const Linear linear = gpu(family, cores), more = gpu(family, cores + 1);
+        bool accelerator = false;
+        for (uint32_t rows = 1; rows <= 2048; ++rows) {
+          const bool now = linear.ggufFloatTile(rows, n) == FloatTile::NeuralAccelerator;
+          require((!accelerator || now) && (!now || rows >= 16) &&
+                      (more.ggufFloatTile(rows, n) == FloatTile::Simdgroup || now),
+                  "GGUF float tile is not monotone in rows and cores");
+          accelerator = now;
+        }
       }
       require(gpu(9, cores).ggufFloatTile(2048, n) == FloatTile::Simdgroup, "Apple9 GGUF float tile");
     }

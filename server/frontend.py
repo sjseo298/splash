@@ -86,20 +86,31 @@ MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
 RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
 
 
+# Text completions' output budget when max_tokens is omitted: OpenAI's
+# default for the endpoint, which vLLM and SGLang also use.
+COMPLETION_DEFAULT_MAX_TOKENS = 16
+
+
 # A stable marker lets repeated image requests reuse the compiled template.
 IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
 
 
-def _thinking_from_prefix(rendered):
-    marker = "<|im_start|>"
-    start = rendered.rfind(marker)
-    prefix = rendered[start + len(marker) :] if start >= 0 else ""
-    if not prefix.startswith("assistant\n") or "<|im_end|>" in prefix:
+def _generation_prompt(probed, rendered, tokens):
+    """Whether the generation prompt opens a think block, and how many of the
+    prompt's last tokens it is (zero where they differ from its tokens).
+    `probed` is its text and tokens, as the startup probe found them for the
+    request's template options, and the rendered prompt must end with that
+    text."""
+    text, ids = probed
+    if not text or not rendered.endswith(text):
         raise APIError(
             400, "chat template must end with an assistant generation prefix"
         )
-    content = prefix[len("assistant\n") :]
-    return content.rfind("<think>") > content.rfind(THINK_END)
+    count = len(ids)
+    return (
+        text.rfind("<think>") > text.rfind(THINK_END),
+        count if count < len(tokens) and tuple(tokens[-count:]) == ids else 0,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +212,19 @@ class RenderedPrompt:
     images: list
     image_positions: list[int]
     thinking: bool
+    # Images precede the generation prompt; expanding them keeps this count.
+    generation_prompt_tokens: int
+
+
+@dataclass(frozen=True)
+class GenerationOptions:
+    """Sampling and stop options, validated alike by every generation API."""
+
+    temperature: float
+    top_p: float
+    top_k: int
+    stop_sequences: tuple[str, ...]
+    ignore_eos: bool
 
 
 def validate_served_model_name(value):
@@ -454,6 +478,78 @@ class Frontend:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
             return self._prepare(body, tool_namespaces, deadline, clamp_output_budget)
+
+    def prepare_completion(self, body, *, deadline=None):
+        """A text completion: the prompt generates as given, with no chat
+        template, reasoning split, tools or images."""
+        if deadline is None:
+            deadline = self.request_deadline(body)
+        with self._preparation(deadline):
+            nullable = {
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "n",
+                "best_of",
+                "presence_penalty",
+                "frequency_penalty",
+                "max_tokens",
+                "suffix",
+                "echo",
+                "logprobs",
+            }
+            body = {
+                key: value
+                for key, value in body.items()
+                if value is not None or key not in nullable
+            }
+            if not self.accepts_model(body.get("model", self.model)):
+                raise APIError(
+                    404, f"model {body['model']} not found", "model_not_found"
+                )
+            # A request generates one text and returns only that text.
+            for field in ("suffix", "logprobs"):
+                if field in body:
+                    raise APIError(400, f"{field} is not supported")
+            if body.get("echo", False) is not False:
+                raise APIError(400, "echo is not supported")
+            for field in ("best_of", "n"):
+                value = body.get(field, 1)
+                if not isinstance(value, int) or isinstance(value, bool) or value != 1:
+                    raise APIError(400, f"{field} must be 1")
+            options = self._generation_options(body)
+            prompt_tokens = self._completion_prompt(body.get("prompt"))
+            remaining_request_time(deadline)
+            # The default is a ceiling: a prompt that leaves less context
+            # generates up to the rest.
+            requested = body.get("max_tokens")
+            max_new = self._output_budget(
+                COMPLETION_DEFAULT_MAX_TOKENS if requested is None else requested,
+                prompt_tokens,
+                "max_tokens",
+                clamp=requested is None,
+            )
+            return self._generation_job(body, options, prompt_tokens, max_new, deadline)
+
+    def _completion_prompt(self, prompt):
+        """A string encodes as a raw prompt, with the tokenizer's own special
+        tokens such as a BOS; token ids must be in its vocabulary."""
+        if isinstance(prompt, str):
+            try:
+                tokens = self._tokenize(prompt, add_special_tokens=True)["input_ids"]
+            except Exception as error:
+                raise APIError(400, "prompt could not be tokenized") from error
+        elif isinstance(prompt, list) and all(type(token) is int for token in prompt):
+            vocabulary = len(self.tokenizer)
+            if any(not 0 <= token < vocabulary for token in prompt):
+                raise APIError(400, "prompt token ids must be in the vocabulary")
+            tokens = prompt
+        else:
+            raise APIError(400, "prompt must be one string or one array of token ids")
+        if not tokens:
+            raise APIError(400, "prompt must not be empty")
+        return list(tokens)
 
     def count_tokens(self, body, *, deadline=None):
         if deadline is None:
@@ -803,7 +899,11 @@ class Frontend:
             )
             raise APIError(400, "messages could not be rendered") from error
         remaining_request_time(deadline)
-        thinking = _thinking_from_prefix(rendered) if add_generation_prompt else False
+        thinking, generation_prompt_tokens = False, 0
+        if add_generation_prompt:
+            thinking, generation_prompt_tokens = _generation_prompt(
+                chat_template.generation_prompt(template), rendered, tokens
+            )
         if (
             add_generation_prompt
             and prompt.reasoning_effort is not None
@@ -812,7 +912,9 @@ class Frontend:
             raise APIError(
                 400, "chat template does not support the requested thinking mode"
             )
-        return RenderedPrompt(rendered, tokens, images, positions, thinking)
+        return RenderedPrompt(
+            rendered, tokens, images, positions, thinking, generation_prompt_tokens
+        )
 
     def _prepare(self, body, tool_namespaces, deadline, clamp_output_budget=False):
         nullable = {
@@ -834,6 +936,95 @@ class Frontend:
             if value is not None or key not in nullable
         }
         prompt = self._prepare_prompt(body, tool_namespaces, deadline=deadline)
+        options = self._generation_options(body)
+        n = body.get("n", 1)
+        logprobs = body.get("logprobs")
+        if (
+            not isinstance(n, int)
+            or isinstance(n, bool)
+            or n != 1
+            or (logprobs is not None and (not isinstance(logprobs, bool) or logprobs))
+        ):
+            raise APIError(400, "n and logprobs are not currently supported")
+        tools, tool_policy = prompt.tools, prompt.tool_policy
+        response_schema, response_validator = (
+            prompt.response_schema,
+            prompt.response_validator,
+        )
+        # A stop sequence could cut a tool call or a structured result short;
+        # under tool_choice none the tools are only described, never called.
+        if options.stop_sequences and (
+            (tools and tool_policy.schemas) or response_schema is not None
+        ):
+            raise APIError(
+                400, "stop cannot be combined with tools or structured output"
+            )
+        # Tools and structured output generate under a grammar, which decides
+        # where the output ends.
+        constrained = bool(tools) or response_schema is not None
+        if options.ignore_eos and constrained:
+            raise APIError(
+                400, "ignore_eos cannot be combined with tools or structured output"
+            )
+        rendered = self._render_prompt(prompt, deadline)
+        prompt_tokens, prepared_images = rendered.tokens, rendered.images
+        image_positions, thinking = rendered.image_positions, rendered.thinking
+        constraint = None
+        remaining_request_time(deadline)
+        if constrained:
+            with self.latencies.measure("grammar"):
+                if tools:
+                    constraint = self.constraint_factory.create(
+                        tool_grammar(tool_policy, thinking, response_schema),
+                        timeout=remaining_request_time(deadline),
+                    )
+                elif response_schema is not None:
+                    constraint = self.constraint_factory.create(
+                        json_grammar(response_schema, thinking),
+                        timeout=remaining_request_time(deadline),
+                    )
+        remaining_request_time(deadline)
+        tools_signature = None
+        if tools:
+            digest = hashlib.sha1(
+                json.dumps(tools, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()[:8]
+            tools_signature = (len(tools), digest)
+        image_spans, image_pixels = (), b""
+        if prepared_images:
+            prompt_tokens, image_spans, image_pixels = self._expand_image_pads(
+                prompt_tokens, prepared_images, image_positions
+            )
+        remaining_request_time(deadline)
+        max_new = self._output_budget(
+            body.get("max_completion_tokens", body.get("max_tokens")),
+            prompt_tokens,
+            "max_completion_tokens",
+            clamp_output_budget,
+        )
+        job = self._generation_job(
+            body,
+            options,
+            prompt_tokens,
+            max_new,
+            deadline,
+            thinking=thinking,
+            thinking_display=(
+                "omitted" if body.get("thinking_display") == "omitted" else "summarized"
+            ),
+            tool_policy=tool_policy,
+            response_validator=response_validator,
+            response_format=body.get("response_format"),
+            constraint=constraint,
+            image_spans=image_spans,
+            image_pixels=image_pixels,
+            image_owner=prepared_images if prepared_images else None,
+            tools_signature=tools_signature,
+            generation_prompt_tokens=rendered.generation_prompt_tokens,
+        )
+        return job, thinking, bool(tools)
+
+    def _generation_options(self, body):
         temperature = body.get("temperature", 1.0)
         top_p, top_k = body.get("top_p", 0.95), body.get("top_k", 20)
         if (
@@ -862,15 +1053,6 @@ class Frontend:
             stop_sequences = tuple(stop)
         else:
             raise APIError(400, "stop must be a string or up to four strings")
-        n = body.get("n", 1)
-        logprobs = body.get("logprobs")
-        if (
-            not isinstance(n, int)
-            or isinstance(n, bool)
-            or n != 1
-            or (logprobs is not None and (not isinstance(logprobs, bool) or logprobs))
-        ):
-            raise APIError(400, "n and logprobs are not currently supported")
         penalties = (
             body.get("presence_penalty", 0),
             body.get("frequency_penalty", 0),
@@ -882,103 +1064,63 @@ class Frontend:
             raise APIError(
                 400, "the requested logits or output transformation is not supported"
             )
-        tools, tool_policy = prompt.tools, prompt.tool_policy
-        response_schema, response_validator = (
-            prompt.response_schema,
-            prompt.response_validator,
-        )
-        # A stop sequence could cut a tool call or a structured result short;
-        # under tool_choice none the tools are only described, never called.
-        if stop_sequences and (
-            (tools and tool_policy.schemas) or response_schema is not None
-        ):
-            raise APIError(
-                400, "stop cannot be combined with tools or structured output"
-            )
-        rendered = self._render_prompt(prompt, deadline)
-        prompt_tokens, prepared_images = rendered.tokens, rendered.images
-        image_positions, thinking = rendered.image_positions, rendered.thinking
-        constraint = None
-        remaining_request_time(deadline)
-        if tools or response_schema is not None:
-            with self.latencies.measure("grammar"):
-                if tools:
-                    constraint = self.constraint_factory.create(
-                        tool_grammar(tool_policy, thinking, response_schema),
-                        timeout=remaining_request_time(deadline),
-                    )
-                elif response_schema is not None:
-                    constraint = self.constraint_factory.create(
-                        json_grammar(response_schema, thinking),
-                        timeout=remaining_request_time(deadline),
-                    )
-        remaining_request_time(deadline)
-        tools_signature = None
-        if tools:
-            digest = hashlib.sha1(
-                json.dumps(tools, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()[:8]
-            tools_signature = (len(tools), digest)
-        image_spans, image_pixels = (), b""
-        if prepared_images:
-            prompt_tokens, image_spans, image_pixels = self._expand_image_pads(
-                prompt_tokens, prepared_images, image_positions
-            )
-        remaining_request_time(deadline)
+        ignore_eos = body.get("ignore_eos", False)
+        if not isinstance(ignore_eos, bool):
+            raise APIError(400, "ignore_eos must be a boolean")
+        return GenerationOptions(temperature, top_p, top_k, stop_sequences, ignore_eos)
+
+    def _output_budget(self, requested, prompt_tokens, field, clamp=False):
+        """The output token budget, requested under the API's field name or
+        the server default, within the context window the prompt leaves."""
         if len(prompt_tokens) >= self.max_context:
             raise ContextLengthError(len(prompt_tokens), self.max_context - 1)
-        max_new = body.get(
-            "max_completion_tokens",
-            body.get(
-                "max_tokens",
-                min(self.default_max_new, self.max_context - len(prompt_tokens)),
-            ),
+        remaining = self.max_context - len(prompt_tokens)
+        max_new = (
+            min(self.default_max_new, remaining) if requested is None else requested
         )
         if not isinstance(max_new, int) or isinstance(max_new, bool) or max_new <= 0:
-            raise APIError(400, "max_completion_tokens must be a positive integer")
-        if len(prompt_tokens) + max_new > self.max_context:
-            if not clamp_output_budget:
+            raise APIError(400, f"{field} must be a positive integer")
+        if max_new > remaining:
+            if not clamp:
                 raise APIError(
                     400,
-                    "prompt and max_completion_tokens exceed the context window",
+                    f"prompt and {field} exceed the context window",
                     "context_length_exceeded",
                 )
             # This API treats the output budget as a ceiling. Generate up to
             # the remaining context and report the length stop if it is reached.
-            max_new = self.max_context - len(prompt_tokens)
+            max_new = remaining
+        return max_new
+
+    def _generation_job(
+        self, body, options, prompt_tokens, max_new, deadline, **fields
+    ):
+        """The job for a prepared prompt, with the endpoint's own fields."""
         seed = body.get("seed")
         if seed is None:
             seed = secrets.randbits(64)
         if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**64:
             raise APIError(400, "seed must be an unsigned 64-bit integer")
         priority = self._priority(body)
-        request_id = next(self.ids)
-        job = Job(
-            request_id=request_id,
+        return Job(
+            request_id=next(self.ids),
             prompt_tokens=prompt_tokens,
             max_new_tokens=max_new,
             seed=seed,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
+            temperature=options.temperature,
+            top_p=options.top_p,
+            top_k=options.top_k,
             deadline=deadline,
             priority=priority,
-            stop_sequences=stop_sequences,
-            thinking=thinking,
-            thinking_display=(
-                "omitted" if body.get("thinking_display") == "omitted" else "summarized"
+            stop_sequences=options.stop_sequences,
+            flags=(
+                wire.RequestFlag.IGNORE_END_OF_SEQUENCE
+                if options.ignore_eos
+                else wire.RequestFlag(0)
             ),
-            tool_policy=tool_policy,
-            response_validator=response_validator,
-            response_format=body.get("response_format"),
-            constraint=constraint,
-            image_spans=image_spans,
-            image_pixels=image_pixels,
-            image_owner=prepared_images if prepared_images else None,
             public_id=secrets.token_hex(16),
-            tools_signature=tools_signature,
+            **fields,
         )
-        return job, thinking, bool(tools)
 
     def prepare_responses(self, body, *, deadline=None, reserve_input=None):
         if deadline is None:

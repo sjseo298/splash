@@ -237,9 +237,13 @@ class AnthropicHTTPContractTest(unittest.TestCase):
 
     def test_keep_all_forwards_history_and_agrees_with_generation_count(self):
         class InputTokenizer(test_server.FakeTokenizer):
-            def apply_chat_template(self, messages, **kwargs):
-                prefix = super().apply_chat_template(messages, **kwargs)
-                return json.dumps([messages, kwargs], sort_keys=True) + prefix
+            def apply_chat_template(
+                self, messages, add_generation_prompt=False, **kwargs
+            ):
+                prompt = super().apply_chat_template(
+                    messages, add_generation_prompt=add_generation_prompt, **kwargs
+                )
+                return json.dumps([messages, kwargs], sort_keys=True) + prompt
 
             def __call__(self, text, **_kwargs):
                 return {"input_ids": list(text.encode())}

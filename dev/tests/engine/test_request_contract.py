@@ -112,6 +112,8 @@ class RequestContractTests(unittest.TestCase):
     def test_unsupported_http_version_is_rejected_before_header_validation(self):
         handler = object.__new__(api.FrontendHandler)
         handler._header_timer = mock.Mock()
+        handler.server = mock.Mock()
+        handler.connection = mock.Mock()
         handler.request_version = "HTTP/0.9"
         handler.headers = {}
         handler.send_error = mock.Mock()
@@ -153,10 +155,17 @@ class RequestContractTests(unittest.TestCase):
         harness = Harness(RejectBeforeStart())
         harness.server.RequestHandlerClass = DelayedHandler
         self.addCleanup(harness.close)
-        for path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
+        for path in (
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/v1/messages",
+        ):
             body = {"model": "test-model", "stream": True, "max_tokens": 16}
             if path == "/v1/responses":
                 body["input"] = "hello"
+            elif path == "/v1/completions":
+                body["prompt"] = "hello"
             else:
                 body["messages"] = [{"role": "user", "content": "hello"}]
             with self.subTest(path=path):

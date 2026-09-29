@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from dev.tests import test_server as fixtures
+from dev.tests.engine.test_launcher import keep_stop_signals
 from install import launcher
 from server import chat_templates
 from server import server as api
@@ -183,6 +184,7 @@ class DefaultReasoningTests(unittest.TestCase):
                     )
 
     def test_cli_over_environment_and_launcher_forwarding(self):
+        keep_stop_signals(self)
         self.assertEqual(chat_templates.REASONING_EFFORTS, launcher.REASONING_EFFORTS)
         for env, explicit, expected in (
             (None, None, None),

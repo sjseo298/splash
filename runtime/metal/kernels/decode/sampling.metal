@@ -63,10 +63,12 @@ __attribute__((always_inline)) inline void top_shard_store(
 
 // Keep the existing sparse-buffer layout for both top-1 and top-32. The
 // choice is uniform across a threadgroup; greedy lanes need only one winner.
+// A lane that excludes the stop tokens never keeps one.
 template <uint K>
 __attribute__((always_inline)) inline void target_top_shard(
     device const float *source, uint vocabulary,
     device const uint *token_mask, bool constrained, ulong mask_origin,
+    bool exclude_stop, uint stop_token_0, uint stop_token_1,
     device uint *partial_ids, device float *partial_values,
     uint group, uint thread_index, uint lane, uint simd_group,
     threadgroup float *group_values, threadgroup uint *group_ids) {
@@ -81,6 +83,8 @@ __attribute__((always_inline)) inline void target_top_shard(
        token += Shards * 256) {
     if (constrained &&
         (token_mask[mask_origin + token / 32] & (1u << (token % 32))) == 0)
+      continue;
+    if (exclude_stop && (token == stop_token_0 || token == stop_token_1))
       continue;
     top_insert<K>(values, ids, source[token], token);
   }
@@ -200,12 +204,16 @@ decode_sample_top32_sharded(device const float *logits [[buffer(0)]],
   ulong mask_origin = ulong(params.mask_row_offset + row) * params.mask_words;
   if (params.top_k == 1)
     target_top_shard<1>(source, params.vocabulary, token_mask, params.constrained,
-                        mask_origin, partial_ids, partial_values,
+                        mask_origin, params.exclude_stop_tokens,
+                        params.stop_token_0, params.stop_token_1,
+                        partial_ids, partial_values,
                         group, thread_index, lane, simd_group,
                         group_values, group_ids);
   else
     target_top_shard<32>(source, params.vocabulary, token_mask, params.constrained,
-                         mask_origin, partial_ids, partial_values,
+                         mask_origin, params.exclude_stop_tokens,
+                         params.stop_token_0, params.stop_token_1,
+                         partial_ids, partial_values,
                          group, thread_index, lane, simd_group,
                          group_values, group_ids);
 }
@@ -263,17 +271,20 @@ kernel void decode_sample_top32_sharded_batch(
     return;
   device const float *source = logits + ulong(global_row) * params.vocabulary;
   bool constrained = (params.constrained_mask & (1u << batch)) != 0;
+  bool exclude_stop = (params.exclude_stop_mask & (1u << batch)) != 0;
   ulong mask_origin =
       ulong(batch) * (SPLASH_TARGET_VERIFY_ROWS + 1) * params.mask_words +
       ulong(row + 1) * params.mask_words;
   if (params.top_k[batch] == 1)
     target_top_shard<1>(source, params.vocabulary, token_mask, constrained,
-                        mask_origin, partial_ids, partial_values,
+                        mask_origin, exclude_stop, params.stop_token_0,
+                        params.stop_token_1, partial_ids, partial_values,
                         group, thread_index, lane, simd_group,
                         group_values, group_ids);
   else
     target_top_shard<32>(source, params.vocabulary, token_mask, constrained,
-                         mask_origin, partial_ids, partial_values,
+                         mask_origin, exclude_stop, params.stop_token_0,
+                         params.stop_token_1, partial_ids, partial_values,
                          group, thread_index, lane, simd_group,
                          group_values, group_ids);
 }

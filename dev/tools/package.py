@@ -67,6 +67,7 @@ SERVER_FILES = (
     "schema_validation.py",
     "crash_trace.py",
     "chat.html",
+    "favicon.svg",
 )
 # Splash's license and the notices of the third-party code it ships.
 LICENSE_FILES = ("LICENSE", "THIRD_PARTY_NOTICES")

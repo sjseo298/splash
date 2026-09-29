@@ -1030,6 +1030,44 @@ def completion_response(model, job, result, message, tool_calls):
     }
 
 
+def text_completion_response(model, job, result, text):
+    return {
+        "id": f"cmpl-{job.public_id}",
+        "object": "text_completion",
+        "created": job.created_at,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "text": text,
+                "logprobs": None,
+                "finish_reason": result.reason,
+            }
+        ],
+        "usage": usage_dict(result, job),
+        "metrics": metrics_dict(result),
+        "timings": timings_dict(result),
+    }
+
+
+def _chunk(object_type, chunk_id, created, model, choice, usage, metrics, timings):
+    chunk = {
+        "id": chunk_id,
+        "object": object_type,
+        "created": created,
+        "model": model,
+        "choices": [choice],
+    }
+    if usage is not None:
+        chunk["choices"] = []
+        chunk["usage"] = usage
+    if metrics is not None:
+        chunk["metrics"] = metrics
+    if timings is not None:
+        chunk["timings"] = timings
+    return chunk
+
+
 def stream_chunk(
     model,
     request_id,
@@ -1040,21 +1078,38 @@ def stream_chunk(
     metrics=None,
     timings=None,
 ):
-    chunk = {
-        "id": f"chatcmpl-{request_id}",
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-    }
-    if usage is not None:
-        chunk["choices"] = []
-        chunk["usage"] = usage
-    if metrics is not None:
-        chunk["metrics"] = metrics
-    if timings is not None:
-        chunk["timings"] = timings
-    return chunk
+    return _chunk(
+        "chat.completion.chunk",
+        f"chatcmpl-{request_id}",
+        created,
+        model,
+        {"index": 0, "delta": delta, "finish_reason": finish_reason},
+        usage,
+        metrics,
+        timings,
+    )
+
+
+def text_completion_chunk(
+    model,
+    request_id,
+    created,
+    text,
+    finish_reason=None,
+    usage=None,
+    metrics=None,
+    timings=None,
+):
+    return _chunk(
+        "text_completion",
+        f"cmpl-{request_id}",
+        created,
+        model,
+        {"index": 0, "text": text, "logprobs": None, "finish_reason": finish_reason},
+        usage,
+        metrics,
+        timings,
+    )
 
 
 def responses_item(job, kind, value, index=0, status="completed"):

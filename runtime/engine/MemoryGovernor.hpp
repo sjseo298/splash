@@ -73,6 +73,9 @@ struct MemoryGovernorSnapshot {
   // Charged against the limit: the backend's resident buffers plus the
   // untracked reserve, or the device's allocation when that is larger.
   uint64_t observedResidentBytes = 0;
+  // The observed resident bytes once warmup released all but one lane's
+  // state and the KV runway (markServingFootprint); zero until then.
+  uint64_t servingFootprintBytes = 0;
   uint64_t reservedBytes = 0;
   uint64_t headroomBytes = 0;
   MemoryPressure pressure = MemoryPressure::Normal;
@@ -84,6 +87,9 @@ struct MemoryGovernorSnapshot {
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
   bool growthAllowed = true;
+  // Whether the host has room for growth beyond the serving footprint.
+  // Growth back to that footprint needs only the host's reserve, so
+  // tryReserve can grant it while this is false.
   bool hostGrowthAllowed = true;
 };
 
@@ -189,6 +195,10 @@ public:
   // A pass that releases or waits for memory again, or the host's recovery,
   // ends the waiver.
   void reclaimed(ReclaimOutcome outcome) noexcept;
+  // Records what is resident once warmup has released all but one lane's
+  // state and the KV runway: the footprint a request is served from. Growth
+  // back to it needs only the host's reserve (tryReserve).
+  void markServingFootprint() noexcept;
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
 private:
@@ -214,6 +224,7 @@ private:
   uint64_t untrackedReserveBytes_ = 0;
   mutable std::mutex mutex_;
   uint64_t reservedBytes_ = 0;
+  uint64_t servingFootprintBytes_ = 0;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   mutable bool hostConstrained_ = false;

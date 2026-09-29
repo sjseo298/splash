@@ -65,15 +65,18 @@ Sampling::Sampling(metal::MetalBackend &backend, uint32_t vocabulary,
 
 void Sampling::addInitial(metal::CommandGraph &graph,
                           const SamplingPolicy &policy,
-                          SamplingBuffers buffers,
-                          uint32_t rowOffset) const {
+                          SamplingBuffers buffers, uint32_t rowOffset,
+                          uint32_t stopToken0, uint32_t stopToken1) const {
   if (rowOffset >= rowsPerLane_)
     throw std::invalid_argument("invalid initial sampling row");
-  if (policy.samples() || policy.constrained) {
+  // The argmax kernels read every token, so a greedy lane that skips some
+  // takes its one winner from the top-32 kernels, as a constrained one does.
+  if (policy.samples() || policy.constrained || policy.excludesStopTokens) {
     const EffectivePolicy effective = effectivePolicy(policy);
     const TargetSamplingParams params{
         vocabulary_, rowOffset, effective.topK, effective.temperature,
-        effective.topP, maskWords_, 0, policy.constrained ? 1U : 0U};
+        effective.topP, maskWords_, 0, policy.constrained ? 1U : 0U,
+        policy.excludesStopTokens ? 1U : 0U, stopToken0, stopToken1};
     graph.add("decode_sample_top32_sharded",
               {buffers.logits, buffers.partialIds, buffers.partialValues,
                buffers.constraintMasks},
@@ -112,7 +115,8 @@ void Sampling::addInitial(metal::CommandGraph &graph,
 
 void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
-                         SamplingBuffers buffers) const {
+                         SamplingBuffers buffers, uint32_t stopToken0,
+                         uint32_t stopToken1) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
   const uint32_t lanes = static_cast<uint32_t>(policies.size());
@@ -125,7 +129,10 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   const bool greedy = std::any_of(
       policies.begin(), policies.end(),
       [](const SamplingPolicy &policy) { return !policy.samples(); });
-  const bool distributed = constrained || sampling;
+  const bool excludesStop = std::any_of(
+      policies.begin(), policies.end(),
+      [](const SamplingPolicy &policy) { return policy.excludesStopTokens; });
+  const bool distributed = constrained || sampling || excludesStop;
   const uint32_t rows = lanes * rowsPerLane_;
 
   if (!distributed) {
@@ -144,6 +151,8 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   params.rows_per_lane = rowsPerLane_;
   params.lanes = lanes;
   params.mask_words = maskWords_;
+  params.stop_token_0 = stopToken0;
+  params.stop_token_1 = stopToken1;
   for (uint32_t lane = 0; lane < kMaximumLanes; ++lane) {
     const SamplingPolicy &policy = policies[std::min(lane, lanes - 1)];
     const EffectivePolicy effective = effectivePolicy(policy);
@@ -152,6 +161,8 @@ void Sampling::addVerify(metal::CommandGraph &graph,
     params.top_p[lane] = effective.topP;
     if (lane < lanes && policy.constrained)
       params.constrained_mask |= uint32_t{1} << lane;
+    if (lane < lanes && policy.excludesStopTokens)
+      params.exclude_stop_mask |= uint32_t{1} << lane;
   }
   graph.add("decode_sample_top32_sharded_batch",
             {buffers.logits, buffers.partialIds, buffers.partialValues,

@@ -30,7 +30,7 @@ void devicePolicyPlans() {
   constexpr std::array devices{std::array{0U, 512U}, std::array{1U, 26U},
       std::array{10U, 260U}, std::array{16U, 416U}, std::array{20U, 520U},
       std::array{40U, 1040U}, std::array{80U, 2080U}};
-  for (uint32_t family : {9U, 10U}) {
+  for (uint32_t family : {9U, 10U, 11U}) {
     for (const auto &[cores, threshold] : devices) {
       splash::DeviceCapabilities device;
       device.appleGpuFamily = family;

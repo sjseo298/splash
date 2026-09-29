@@ -17,10 +17,15 @@ struct TargetSamplingParams {
   uint32_t mask_words;
   uint32_t mask_row_offset;
   uint32_t constrained;
+  // Nonzero when the lane ignores end-of-sequence: it never selects a stop
+  // token.
+  uint32_t exclude_stop_tokens;
+  uint32_t stop_token_0;
+  uint32_t stop_token_1;
 };
 
-static_assert(sizeof(TargetSamplingParams) == 32,
-              "Target sampling parameters are 32 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 44,
+              "Target sampling parameters are 44 bytes on both sides");
 
 struct TargetSamplingBatchParams {
   uint32_t vocabulary;
@@ -31,10 +36,14 @@ struct TargetSamplingBatchParams {
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   float top_p[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t constrained_mask;
+  // Lanes that ignore end-of-sequence: they never select a stop token.
+  uint32_t exclude_stop_mask;
+  uint32_t stop_token_0;
+  uint32_t stop_token_1;
 };
 
-static_assert(sizeof(TargetSamplingBatchParams) == 68,
-              "Batched target sampling parameters are 68 bytes on both sides");
+static_assert(sizeof(TargetSamplingBatchParams) == 80,
+              "Batched target sampling parameters are 80 bytes on both sides");
 
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];

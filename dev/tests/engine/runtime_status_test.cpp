@@ -1,10 +1,18 @@
 #include "TestModel.hpp"
 #include "engine/RuntimeResources.hpp"
+#include "StderrLine.hpp"
 #include "engine/Status.hpp"
 
+#include <unistd.h>
+
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 using namespace splash;
 using namespace splash::engine;
@@ -141,6 +149,7 @@ void testCleanRuntimeStatus() {
   MemoryGovernorSnapshot governor;
   governor.limitBytes = memoryPlan.breakdown().hardBudgetBytes;
   governor.observedResidentBytes = metal.allocatedBytes;
+  governor.servingFootprintBytes = 3 * kGiB;
   governor.headroomBytes = governor.limitBytes - governor.observedResidentBytes;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
@@ -238,6 +247,9 @@ void testCleanRuntimeStatus() {
               json.find("\"host_headroom_bytes\":" + std::to_string(6 * kGiB)) !=
                   std::string::npos,
           "status omitted the host-side growth constraints");
+  require(json.find("\"serving_footprint_bytes\":" + std::to_string(3 * kGiB)) !=
+              std::string::npos,
+          "status omitted the serving footprint");
   require(json.find("\"resident_bytes\":350224384") != std::string::npos &&
               json.find("\"warm_idle_cells\":1") != std::string::npos &&
               json.find("\"scope\":\"startup_warmup\"") != std::string::npos,
@@ -495,6 +507,37 @@ void testResourceWaitDiagnostics() {
   require(reporter.update(wait, true).empty(), "concurrency queue logged pressure");
 }
 
+// The server and the runtime share stderr, as `serve > log 2>&1` does: a
+// line written from any thread arrives whole.
+void testStderrLinesStayWhole() {
+  std::FILE *log = std::tmpfile();
+  require(log != nullptr, "no temporary file");
+  const int saved = ::dup(STDERR_FILENO);
+  ::dup2(::fileno(log), STDERR_FILENO);
+  std::vector<std::thread> writers;
+  for (int writer = 0; writer < 8; ++writer)
+    writers.emplace_back([writer] {
+      for (int line = 0; line < 300; ++line)
+        writeStderrLine("writer " + std::to_string(writer) + " line " +
+                        std::to_string(line));
+    });
+  for (std::thread &writer : writers)
+    writer.join();
+  ::dup2(saved, STDERR_FILENO);
+  ::close(saved);
+  std::rewind(log);
+  std::ostringstream text;
+  for (int character; (character = std::fgetc(log)) != EOF;)
+    text.put(static_cast<char>(character));
+  std::fclose(log);
+  std::istringstream lines(text.str());
+  const std::regex whole("writer [0-7] line [0-9]+");
+  int count = 0;
+  for (std::string line; std::getline(lines, line); ++count)
+    require(std::regex_match(line, whole), "a stderr line was broken");
+  require(count == 8 * 300, "stderr lines were lost or merged");
+}
+
 } // namespace
 
 int main() {
@@ -504,6 +547,7 @@ int main() {
     testWarmupStatesPreserveReadinessAndMeasurementTruth();
     testMemoryPressureTelemetry();
     testResourceWaitDiagnostics();
+    testStderrLinesStayWhole();
     std::cout << "runtime status tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

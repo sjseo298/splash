@@ -11,11 +11,6 @@ namespace {
 constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 
-uint32_t replayStateBoundary(uint32_t tokens) noexcept {
-  return tokens > 1 ? (tokens - 1) / KvCache::pageTokens * KvCache::pageTokens
-                    : 0;
-}
-
 } // namespace
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
@@ -39,6 +34,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
 void Engine::submit(EngineRequest value) {
   const bool scoring = !value.scoreTokens.empty();
   if (!value.id || value.prompt.empty() ||
+      value.generationPromptTokens >= value.prompt.size() ||
       (scoring ? value.maxNewTokens != 0 : !value.maxNewTokens) ||
       value.prompt.size() + value.maxNewTokens > config_.maxContext ||
       !std::isfinite(value.deadlineMilliseconds) ||
@@ -92,6 +88,7 @@ void Engine::submit(EngineRequest value) {
     }
   }
   Request requestState;
+  requestState.sequence = counters_.submitted;
   requestState.promptTokens = static_cast<uint32_t>(value.prompt.size());
   requestState.replayTokens = requestState.promptTokens;
   requestState.request = std::move(value);
@@ -176,13 +173,30 @@ bool Engine::tick(double now) {
     progressed = true;
   }
   progressed = pollRestores(now) || progressed;
+  // The earliest submitted of the lanes with work in flight.
+  uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
+  if (pending_) {
+    for (const BatchItem &item : pending_->plan.items)
+      earliestWorking = std::min(earliestWorking, request(item.requestId).sequence);
+  }
+  const bool draining = drainingForRecovery();
   for (auto &[_, active] : requests_) {
-    // Admission is deliberately paused while resident peers finish. Keep the
-    // original memory wait budget active so a suspended lane cannot stall
-    // indefinitely behind a long-running peer.
-    if (!active.finalized && active.resourceWait.deadlineMilliseconds > 0.0 &&
-        now >= active.resourceWait.deadlineMilliseconds) {
-      finishFailure(active, {"resource_timeout", "memory did not become available within the resource wait limit", true});
+    // Admission is deliberately paused while resident peers finish. Start a
+    // fresh resource wait only if admission still fails after that drain.
+    if (draining) {
+      active.resourceWait.deadlineMilliseconds = 0.0;
+      continue;
+    }
+    // A lane submitted earlier holds memory this request may wait for until
+    // it finishes; while it works, the wait's limit restarts.
+    if (active.sequence > earliestWorking)
+      active.resourceWait.earlierLaneWorkMilliseconds = now;
+    const double deadline = resourceDeadline(active);
+    if (!active.finalized && deadline > 0.0 && now >= deadline) {
+      std::string message = "memory did not become available within the resource wait limit";
+      if (active.resourceWait.allocationFailure == metal::AllocationFailure::HostPressure)
+        message += ": macOS is short of memory; close memory-heavy applications";
+      finishFailure(active, {"resource_timeout", std::move(message), true});
       progressed = true;
     }
   }
@@ -283,9 +297,9 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
       continue;
     if (!result || active.request.deadlineMilliseconds < *result)
       result = active.request.deadlineMilliseconds;
-    if (active.resourceWait.deadlineMilliseconds > 0.0 &&
-        (!result || active.resourceWait.deadlineMilliseconds < *result))
-      result = active.resourceWait.deadlineMilliseconds;
+    const double deadline = resourceDeadline(active);
+    if (!draining && deadline > 0.0 && (!result || deadline < *result))
+      result = deadline;
     if (draining || pending_ || (recovering && !active.suspended) ||
         active.resourceWait.retryMilliseconds <= 0.0)
       continue;
@@ -363,7 +377,7 @@ bool Engine::admitQueued(double now) {
       continue;
     if (cellsFull) {
       scheduler_.waitForResources(id);
-      deferResourceRetry(active, now, StateFailure::ConcurrencyLimit);
+      deferResourceRetry(active, now, {}, StateFailure::ConcurrencyLimit);
       continue;
     }
     active.admissionProbe =
@@ -402,6 +416,17 @@ bool Engine::admitQueued(double now) {
   return progressed;
 }
 
+uint32_t Engine::replayStateBoundary(const Request &active) noexcept {
+  // A later request may not share the generation prompt; generated history
+  // that a resumed lane replays is its own.
+  const uint32_t tail =
+      active.replayTokens == active.promptTokens
+          ? std::max(active.request.generationPromptTokens, uint32_t{1})
+          : 1;
+  return (active.replayTokens - tail) / KvCache::pageTokens *
+         KvCache::pageTokens;
+}
+
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
                                        const Request &right) {
   const auto prompt = [](const Request &value) -> std::span<const uint32_t> {
@@ -415,8 +440,7 @@ uint32_t Engine::sharedPrefillBoundary(const Request &left,
   const auto end = std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first;
   uint32_t boundary = std::min<uint32_t>(
       static_cast<uint32_t>(end - a.begin()),
-      std::min(replayStateBoundary(left.promptTokens),
-               replayStateBoundary(right.promptTokens)));
+      std::min(replayStateBoundary(left), replayStateBoundary(right)));
   boundary -= boundary % KvCache::pageTokens;
   if (!left.request.images.empty() || !right.request.images.empty()) {
     for (uint32_t offset = 0; offset < boundary; offset += KvCache::pageTokens) {
@@ -519,7 +543,7 @@ bool Engine::admit(Request &active, double now) {
         return true;
       }
       scheduler_.waitForResources(active.request.id);
-      deferResourceRetry(active, now, admission.failure, denial.pending);
+      deferResourceRetry(active, now, denial, admission.failure);
       return false;
     }
     executorStarted = true;
@@ -555,7 +579,7 @@ bool Engine::admit(Request &active, double now) {
         // Release the prefix pin before retrying without its memory footprint.
         active.skipCache = true;
         scheduler_.waitForResources(requestId);
-        deferResourceRetry(active, now);
+        deferResourceRetry(active, now, kv.denial);
         return false;
       }
       if (verdict == Verdict::Fail) {
@@ -563,7 +587,7 @@ bool Engine::admit(Request &active, double now) {
         return true;
       }
       scheduler_.waitForResources(requestId);
-      deferResourceRetry(active, now, StateFailure::MemoryPressure, kv.denial.pending);
+      deferResourceRetry(active, now, kv.denial);
       return false;
     }
     active.resourceWait = {};
@@ -608,7 +632,7 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
     // it on disk. Other restored progress points retain their rolling
     // lifetime.
     if (active.latestCheckpoint &&
-        resumeBoundary == replayStateBoundary(active.replayTokens)) {
+        resumeBoundary == replayStateBoundary(active)) {
       if (cache_.reuseStoredState(active.latestCheckpoint.kvBlock))
         ++counters_.deduplicatedStatePublications;
       active.latestCheckpoint = {};
@@ -699,13 +723,14 @@ bool Engine::resourceRetryReady(const Request &active,
 }
 
 void Engine::deferResourceRetry(Request &active, double now,
-                                StateFailure reason, bool pending) noexcept {
+                                const Denial &denial, StateFailure reason) noexcept {
   auto &wait = active.resourceWait;
   if (!wait.startedMilliseconds)
     wait.startedMilliseconds = now;
   const bool progressed = wait.pending && wait.epoch != resourceEpoch_;
   wait.reason = reason;
-  wait.pending = pending;
+  wait.allocationFailure = denial.allocationFailure;
+  wait.pending = denial.pending;
   if (reason == StateFailure::ConcurrencyLimit)
     wait.deadlineMilliseconds = 0.0;
   else if (progressed || wait.deadlineMilliseconds <= 0.0)
@@ -716,8 +741,13 @@ void Engine::deferResourceRetry(Request &active, double now,
 
 double Engine::resourceDeadline(const Request &active) const noexcept {
   const ResourceWait &wait = active.resourceWait;
-  return wait.pending && wait.epoch != resourceEpoch_ ? 0.0
-                                                      : wait.deadlineMilliseconds;
+  if ((wait.pending && wait.epoch != resourceEpoch_) || wait.deadlineMilliseconds <= 0.0)
+    return 0.0;
+  // The limit restarts whenever a lane submitted before the request works,
+  // however long that takes. Later lanes do not extend it: requests that
+  // keep arriving would otherwise hold it until the request's deadline.
+  return std::max(wait.deadlineMilliseconds,
+                  wait.earlierLaneWorkMilliseconds + config_.resourceWaitTimeoutMilliseconds);
 }
 
 void Engine::signalResourceProgress() noexcept {
@@ -732,9 +762,12 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
     throw std::logic_error("request already has a composite-state plan");
   }
 
+  // The replay state is the last one planned: a lazy junction past it would
+  // lie inside the generation prompt, which a later request may not share.
+  const uint32_t latestReplayBoundary = replayStateBoundary(active);
   const auto addCandidate = [&](uint32_t tokens,
                                 Request::StateBoundary::Purpose purpose) {
-    if (!tokens || tokens <= stateBoundary)
+    if (tokens <= stateBoundary || tokens > latestReplayBoundary)
       return;
     for (size_t index = 0; index < active.stateBoundaries.size(); ++index) {
       if (active.stateBoundaries[index].tokens != tokens)
@@ -748,7 +781,6 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
 
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state. Progress points remain disposable after restoration.
-  const uint32_t latestReplayBoundary = replayStateBoundary(active.replayTokens);
   if (const uint32_t interval = config_.prefillCheckpointTokens) {
     for (uint64_t boundary = (uint64_t{stateBoundary} / interval + 1) * interval;
          boundary < latestReplayBoundary; boundary += interval) {
@@ -778,7 +810,7 @@ bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
   if (active.suspended || active.replaying)
     return false;
   bool changed = false;
-  const uint32_t replay = replayStateBoundary(active.replayTokens);
+  const uint32_t replay = replayStateBoundary(active);
   for (const auto &[id, peer] : requests_) {
     if (id == active.request.id || peer.stateCell || peer.suspended ||
         peer.finalized || peer.failure ||
@@ -882,7 +914,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
         // point instead of evicting it or writing a short-lived replacement.
         if (checkpoint && model_.canSnapshotToDisk() &&
             uint64_t{objective.tokens} + model::ExecutionLimits::prefillTokenBudget >
-                replayStateBoundary(active.replayTokens)) {
+                replayStateBoundary(active)) {
           state = model_.snapshot(active.request.id);
           if (!state)
             continue;
@@ -1025,8 +1057,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
   if (std::any_of(denied.begin(), denied.end(),
                   [](const Denied &entry) { return entry.denial.pending; })) {
     for (const Denied &entry : denied)
-      deferResourceRetry(request(entry.requestId), now, StateFailure::MemoryPressure,
-                         entry.denial.pending);
+      deferResourceRetry(request(entry.requestId), now, entry.denial);
     return Prepared::Waiting;
   }
   const Denied &victim = *std::min_element(
@@ -1192,7 +1223,7 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
                       failure != metal::AllocationFailure::HostPressure;
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
   scheduler_.suspendForResources(active.request.id);
-  deferResourceRetry(active, now);
+  deferResourceRetry(active, now, {.allocationFailure = failure});
   ++counters_.resourceSuspensions;
 }
 

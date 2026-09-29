@@ -103,12 +103,13 @@ void readDeviceCapabilities(id<MTLDevice> device,
                             DeviceCapabilities &capabilities) {
     capabilities.deviceName = stringFromNSString(device.name);
     capabilities.gpuCoreCount = gpuCoreCountForDevice(device.registryID);
-    for (uint32_t family = 10; family >= 7; --family) {
-        if ([device supportsFamily:static_cast<MTLGPUFamily>(1000 + family)]) {
-            capabilities.appleGpuFamily = family;
-            break;
-        }
-    }
+    // Apple GPU families nest, so the device's is the last one supported
+    // counting up from Apple7.
+    uint32_t family = 0;
+    for (uint32_t next = 7;
+         [device supportsFamily:static_cast<MTLGPUFamily>(1000 + next)]; ++next)
+        family = next;
+    capabilities.appleGpuFamily = family;
     capabilities.physicalMemoryBytes = NSProcessInfo.processInfo.physicalMemory;
     capabilities.recommendedMaxWorkingSetBytes =
         device.recommendedMaxWorkingSetSize;

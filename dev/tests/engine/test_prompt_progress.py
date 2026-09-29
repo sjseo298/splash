@@ -37,6 +37,7 @@ class PromptProgressTests(unittest.TestCase):
     def test_all_streams_are_opt_in_and_preserve_completion(self):
         paths = (
             "/v1/chat/completions",
+            "/v1/completions",
             "/v1/responses",
             "/v1/messages?beta=true",
         )
@@ -58,6 +59,8 @@ class PromptProgressTests(unittest.TestCase):
                                 body["input"] = "Hi"
                                 body.pop("max_tokens")
                                 body["max_output_tokens"] = 8
+                            elif path == "/v1/completions":
+                                body["prompt"] = "Hi"
                             else:
                                 body["messages"] = [{"role": "user", "content": "Hi"}]
                             status, _, payload = harness.request("POST", path, body)
@@ -99,6 +102,13 @@ class PromptProgressTests(unittest.TestCase):
                                 self.assertTrue(
                                     all(
                                         event["choices"][0]["delta"] == {}
+                                        for event in progress_events
+                                    )
+                                )
+                            elif path == "/v1/completions":
+                                self.assertTrue(
+                                    all(
+                                        event["choices"][0]["text"] == ""
                                         for event in progress_events
                                     )
                                 )
@@ -151,7 +161,12 @@ class PromptProgressTests(unittest.TestCase):
         runtime = ProgressRuntime()
         harness = Harness(runtime)
         self.addCleanup(harness.close)
-        for path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
+        for path in (
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/v1/messages",
+        ):
             for extra in (
                 {"return_progress": True},
                 {"return_progress": True, "stream": False},
@@ -161,6 +176,7 @@ class PromptProgressTests(unittest.TestCase):
                 with self.subTest(path=path, extra=extra):
                     body = {
                         "messages": [{"role": "user", "content": "Hi"}],
+                        "prompt": "Hi",
                         "input": "Hi",
                         "max_tokens": 8,
                         **extra,

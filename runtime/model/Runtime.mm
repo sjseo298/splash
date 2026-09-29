@@ -201,6 +201,8 @@ struct Runtime::Impl {
     BatchCohort cohort = BatchCohort::Greedy;
     SamplingParameters sampling;
     ConstraintMode constraint = ConstraintMode::None;
+    // RequestFlag bits.
+    uint32_t flags = 0;
     std::optional<uint32_t> pendingToken;
     // Transient active-request hidden used only while a constrained request
     // waits for its first token mask. Composite cache state never stores it;
@@ -730,7 +732,8 @@ struct Runtime::Impl {
     return {enabled ? entry.sampling.topK : 1,
             enabled ? entry.sampling.temperature : 0.0F,
             enabled ? entry.sampling.topP : 1.0F,
-            entry.constraint == ConstraintMode::TokenMask};
+            entry.constraint == ConstraintMode::TokenMask,
+            (entry.flags & RequestIgnoreEndOfSequence) != 0};
   }
 
   template <class Get>
@@ -760,7 +763,9 @@ struct Runtime::Impl {
   void addInitialPolicySelection(CommandGraph &graph, Request &entry,
                                  uint32_t lane, uint32_t rowOffset) const {
     sampling.addInitial(graph, samplingPolicy(entry),
-                        samplingBuffersForLane(lane), rowOffset);
+                        samplingBuffersForLane(lane), rowOffset,
+                        geometry.target.stopTokens[0],
+                        geometry.target.stopTokens[1]);
   }
 
   CommandTiming selectPendingFromFinalHidden(Request &entry, uint32_t lane,
@@ -1335,7 +1340,8 @@ struct Runtime::Impl {
       policies[lane] = samplingPolicy(*entries[lane]);
     }
     sampling.addVerify(graph, std::span(policies).first(lanes),
-                       samplingBuffers(lanes));
+                       samplingBuffers(lanes), geometry.target.stopTokens[0],
+                       geometry.target.stopTokens[1]);
   }
 
   void addPrefillPolicy(CommandGraph &graph, Request &entry, uint32_t lane,
@@ -1878,6 +1884,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   entry.cohort = request.cohort;
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
+  entry.flags = request.flags;
   const BatchCohort expected =
       entry.constraint == ConstraintMode::TokenMask
           ? BatchCohort::Constrained

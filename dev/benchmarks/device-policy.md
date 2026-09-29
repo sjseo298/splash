@@ -22,9 +22,10 @@ Core count comes from the Metal device's IORegistry property. Missing metadata
 uses one 32-core estimate across families, an intermediate value in the
 16–40-core range of our reference machines. This is not a calibrated optimum
 or a performance guarantee for unidentified GPUs. A nonzero reported count
-always overrides it. Family 11 policy tests check extrapolation only: actual
-validation here covers families 9 and 10. Core count alone cannot describe
-memory bandwidth, cache capacity, power state or compiler behavior.
+always overrides it. Family 11 (the M6) runs the family 10 policy; its policy
+tests check extrapolation only, and actual validation here covers families 9
+and 10. Core count alone cannot describe memory bandwidth, cache capacity,
+power state or compiler behavior.
 
 MoE routing scales its row threshold with core count. The expert tile's
 four-SIMD-group Apple9 decode default remains a family rule, measured on the

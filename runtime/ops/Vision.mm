@@ -24,6 +24,7 @@ constexpr uint32_t kQueryTile = 64;
 constexpr uint32_t kQkDimension = 80; // head dimension 72 padded to 16
 constexpr uint64_t kArenaAlignment = 16 * 1024;
 constexpr uint64_t kBf16Bytes = 2;
+constexpr uint64_t kFloatBytes = 4;
 
 uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept {
   return (value + multiple - 1) / multiple * multiple;
@@ -36,7 +37,7 @@ uint64_t alignArena(uint64_t bytes) noexcept {
 // Scratch tensor byte sizes for one encoder sized to maximumPatches. GEMM
 // tiles read and write whole 64-row tiles, attention reads whole 128-key
 // tiles, and the merger reads the normalized rows as (patches / 4, 4608).
-std::array<uint64_t, 13> scratchLayout(const VisionLayout &layout,
+std::array<uint64_t, 12> scratchLayout(const VisionLayout &layout,
                                        uint32_t maximumPatches) {
   const uint64_t rows = roundUp(maximumPatches, kGemmRowTile);
   const uint64_t padded = roundUp(maximumPatches, kKeyTile);
@@ -45,10 +46,9 @@ std::array<uint64_t, 13> scratchLayout(const VisionLayout &layout,
   const uint64_t headRows = uint64_t{layout.heads} * padded;
   return {
       rows * layout.patchDimension * kBf16Bytes,                 // Patches
-      rows * hidden * kBf16Bytes,                                // Positions
-      uint64_t{maximumPatches} * layout.headDimension * 4,       // RopeCos
-      uint64_t{maximumPatches} * layout.headDimension * 4,       // RopeSin
-      rows * hidden * kBf16Bytes,                                // Hidden
+      uint64_t{maximumPatches} * layout.headDimension * kFloatBytes, // RopeCos
+      uint64_t{maximumPatches} * layout.headDimension * kFloatBytes, // RopeSin
+      rows * hidden * kFloatBytes,                               // Hidden
       std::max(rows * hidden, mergedRows * layout.mergedHiddenSize) *
           kBf16Bytes,                                            // Normalized
       std::max(rows * 3 * hidden, mergedRows * layout.mergedHiddenSize) *
@@ -169,14 +169,14 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
 
   graph.add("vision_patchify", {pixels, scratch(Scratch::Patches)}, gridParams,
             {tokens, 1, 1});
+  // The positions start the residual stream the patch embedding adds to.
   graph.add("vision_prepare_positions",
-            {model_.positionTable, scratch(Scratch::Positions),
-             scratch(Scratch::RopeCos), scratch(Scratch::RopeSin)},
-            gridParams, {tokens, 1, 1});
+            {model_.positionTable, hidden, scratch(Scratch::RopeCos),
+             scratch(Scratch::RopeSin)},
+            gridParams, {roundUp(tokens, kGemmRowTile), 1, 1});
   addGemm(graph, "vision_gemm_m64n128_residual", scratch(Scratch::Patches),
-          model_.patchEmbedding, hidden, scratch(Scratch::Positions),
-          layout.hiddenSize, layout.patchDimension, tokens, kGemmRowTile,
-          kGemmColumnTile);
+          model_.patchEmbedding, hidden, hidden, layout.hiddenSize,
+          layout.patchDimension, tokens, kGemmRowTile, kGemmColumnTile);
 
   for (const VisionBlock &block : model_.blocks) {
     addNorm(graph, hidden, block.norm1, normalized, tokens);

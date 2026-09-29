@@ -225,6 +225,7 @@ def request(
     mask_provider=None,
     image_owner=None,
     score_tokens=(),
+    generation_prompt_tokens=0,
 ):
     return engine_runtime.GenerationRequest(
         prompt_tokens=(token, token + 1),
@@ -238,6 +239,7 @@ def request(
         mask_provider=mask_provider,
         image_owner=image_owner,
         score_tokens=score_tokens,
+        generation_prompt_tokens=generation_prompt_tokens,
     )
 
 
@@ -622,6 +624,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(result.start)
         self.assertEqual(result.done.completion_tokens, 0)
         self.assertFalse(call.cancel())
+
+    def test_generation_prompt_tokens_reach_the_request_frame(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        runtime.submit(request(10, generation_prompt_tokens=1))
+        frame = factory.processes[0].stdin.wait_for(wire.RequestFrame)[0]
+        self.assertEqual(frame.generation_prompt_tokens, 1)
 
     def test_score_request_passes_slots_and_returns_option_logits(self):
         factory = FakeFactory()

@@ -120,6 +120,10 @@ class Job:
     return_progress: bool = False
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
+    # Trailing prompt tokens of the chat template's generation prompt; zero
+    # when unknown.
+    generation_prompt_tokens: int = 0
+    flags: wire.RequestFlag = wire.RequestFlag(0)
     # Endpoint-specific metadata carried to the response builder.
     meta: dict | None = None
     latency: RequestLatency | None = None
@@ -501,6 +505,8 @@ class NativeBackend:
             image_owner=job.image_owner,
             return_progress=job.return_progress,
             score_tokens=job.score_tokens,
+            generation_prompt_tokens=job.generation_prompt_tokens,
+            flags=job.flags,
         )
 
     def submit(self, job):

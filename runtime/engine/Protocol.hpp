@@ -14,7 +14,7 @@
 
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 6;
+inline constexpr uint16_t kProtocolVersion = 7;
 inline constexpr size_t kFrameHeaderBytes = 24;
 inline constexpr uint32_t kStatusSchemaVersion = 5;
 // Image pixels travel inside the request frame; a multi-image agent turn can
@@ -137,6 +137,16 @@ enum class ConstraintMode : uint8_t {
   TokenMask = 1,
 };
 
+// Request options, one bit each; a request with any other bit set is a
+// request error.
+enum RequestFlag : uint32_t {
+  // Never select the model's stop tokens, so generation runs to its output
+  // limit. Only unconstrained generation can carry it.
+  RequestIgnoreEndOfSequence = 1U << 0,
+};
+
+inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
+
 struct SamplingParameters {
   float temperature = 0.0f;
   float topP = 1.0f;
@@ -190,6 +200,11 @@ struct RequestFrame {
   // 2..255 distinct token ids, logicalMaxOutputTokens must be zero, and the
   // request must be text-only, unconstrained, and greedy.
   std::vector<uint32_t> scoreTokens{};
+  // Trailing prompt tokens of the chat template's generation prompt; zero
+  // when unknown. It must leave at least one prompt token.
+  uint32_t generationPromptTokens = 0;
+  // RequestFlag bits.
+  uint32_t flags = 0;
 
   bool operator==(const RequestFrame &) const = default;
 };

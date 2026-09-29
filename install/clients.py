@@ -50,6 +50,13 @@ class _Server:
     def response_tokens(self):
         return min(MAX_RESPONSE_TOKENS, max(1, self.context // 4))
 
+    @property
+    def name(self):
+        """splash for the default port, 8000, and splash-<port> for another,
+        so a client's session keeps the server it was started for."""
+        port = urllib.parse.urlsplit(self.base_url).port
+        return "splash" if port == 8000 else f"splash-{port}"
+
 
 def find_executable(name):
     path = shutil.which(name)
@@ -59,6 +66,15 @@ def find_executable(name):
             f"Install it first: {INSTALL_URLS[name]}"
         )
     return path
+
+
+def major_version(text):
+    """The major version a client's --version output names; None if none."""
+    match = re.match(
+        r"(?:opencode\s+)?v?(\d+)\.\d+(?:\.\d+)?(?:[-+\s]|$)",
+        text.strip(),
+    )
+    return int(match.group(1)) if match else None
 
 
 def probe_major_version(path):
@@ -78,11 +94,7 @@ def probe_major_version(path):
         return None
     if result.returncode:
         return None
-    match = re.match(
-        r"(?:opencode\s+)?v?(\d+)\.\d+(?:\.\d+)?(?:[-+\s]|$)",
-        result.stdout.strip(),
-    )
-    return int(match.group(1)) if match else None
+    return major_version(result.stdout)
 
 
 def command(
@@ -91,16 +103,17 @@ def command(
     base_url,
     model,
     context,
-    profiles_dir,
     environment=None,
     *,
     input_modalities,
     client_args=(),
     client_version=None,
+    hermes_profile=None,
 ):
     """Return argv and a private environment; never mutate the caller's env.
     input_modalities is what the served model accepts, as /v1/models
-    reports it."""
+    reports it. hermes_profile names the Hermes profile to configure, by
+    default the server's name."""
     if not isinstance(model, str) or not model:
         raise ClientError("The server did not report a model name")
     if type(context) is not int or context <= 0:
@@ -131,7 +144,7 @@ def command(
         case "codex":
             argv = _codex(path, server, environment, client_args)
         case "hermes":
-            argv = _hermes(path, server, environment, client_args, profiles_dir)
+            argv = _hermes(path, server, environment, client_args, hermes_profile)
         case "pi":
             argv = _pi(path, server, environment, client_args)
         case _:
@@ -300,11 +313,18 @@ def _codex_config_args(arguments):
     return config, remaining
 
 
-def _hermes(path, server, environment, arguments, profiles_dir):
-    # HERMES_HOME is Hermes's supported profile boundary. Keep sessions and
-    # the complete default tool surface, without touching ~/.hermes/config.yaml.
-    home = profiles_dir / "hermes"
-    _write_hermes_profile(home, server)
+def _hermes(path, server, environment, arguments, profile):
+    # Hermes keeps its managed tools, and the launchers of the user's hermes
+    # command that run them, in its root, and each profile's configuration
+    # and sessions in <root>/profiles/<name>. Any other HERMES_HOME is a root
+    # of its own: Hermes would install its tools there and point the user's
+    # hermes command at them. So run in a profile of the user's root, with
+    # the complete default tool surface, and leave the root's config.yaml.
+    home = hermes_profile_home(environment, profile or server.name)
+    created = not (home / "config.yaml").exists() and _create_hermes_profile(
+        path, home, environment
+    )
+    _write_hermes_profile(home, server, created)
     environment.update(
         HERMES_HOME=str(home),
         CUSTOM_BASE_URL=server.endpoint,
@@ -314,7 +334,42 @@ def _hermes(path, server, environment, arguments, profiles_dir):
     return [path, "chat", "--provider", "custom", "--model", server.model, *arguments]
 
 
-def _write_hermes_profile(home, server):
+def hermes_profile_home(environment, name):
+    """The home of profile name in the Hermes root of environment's
+    HERMES_HOME, by Hermes's own rule (hermes_constants.get_default_hermes_root):
+    ~/.hermes for a home inside it, <root> for <root>/profiles/<another>, and
+    otherwise that home itself."""
+    root = Path.home() / ".hermes"
+    if value := environment.get("HERMES_HOME", "").strip():
+        home = Path(os.path.expandvars(value)).expanduser()
+        if not home.resolve().is_relative_to(root.resolve()):
+            root = home.parent.parent if home.parent.name == "profiles" else home
+    return root / "profiles" / name
+
+
+def _create_hermes_profile(path, home, environment):
+    """Create the profile with Hermes, as a user would, and say whether this
+    call created it. Hermes seeds its files and lifts the mark that `hermes
+    profile delete` leaves, without which Hermes refuses the profile. No
+    alias: Hermes would add a command named after the profile."""
+    try:
+        result = subprocess.run(
+            [path, "profile", "create", home.name, "--no-alias"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        raise ClientError(f"Could not run {path}: {error}") from error
+    # Another launch may have created it meanwhile.
+    if result.returncode and not home.is_dir():
+        output = (result.stderr or result.stdout).strip()[-2000:]
+        raise ClientError(f"hermes profile create {home.name} failed: {output}")
+    return result.returncode == 0
+
+
+def _write_hermes_profile(home, server, created=False):
     # The launcher imports this module before the environment that provides
     # PyYAML is installed.
     import yaml
@@ -330,7 +385,8 @@ def _write_hermes_profile(home, server):
         profile = {}
     if not isinstance(profile, dict):
         raise ClientError(invalid)
-    if profile.get("model") is None:
+    # Hermes gives a new profile a copy of the user's default model.
+    if created or profile.get("model") is None:
         profile["model"] = {}
     if not isinstance(profile["model"], dict):
         raise ClientError(invalid)
@@ -352,11 +408,9 @@ def _write_hermes_profile(home, server):
 def _pi(path, server, environment, arguments):
     # Pi reads custom providers only from models.json in its agent directory,
     # beside the user's sessions, settings and extensions. Replace this
-    # server's provider there and leave everything else as it is: splash for
-    # the default port, 8000, and splash-<port> for another, so a Pi session
-    # keeps the server it was started for.
-    port = urllib.parse.urlsplit(server.base_url).port
-    provider = "splash" if port == 8000 else f"splash-{port}"
+    # server's provider there, named for the server, and leave everything
+    # else as it is.
+    provider = server.name
     _write_pi_provider(_pi_models_path(environment), provider, server, environment)
     return [path, "--provider", provider, "--model", server.model, *arguments]
 

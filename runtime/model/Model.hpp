@@ -30,6 +30,16 @@ enum class DecodeStage : uint8_t {
 
 enum class ConstraintMode : uint8_t { None, TokenMask };
 
+// Request options, one bit each, as the native protocol's request flags carry
+// them.
+enum RequestFlag : uint32_t {
+  // Never select the model's stop tokens, so generation runs to its output
+  // limit. Only unconstrained generation carries it.
+  RequestIgnoreEndOfSequence = 1U << 0,
+};
+
+inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
+
 struct SamplingParameters final {
   float temperature = 0.0F;
   float topP = 1.0F;
@@ -52,6 +62,8 @@ struct ModelRequest final {
   // generated, and the raw final-position logits at these ids are returned in
   // ModelStepResult::scoreLogits. maxNewTokens must be zero.
   std::span<const uint32_t> scoreTokens{};
+  // RequestFlag bits.
+  uint32_t flags = 0;
 };
 
 struct ImageSpan final {

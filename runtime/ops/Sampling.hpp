@@ -18,6 +18,9 @@ struct SamplingPolicy final {
   float temperature = 1.0F;
   float topP = 1.0F;
   bool constrained = false;
+  // The lane ignores end-of-sequence: the target never selects a stop token,
+  // though the draft may still propose one.
+  bool excludesStopTokens = false;
 
   [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F; }
 };
@@ -81,8 +84,9 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer acceptedCounts;
 };
 
-// Target token policy. This operator owns top-k/top-p, constrained selection
-// and greedy argmax pipeline ABIs; the model only supplies policy and buffers.
+// Target token policy. This operator owns top-k/top-p, constrained selection,
+// stop-token exclusion and greedy argmax pipeline ABIs; the model only
+// supplies policy, buffers and its stop tokens.
 class Sampling final {
 public:
   // rowsPerLane is the kernels' SPLASH_TARGET_VERIFY_ROWS.
@@ -95,10 +99,12 @@ public:
   [[nodiscard]] static DraftSelectorWorkspace draftWorkspace(uint32_t positions);
 
   void addInitial(metal::CommandGraph &graph, const SamplingPolicy &policy,
-                  SamplingBuffers buffers, uint32_t rowOffset) const;
+                  SamplingBuffers buffers, uint32_t rowOffset,
+                  uint32_t stopToken0, uint32_t stopToken1) const;
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
-                 SamplingBuffers buffers) const;
+                 SamplingBuffers buffers, uint32_t stopToken0,
+                 uint32_t stopToken1) const;
   // proposalTokens is the kernels' SPLASH_DRAFT_PROPOSAL_TOKENS.
   void addDraftSelector(
       metal::CommandGraph &graph, DraftSelectorBuffers buffers,

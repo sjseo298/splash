@@ -10,6 +10,7 @@ import random
 import signal
 import socket
 import struct
+import tempfile
 import threading
 import time
 import unittest
@@ -116,8 +117,8 @@ class FakeTokenizer:
         self.backend_tokenizer = _byte_backend(self.fragments)
         self.templates = []
 
-    # Requests render as a fixed generation prefix; the source only has to be
-    # a template ChatTemplates can probe at startup.
+    # Requests render as their generation prompt alone, a fixed prefix; the
+    # source only has to be a template ChatTemplates can probe at startup.
     chat_template = (
         "{%- for message in messages %}"
         "{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}"
@@ -127,9 +128,11 @@ class FakeTokenizer:
 
     def apply_chat_template(self, messages, **kwargs):
         self.templates.append((messages, kwargs))
-        rendered = "<|im_start|>assistant\n<think>\n"
-        if not kwargs.get("enable_thinking", True):
-            rendered += "\n</think>\n\n"
+        rendered = ""
+        if kwargs.get("add_generation_prompt"):
+            rendered = "<|im_start|>assistant\n<think>\n"
+            if not kwargs.get("enable_thinking", True):
+                rendered += "\n</think>\n\n"
         return rendered if kwargs.get("tokenize") is False else [101, 102]
 
     def __call__(self, text, **kwargs):
@@ -1696,9 +1699,10 @@ class ServerTest(unittest.TestCase):
                         if part.get("type") == "image_url"
                     )
             rendered += "Z"
-            rendered += "<|im_start|>assistant\n<think>\n"
-            if not kwargs.get("enable_thinking", True):
-                rendered += "\n</think>\n\n"
+            if kwargs.get("add_generation_prompt"):
+                rendered += "<|im_start|>assistant\n<think>\n"
+                if not kwargs.get("enable_thinking", True):
+                    rendered += "\n</think>\n\n"
             return (
                 rendered
                 if kwargs.get("tokenize") is False
@@ -2536,9 +2540,13 @@ class ServerTest(unittest.TestCase):
 
     def test_anthropic_count_tokens_matches_generation_without_admission(self):
         class InputTokenizer(FakeTokenizer):
-            def apply_chat_template(self, messages, **kwargs):
-                prefix = super().apply_chat_template(messages, **kwargs)
-                return json.dumps([messages, kwargs], sort_keys=True) + prefix
+            def apply_chat_template(
+                self, messages, add_generation_prompt=False, **kwargs
+            ):
+                prompt = super().apply_chat_template(
+                    messages, add_generation_prompt=add_generation_prompt, **kwargs
+                )
+                return json.dumps([messages, kwargs], sort_keys=True) + prompt
 
             def __call__(self, text, **kwargs):
                 return {"input_ids": list(text.encode())}
@@ -3228,14 +3236,12 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("queue_ms", record["metrics"])
         self.assertNotIn("hello", json.dumps(record))
 
-        with mock.patch("builtins.print") as output:
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             diagnostics.print_request(record)
-        line = output.call_args.args[0]
-        self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} Done · input ")
+        line = output.getvalue()
+        self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} Done · input [^\n]*\n$")
         self.assertNotIn("request_id", line)
         self.assertNotIn("hello", line)
-        self.assertNotIn("\n", line)
-        self.assertTrue(output.call_args.kwargs["flush"])
 
     def test_latency_histograms_cover_http_preparation_and_token_batches(self):
         harness = self.harness(FakeRuntime(Plan([[4, 4], [4]], delay=0.01)))
@@ -3286,13 +3292,13 @@ class ServerTest(unittest.TestCase):
         }
         with (
             mock.patch.object(api.time, "strftime", return_value="14:32:08"),
-            mock.patch("builtins.print") as output,
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
             diagnostics.print_request(record)
         self.assertEqual(
-            output.call_args.args[0],
+            output.getvalue(),
             "14:32:08 Done · input 10,240 · cached 8,192 · output 320"
-            " · TTFT 0.8s · 85.0 tok/s",
+            " · TTFT 0.8s · 85.0 tok/s\n",
         )
 
     def test_console_shows_the_tool_block_signature(self):
@@ -3305,25 +3311,28 @@ class ServerTest(unittest.TestCase):
         }
         with (
             mock.patch.object(api.time, "strftime", return_value="14:32:08"),
-            mock.patch("builtins.print") as output,
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
             diagnostics.print_request(record)
         self.assertEqual(
-            output.call_args.args[0],
+            output.getvalue(),
             "14:32:08 Done · input 33,799 · cached 6,656 · output 12"
-            " · tools 27·1a2b3c4d",
+            " · tools 27·1a2b3c4d\n",
         )
 
     def test_console_cancellation_without_tokens_or_latency(self):
-        with mock.patch("builtins.print") as output:
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             diagnostics.print_request({"outcome": "cancelled", "prompt_tokens": 32})
-        line = output.call_args.args[0]
+        line = output.getvalue()
         self.assertIn("Cancelled · input 32 · cached 0 · output 0", line)
         self.assertNotIn("TTFT", line)
         self.assertNotIn("tok/s", line)
 
     def test_console_error_omits_private_details(self):
-        with mock.patch("builtins.print") as output:
+        with (
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            mock.patch("sys.stderr", new_callable=io.StringIO) as errors,
+        ):
             diagnostics.print_request(
                 {
                     "outcome": "error",
@@ -3332,9 +3341,45 @@ class ServerTest(unittest.TestCase):
                     "request_id": 123,
                 }
             )
-        line = output.call_args.args[0]
-        self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} Error · context_length_exceeded$")
-        self.assertIs(output.call_args.kwargs["file"], api.sys.stderr)
+        self.assertRegex(
+            errors.getvalue(), r"^\d{2}:\d{2}:\d{2} Error · context_length_exceeded\n$"
+        )
+        self.assertEqual(output.getvalue(), "")
+
+    def test_concurrent_console_lines_stay_whole(self):
+        # Status lines on stdout and errors on stderr, both on one unbuffered
+        # file, as `python -u server.py > log 2>&1` or launchd writes them.
+        with tempfile.TemporaryFile() as log:
+            streams = [
+                io.TextIOWrapper(
+                    io.FileIO(os.dup(log.fileno()), "w"), write_through=True
+                )
+                for _ in range(2)
+            ]
+            self.addCleanup(lambda: [stream.close() for stream in streams])
+
+            def write(worker):
+                for line in range(300):
+                    diagnostics.print_status(
+                        f"worker {worker} line {line}", error=worker % 2 == 1
+                    )
+
+            workers = [
+                threading.Thread(target=write, args=(worker,)) for worker in range(8)
+            ]
+            with (
+                mock.patch("sys.stdout", streams[0]),
+                mock.patch("sys.stderr", streams[1]),
+            ):
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join()
+            log.seek(0)
+            lines = log.read().decode().splitlines()
+        self.assertEqual(len(lines), 8 * 300)
+        for line in lines:
+            self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} worker \d line \d+$")
 
     def test_server_requires_explicit_model_and_paths(self):
         model = "community/custom-splash"
@@ -3532,7 +3577,7 @@ class ServerTest(unittest.TestCase):
             mock.patch.object(api, "Frontend", return_value=mock.Mock()) as app_type,
             mock.patch.object(api, "FrontendServer", side_effect=bind),
             mock.patch.object(api.signal, "signal", side_effect=install),
-            mock.patch("builtins.print"),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
         ):
             api.main()
         self.assertEqual(
@@ -3945,12 +3990,30 @@ class ServerTest(unittest.TestCase):
             try:
                 role = json.loads(self.next_sse_data(response))
                 self.assertEqual(role["choices"][0]["delta"]["role"], "assistant")
-                self.assertEqual(
-                    response.readline().decode().rstrip("\r\n"),
-                    ": splash-keepalive",
-                )
+                heartbeat = json.loads(self.next_sse_data(response))
+                self.assertEqual(heartbeat["choices"][0]["delta"], {})
+                self.assertIsNone(heartbeat["choices"][0]["finish_reason"])
             finally:
                 plan.release.set()
+                response.read()
+                connection.close()
+
+    def test_stream_keepalive_is_a_comment_until_the_role_chunk(self):
+        plan = Plan([[4]], before_start=True)
+        harness = self.harness(FakeRuntime(plan))
+        with mock.patch.object(api, "SSE_KEEPALIVE_SECONDS", 0.02):
+            connection, response = harness.open_stream(
+                "/v1/chat/completions",
+                self.body(stream=True, reasoning_effort="none"),
+            )
+            try:
+                self.assertEqual(response.readline(), b": splash-keepalive\n")
+                self.assertFalse(plan.started.is_set())
+                plan.start_release.set()
+                role = json.loads(self.next_sse_data(response))
+                self.assertEqual(role["choices"][0]["delta"]["role"], "assistant")
+            finally:
+                plan.start_release.set()
                 response.read()
                 connection.close()
 
@@ -5728,7 +5791,8 @@ class ServerTest(unittest.TestCase):
             ("<think>\\n\\n</think>\\n\\n", "low"),
         ):
             tokenizer = TemplateTokenizer(
-                "{{ '<|im_start|>assistant\\n" + prefix + "' }}"
+                "{% if add_generation_prompt %}"
+                "{{ '<|im_start|>assistant\\n" + prefix + "' }}{% endif %}"
             )
             app = make_frontend(
                 tokenizer, None, "test-model", 128, 16, 1, 2, vision=True
@@ -5739,26 +5803,37 @@ class ServerTest(unittest.TestCase):
             ):
                 app.prepare(self.body(reasoning_effort=effort))
 
-    def test_thinking_prefix_excludes_completed_or_nonassistant_history(self):
-        for suffix, expected in (
+    def test_generation_prompt_decides_thinking_and_its_token_count(self):
+        history = "<|im_start|>assistant\n<think>old</think>answer<|im_end|>\n"
+        for suffix, thinking in (
             ("", False),
             ("<think>\n", True),
             ("<think>\n\n</think>\n\n", False),
         ):
-            history = "<|im_start|>assistant\n<think>old</think>answer<|im_end|>\n"
-            self.assertEqual(
-                request_frontend._thinking_from_prefix(
-                    history + "<|im_start|>assistant\n" + suffix
-                ),
-                expected,
-            )
-        for rendered in (
-            "",
-            "<|im_start|>user\n<think>",
-            "<|im_start|>assistant\n<think>old<|im_end|>\n",
+            text = "<|im_start|>assistant\n" + suffix
+            # Tokens that end otherwise, or are the generation prompt alone,
+            # are not counted.
+            for tokens, count in (
+                ([1, 2, 7, 8, 9], 3),
+                ([1, 2, 7, 8, 8], 0),
+                ([7, 8, 9], 0),
+            ):
+                with self.subTest(suffix=suffix, tokens=tokens):
+                    self.assertEqual(
+                        request_frontend._generation_prompt(
+                            (text, (7, 8, 9)), history + text, tokens
+                        ),
+                        (thinking, count),
+                    )
+        # A prompt must end with the generation prompt the probe found.
+        assistant = ("<|im_start|>assistant\n", (7, 8))
+        for probed, rendered in (
+            (assistant, ""),
+            (assistant, "<|im_start|>assistant\n<think>old<|im_end|>\n"),
+            (("", ()), history),
         ):
             with self.subTest(rendered=rendered), self.assertRaises(api.APIError):
-                request_frontend._thinking_from_prefix(rendered)
+                request_frontend._generation_prompt(probed, rendered, [1, 2, 7, 8])
 
     def test_anthropic_thinking_off_is_not_reenabled_by_effort(self):
         tokenizer = TemplateTokenizer(self.reasoning_template())
@@ -6714,44 +6789,191 @@ class ServerTest(unittest.TestCase):
             harness.request("POST", "/v1/chat/completions", self.body())[0], 200
         )
 
-    def test_header_only_connections_are_bounded_before_thread_creation(self):
+    def _assert_refused(self, connection):
+        # A connection given no slot, or losing its slot before its request is
+        # read, is answered as the accept answers an excess one, then closed.
+        response = http.client.HTTPResponse(connection)
+        response.begin()
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.getheader("Retry-After"), "1")
+        error = json.loads(response.read())["error"]
+        self.assertEqual(error["type"], "server_error")
+        self.assertEqual(error["code"], "frontend_overloaded")
+        self.assertEqual(connection.recv(1), b"")
+
+    def _assert_open(self, connection):
+        connection.settimeout(0.2)
+        with self.assertRaises(TimeoutError):
+            connection.recv(1)
+
+    def _upload_in_progress(self, address):
+        upload = socket.create_connection(address, timeout=2)
+        self.addCleanup(upload.close)
+        upload.sendall(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+            b"Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{"
+        )
+        return upload
+
+    def _stalled(self, address):
+        stalled = socket.create_connection(address, timeout=2)
+        self.addCleanup(stalled.close)
+        stalled.sendall(b"GET /health HTTP/1.1\r\nHost:")
+        return stalled
+
+    def test_stalled_connections_give_their_slots_to_new_ones(self):
         with mock.patch.object(api.FrontendServer, "control_connection_capacity", 2):
             harness = self.harness(FakeRuntime(), queue_size=1)
-        sockets = []
-        try:
-            for _ in range(harness.server.connections.capacity):
-                connection = socket.create_connection(
-                    harness.server.server_address, timeout=2
-                )
-                sockets.append(connection)
-                connection.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost:")
+        address = harness.server.server_address
+        upload = self._upload_in_progress(address)
+        self._wait_for_http_active(harness.server.requests, 1)
+        waiting = [self._stalled(address), self._stalled(address)]
+        self._wait_for_http_active(harness.server.connections, 3)
+        # Every slot is taken; the longest waiting stalled one gives way, never
+        # the older connection with a request in progress.
+        for _ in range(3):
+            self.assertEqual(harness.request("GET", "/health")[0], 200)
+            self._assert_refused(waiting.pop(0))
+            waiting.append(self._stalled(address))
             self._wait_for_http_active(harness.server.connections, 3)
-            excess = socket.create_connection(harness.server.server_address, timeout=1)
-            self.addCleanup(excess.close)
-            response = http.client.HTTPResponse(excess)
-            response.begin()
-            self.assertEqual(response.status, 503)
-            error = json.loads(response.read())["error"]
-            self.assertEqual(error["type"], "server_error")
-            self.assertEqual(error["code"], "frontend_overloaded")
-            self.assertEqual(response.getheader("Retry-After"), "1")
-            excess.close()
-            self.assertEqual(harness.server.connections.stats()["active"], 3)
-            self.assertEqual(harness.server.requests.stats()["active"], 0)
-        finally:
-            for connection in sockets:
-                connection.close()
-        self._wait_for_http_active(harness.server.connections, 0)
+            self._assert_open(waiting[0])
+        self._assert_open(upload)
+        self.assertEqual(harness.server.requests.stats()["active"], 1)
+        # Before the server closes, so it has no connection to wait for.
+        for connection in (upload, *waiting):
+            connection.close()
+
+    def test_complete_requests_beyond_capacity_are_answered(self):
+        with mock.patch.object(api.FrontendServer, "control_connection_capacity", 0):
+            harness = self.harness(FakeRuntime(), queue_size=2)
+        address = harness.server.server_address
+        # Each connection's thread waits, as one not yet scheduled does, until
+        # every client has sent its whole request.
+        sent = threading.Event()
+        setup = api.FrontendHandler.setup
+
+        def scheduled_late(handler):
+            sent.wait(2)
+            setup(handler)
+
+        clients = []
+        with mock.patch.object(api.FrontendHandler, "setup", scheduled_late):
+            for _ in range(8):
+                client = socket.create_connection(address, timeout=2)
+                self.addCleanup(client.close)
+                client.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                clients.append(client)
+            # The oldest six give way to the six after them and are answered
+            # at once; the last two are served once their threads run.
+            for client in clients[:6]:
+                self._assert_refused(client)
+            sent.set()
+            for client in clients[6:]:
+                response = http.client.HTTPResponse(client)
+                response.begin()
+                self.assertEqual(response.status, 200)
+                response.read()
+        for client in clients:
+            client.close()
+
+    def test_a_connection_draining_a_refused_upload_gives_its_slot_away(self):
+        with mock.patch.object(api.FrontendServer, "control_connection_capacity", 1):
+            harness = self.harness(FakeRuntime(), queue_size=1)
+        address = harness.server.server_address
+        upload = self._upload_in_progress(address)
+        self._wait_for_http_active(harness.server.requests, 1)
+        refused = socket.create_connection(address, timeout=2)
+        self.addCleanup(refused.close)
+        refused.sendall(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+            b"Content-Type: application/json\r\nContent-Length: 100\r\n\r\n"
+        )
+        response = http.client.HTTPResponse(refused)
+        response.begin()
+        self.assertEqual(response.status, 503)
+        response.read()
+        # The server half-closes once it waits for the upload to drain.
+        self.assertEqual(refused.recv(1), b"")
+        self.assertEqual(harness.server.connections.stats()["active"], 2)
         self.assertEqual(harness.request("GET", "/health")[0], 200)
+        self._wait_for_http_active(harness.server.connections, 1)
+        upload.close()
+
+    def test_requests_in_progress_fill_every_connection_slot(self):
+        with mock.patch.object(api.FrontendServer, "control_connection_capacity", 0):
+            harness = self.harness(FakeRuntime(), queue_size=3)
+        address = harness.server.server_address
+        uploads = [self._upload_in_progress(address) for _ in range(3)]
+        self._wait_for_http_active(harness.server.requests, 3)
+        excess = socket.create_connection(address, timeout=1)
+        self.addCleanup(excess.close)
+        response = http.client.HTTPResponse(excess)
+        response.begin()
+        self.assertEqual(response.status, 503)
+        error = json.loads(response.read())["error"]
+        self.assertEqual(error["type"], "server_error")
+        self.assertEqual(error["code"], "frontend_overloaded")
+        self.assertEqual(response.getheader("Retry-After"), "1")
+        self.assertEqual(harness.server.connections.stats()["active"], 3)
+        for upload in uploads:
+            self._assert_open(upload)
+        uploads[0].close()
+        self._wait_for_http_active(harness.server.connections, 2)
+        self.assertEqual(harness.request("GET", "/health")[0], 200)
+        for upload in uploads:
+            upload.close()
+
+    def test_connection_slots_close_the_longest_waiting_connection(self):
+        slots = api.ConnectionSlots(2)
+        first, second, third, fourth = (mock.Mock() for _ in range(4))
+        self.assertTrue(slots.admit(first))
+        self.assertTrue(slots.admit(second))
+        self.assertTrue(slots.serving(first))
+        self.assertTrue(slots.admit(third))
+        # Still awaiting its request, it is answered before it is closed.
+        second.send.assert_called_once_with(
+            api.CONNECTION_OVERLOADED_RESPONSE, socket.MSG_DONTWAIT
+        )
+        second.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+        # A connection that lost its slot is not served.
+        self.assertFalse(slots.serving(second))
+        self.assertTrue(slots.serving(third))
+        self.assertFalse(slots.admit(fourth))
+        # One draining an upload, which has its response, is last in line
+        # and closed without another.
+        slots.draining(first)
+        slots.expire(third)
+        third.shutdown.assert_not_called()
+        self.assertTrue(slots.admit(fourth))
+        first.send.assert_not_called()
+        first.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+        # The header timeout closes a connection awaiting its request.
+        slots.expire(fourth)
+        fourth.send.assert_not_called()
+        fourth.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+        self.assertEqual(slots.stats(), {"active": 1, "capacity": 2})
+        for connection in (first, second, third, fourth):
+            slots.release(connection)
+        self.assertTrue(slots.idle.is_set())
+        self.assertEqual(slots.stats(), {"active": 0, "capacity": 2})
 
     def test_thread_start_failure_returns_connection_slot(self):
-        harness = self.harness(FakeRuntime())
-        with mock.patch.object(
-            api.ThreadingHTTPServer, "process_request", side_effect=RuntimeError("test")
+        server = api.FrontendServer(("127.0.0.1", 0), None)
+        self.addCleanup(server.server_close)
+        client = socket.create_connection(server.server_address, timeout=2)
+        self.addCleanup(client.close)
+        with (
+            mock.patch.object(
+                api.ThreadingHTTPServer,
+                "process_request",
+                side_effect=RuntimeError("test"),
+            ),
+            mock.patch.object(api.ThreadingHTTPServer, "handle_error") as handle_error,
         ):
-            with self.assertRaisesRegex(RuntimeError, "test"):
-                harness.server.process_request(mock.Mock(), ("127.0.0.1", 1))
-        self.assertEqual(harness.server.connections.stats()["active"], 0)
+            server.handle_request()
+        handle_error.assert_called_once()
+        self.assertEqual(server.connections.stats()["active"], 0)
+        self.assertEqual(client.recv(1), b"")
 
     def test_http_admission_capacity_is_exact_and_validated(self):
         for invalid in (0, -1, True, 1.5):

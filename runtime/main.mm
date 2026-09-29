@@ -1,3 +1,4 @@
+#include "StderrLine.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
@@ -17,7 +18,6 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <iostream>
 #include <limits.h>
 #include <memory>
 #include <stdexcept>
@@ -119,10 +119,11 @@ private:
 };
 
 void printUsage(std::string_view executable) {
-  std::cerr << "usage: " << executable
-            << " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
-               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-               " [--kv-format int8|bf16]\n";
+  writeStderrLine(
+      "usage: " + std::string(executable) +
+      " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
+      " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
+      " [--kv-format int8|bf16]");
 }
 
 template <typename T>
@@ -342,9 +343,9 @@ int runNative(const NativeArguments &arguments) {
       if (!recoveryDeadline)
         throw;
       if (!reportedRecoveryWait) {
-        std::cerr
-            << "Waiting for sufficient available memory to start; "
-               "the macOS reserve remains protected...\n";
+        writeStderrLine(
+            "Waiting for sufficient available memory to start; "
+            "the macOS reserve remains protected...");
         reportedRecoveryWait = true;
       }
       const auto resumeAt = std::min(
@@ -358,9 +359,6 @@ int runNative(const NativeArguments &arguments) {
   }
   if (transport.shutdownRequested())
     return static_cast<int>(engine::NativeProcessExit::CleanEof);
-  // Serving handles shutdown and memory pressure between engine ticks.
-  // The per-operation guard is only needed during bootstrap.
-  bootstrap->resources().backend().setOperationGuard({});
   published = bootstrap.get();
 
   transport.setControlHandler([&pressureMonitor, published,
@@ -381,7 +379,7 @@ int runNative(const NativeArguments &arguments) {
     const std::string diagnostic =
         memoryReporter.update(wait, memory.growthAllowed);
     if (!diagnostic.empty())
-      std::cerr << diagnostic << '\n';
+      writeStderrLine(diagnostic);
     engine::MemoryReclaimDirective directive =
         pressurePolicy.update(memory, now, wait.memory || wait.suspended);
     if (!directive.reclaimEmptyKvExtents)
@@ -403,24 +401,26 @@ int runNative(const NativeArguments &arguments) {
   case engine::NativeProcessExit::CleanEof:
     break;
   case engine::NativeProcessExit::ProtocolFailure:
-    std::cerr << "error: native transport stopped after a protocol failure\n";
+    writeStderrLine(
+        "error: native transport stopped after a protocol failure");
     break;
   case engine::NativeProcessExit::EngineFailure:
-    std::cerr << "error: native transport stopped after an engine failure ("
-              << bootstrap->nativeLoop().engineFailure() << ")\n";
+    writeStderrLine(
+        "error: native transport stopped after an engine failure (" +
+        bootstrap->nativeLoop().engineFailure() + ")");
     break;
   case engine::NativeProcessExit::IoFailure:
-    std::cerr << "error: native transport stopped after an I/O failure\n";
+    writeStderrLine(
+        "error: native transport stopped after an I/O failure");
     break;
   }
   return static_cast<int>(exit);
 }
 
 void printBootstrapError(const engine::RuntimeBootstrapReport &report) {
-  std::cerr << "error: " << report.describe() << '\n';
-  if (!report.memoryPlanJson.empty()) {
-    std::cerr << "memory_plan_json: " << report.memoryPlanJson << '\n';
-  }
+  writeStderrLine("error: " + report.describe());
+  if (!report.memoryPlanJson.empty())
+    writeStderrLine("memory_plan_json: " + report.memoryPlanJson);
 }
 
 // The engine's device rule, which the launcher runs before any download:
@@ -429,7 +429,7 @@ int checkDevice() {
   const auto message = metal::probeDeviceCapabilities().validationMessage();
   if (!message)
     return 0;
-  std::cerr << "error: " << *message << '\n';
+  writeStderrLine("error: " + *message);
   return static_cast<int>(engine::NativeProcessExit::EngineFailure);
 }
 
@@ -444,7 +444,7 @@ int main(int argc, char **argv) {
       splash::NativeArguments arguments = splash::parseArguments(argc, argv);
       return splash::runNative(arguments);
     } catch (const splash::UsageError &error) {
-      std::cerr << "error: " << error.what() << '\n';
+      splash::writeStderrLine(std::string("error: ") + error.what());
       splash::printUsage(argc > 0 ? argv[0] : "splash");
       return static_cast<int>(
           splash::engine::NativeProcessExit::ProtocolFailure);
@@ -453,10 +453,11 @@ int main(int argc, char **argv) {
       return static_cast<int>(
           splash::engine::NativeProcessExit::EngineFailure);
     } catch (const std::system_error &error) {
-      std::cerr << "error: native runtime I/O failed: " << error.what() << '\n';
+      splash::writeStderrLine(
+          std::string("error: native runtime I/O failed: ") + error.what());
       return static_cast<int>(splash::engine::NativeProcessExit::IoFailure);
     } catch (const std::exception &error) {
-      std::cerr << "error: " << error.what() << '\n';
+      splash::writeStderrLine(std::string("error: ") + error.what());
       return static_cast<int>(
           splash::engine::NativeProcessExit::EngineFailure);
     }

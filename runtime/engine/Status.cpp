@@ -130,6 +130,7 @@ std::string runtimeStatusJson(
       << ",\"peak_bytes\":" << peakBytes << "}"
       << ",\"memory_governor\":{\"limit_bytes\":" << memoryGovernor.limitBytes
       << ",\"observed_resident_bytes\":" << memoryGovernor.observedResidentBytes
+      << ",\"serving_footprint_bytes\":" << memoryGovernor.servingFootprintBytes
       << ",\"reserved_bytes\":" << memoryGovernor.reservedBytes
       << ",\"headroom_bytes\":" << memoryGovernor.headroomBytes
       << ",\"growth_allowed\":" << boolean(memoryGovernor.growthAllowed)

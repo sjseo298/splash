@@ -61,7 +61,9 @@ void validateConfiguration(const SafetensorsCheckpoint &source, const Layout &la
       {"rope_parameters.partial_rotary_factor", double(layout.rotaryPairs * 2) / layout.attentionHeadDimension}};
   for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
   source.requireConfigString("hidden_act", "silu");
-  source.requireConfigString("rope_parameters.rope_type", "default");
+  // Transformers also reads the rope type from the older `type` key, which
+  // fine-tunes such as Ornith 1.5 still write.
+  source.requireConfigString("rope_parameters.rope_type", "default", "rope_parameters.type");
   source.requireLayerTypes(layout.layers, layout.fullAttentionPeriod);
   if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
     source.requireConfigString("model_type", "qwen3_5_moe_text");

@@ -193,9 +193,14 @@ void SafetensorsCheckpoint::requireConfigNumber(std::string_view key, double exp
       throw WeightStoreError("source model configuration does not match: " + std::string(key));
   }
 }
-void SafetensorsCheckpoint::requireConfigString(std::string_view key, std::string_view expected) const {
+void SafetensorsCheckpoint::requireConfigString(std::string_view key, std::string_view expected,
+                                               std::string_view legacyKey) const {
   @autoreleasepool {
     id value = configValue(impl_->textConfig, key);
+    if (!value && !legacyKey.empty()) {
+      key = legacyKey;
+      value = configValue(impl_->textConfig, key);
+    }
     if (![value isKindOfClass:[NSString class]] || std::string_view([value UTF8String]) != expected)
       throw WeightStoreError("source model configuration does not match: " + std::string(key));
   }

@@ -50,12 +50,17 @@ overrides this. Concurrent input bytes share a budget of at least 512 MiB
 an input-byte budget, not a process RSS limit: large ASCII/base64 strings can
 use roughly twice their encoded size during JSON parsing alone. Decoded images
 and object-heavy JSON need additional memory. Oversized requests return 413;
-exhausted ingress capacity returns 503. Image and model context limits apply
-independently.
+exhausted ingress capacity returns 503. A connection that has sent no request
+yet, or is receiving an upload refused unread, gives way to a new one when
+every connection slot is taken, the first with that 503, so stalled clients
+cannot lock others out. Image and model context limits apply independently.
 Stored Responses history is charged before decoding. Uploads allow 30 seconds
 of inactivity; total upload time is limited to 30 seconds plus the body size
 at 512 KiB/s (286 seconds for 128 MiB), capped by the overall request deadline.
-Timed-out uploads return 408 and release their input reservation.
+Timed-out uploads return 408 and release their input reservation. An upload
+refused before it is read, such as one over the shared budget, is still
+received on these terms, so a client that sends its whole body before reading
+the response gets the refusal.
 `/status` reports `http.request_body_bytes` and `http.max_request_bytes`.
 
 Source `install/completions/splash.bash` for Bash or
@@ -101,6 +106,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. |
+| `--request-timeout` | `1800` | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
 | `--no-webui` | Off | Disable the chat page. |
@@ -117,6 +123,23 @@ cannot fit, startup prints a memory budget breakdown and stops.
 a server on another port), preserving other providers, settings and sessions.
 The browser chat and agent launchers connect to the running server; a model
 need not appear in a client's catalog to serve it by its full repository ID.
+
+`splash hermes` runs Hermes in the `splash` profile (`splash-<port>`) of the
+user's Hermes root, `~/.hermes` or the root `HERMES_HOME` belongs to, and
+creates it with `hermes profile create` on first use. It writes only the
+profile's model settings; Hermes's tools and the root's `config.yaml` remain
+the user's.
+
+Earlier versions gave Hermes a home of its own, `install/agents/hermes` in a
+checkout or `~/Library/Application Support/Splash/runtime/hermes` in a
+release, which Hermes took for a root: a Hermes that manages its own runtime
+installed its tools there and pointed the `hermes` command at them. While that
+directory still exists, run `hermes pm install` once in a normal shell; it
+installs Hermes's tools under `~/.hermes/tools` and points the `hermes` and
+`hermes-acp` launchers in `~/.hermes/hermes-agent/.hermes/bin` at them. Once
+those launchers no longer name the old directory, or do not exist, as with
+Hermes before its managed runtime, delete it with the sessions Splash started
+there.
 
 ### KV cache precision
 
@@ -641,8 +664,9 @@ variants, so a `:VARIANT` suffix is rejected, and `--revision`,
 
 ## Code and API boundaries
 
-- `server/`: OpenAI Chat/Responses, Anthropic Messages/count_tokens, typed
-  judgments, templates, streaming and input processing. No client-version branches.
+- `server/`: OpenAI Chat/Completions/Responses, Anthropic Messages/count_tokens,
+  typed judgments, templates, streaming and input processing. No client-version
+  branches.
 - `runtime/engine/`: scheduling, memory admission and reusable request state.
 - `runtime/model/`: target/draft execution and vision.
 - `runtime/ops/` and `runtime/metal/`: operators and Metal kernels.
@@ -660,9 +684,11 @@ Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The
 original schema validates complete arguments, including cross-field conditions,
 dependencies and property-count rules that framing alone cannot enforce; array
-item bounds and `multipleOf` above 64 are left to that validation as well, and
-the framed schemas of one request are limited to 16 MiB. Extra properties use
-JSON-encoded values; statically typed strings retain raw text.
+item bounds and `multipleOf` above 64 are left to that validation as well, as
+are patterns the grammar cannot compile (look-around, word boundaries,
+backreferences). The framed schemas of one request are limited to 16 MiB. Extra
+properties use JSON-encoded values; statically typed strings retain raw text,
+so their patterns are checked on the complete call.
 `tool_choice: "none"` renders the tools like any other choice and only
 prevents calls. Remote schema references, parameter names containing XML
 delimiters and `unevaluatedProperties` combined with `patternProperties` are
@@ -695,13 +721,34 @@ raw tokenization does not account for image embeddings (use `count_tokens` for t
 Both endpoints run without inference and share bounded preparation capacity with
 `count_tokens`; they can inspect prompts larger than the serving context limit.
 
+`POST /v1/completions` serves OpenAI's legacy text completions. `prompt` is one
+string, which the loaded tokenizer encodes as a raw prompt, adding its own
+special tokens such as a BOS and recognizing special-token strings, or one array
+of token IDs from its vocabulary. No chat template, reasoning split, tools or
+images apply: `text` is the generated text, decoded without special tokens.
+`max_tokens` defaults to 16, OpenAI's default for the endpoint as in vLLM and
+SGLang, or to what the context leaves when that is less. `temperature`,
+`top_p`, `top_k`, `seed`, `stop`, `priority`, `timeout` and `stream` with
+`stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
+`echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
+
+Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
+and llama.cpp do: the model never selects its own stop tokens, and a draft
+proposal of one is rejected, so generation runs to its output budget and
+finishes with `length` unless a `stop` string ends it first. Benchmarks use it
+to generate a fixed number of tokens. Tools and structured output generate
+under a grammar, which decides where the output ends, so combining them with
+`ignore_eos` returns 400. The engine receives it as bit 0 of the request
+frame's flags word (native wire version 7), which rejects undefined bits.
+
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,
 initial cached tokens, completed tokens including cache, and elapsed milliseconds
 since prefill admission. Updates follow completed chunks and never regress during
-recovery; they are not a time estimate. Chat uses empty-delta chunks, Responses
-uses `response.in_progress`, and Messages uses `ping`. Queueing and prompt
-preparation do not advance this counter. Non-streaming requests cannot enable it.
+recovery; they are not a time estimate. Chat uses empty-delta chunks, text
+completions empty-text chunks, Responses `response.in_progress`, and Messages
+`ping`. Queueing and prompt preparation do not advance this counter.
+Non-streaming requests cannot enable it.
 
 `GET /status` returns instance identity and the effective context limit as JSON.
 Proxy consumers can use these fields; additional fields may be added:
@@ -719,11 +766,12 @@ Proxy consumers can use these fields; additional fields may be added:
 `GET /metrics` exposes the same counters in Prometheus text format. Both endpoints
 require the API key when authentication is enabled. Consumers should tolerate
 missing native fields while the engine is unavailable, and counter resets after
-an engine restart. Chat streams include token usage when the request sets
-`"stream_options":{"include_usage":true}`; non-streaming Chat responses always
-include usage. A proxy must consume these fields to display statistics.
+an engine restart. Chat and text completion streams include token usage when
+the request sets `"stream_options":{"include_usage":true}`; their non-streaming
+responses always include usage. A proxy must consume these fields to display
+statistics.
 
-Chat completions also include a llama-server-style `timings` object, both in
+Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
 even without `include_usage`. `prompt_n` and `predicted_n` are the full prompt
 and output counts; `cache_n` is the cached prompt count. `prompt_ms` measures
@@ -756,6 +804,9 @@ with large images, is kept only as a marker with its size and SHA-256
 (`omitted_frames` counts them), and a trace missing engine input that way
 cannot be replayed.
 
+A request keeps its reusable model state at the last whole 32-token page before
+its generation prompt, the text a chat template appends to open the reply: the
+next turn may render it differently, so a follow-up resumes from there.
 Requests sharing a cold prefix can wait for a resident request's planned recovery
 point, then enter through the ordinary cache restore path. Waiting requests hold
 no active state cell or KV pages and return to ordinary admission when no useful
@@ -766,13 +817,22 @@ Higher-priority work does not wait for a lower-priority producer. `/status` expo
 Greedy and sampled requests can share an unconstrained decode batch; each lane
 keeps its own sampling policy and RNG. Pure greedy batches retain their argmax
 path. Constrained requests use a separate batch for the host mask exchange.
+A lane's arithmetic can depend on the batch it decodes in and on how its
+prompt is chunked. Concurrent requests change both, and chunk boundaries also
+come from the cached boundary a request resumes from and from the junctions
+and checkpoints earlier requests left. So a greedy or seeded request repeats
+its output when it runs alone with the same cached prefixes; alongside other
+requests, or with other prefixes cached, it can differ.
 
 Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
 prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
 work. These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended
-requests then resume first, each within its own resource wait. Readiness does
+requests then resume first, each within its own resource wait. A resource
+wait's limit restarts whenever a lane submitted before the waiting request has
+work in flight, since that lane holds memory the request waits for until it
+finishes; lanes submitted after the request do not extend it. Readiness does
 not guarantee that a request-sized allocation fits.
 
 ### Disk cache
@@ -977,6 +1037,10 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-performance-real` | the native decode and partial-prefix benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
+`test-agent-real` runs Hermes in a profile of its own in the developer's Hermes
+root, `splash-test-<id>`, which moves into the run's folder under
+`build/release` when Hermes finishes.
+
 `benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
 the same way. The models they are run with, one per family and source format:
 
@@ -988,6 +1052,15 @@ the same way. The models they are run with, one per family and source format:
 The source formats load differently: an MLX target is prepared into the packed
 layout, a GGUF target into its own layout for the GGUF projection and MoE
 kernels, and a package's packed files are mapped as they are.
+
+On a 24 GB Mac, `test-agent-real` stops a client's workflow at macOS's warning
+memory pressure, which the smaller GGUF variants such a Mac uses can reach under
+an agent's load; `SPLASH_TEST_PRESSURE_STOP=4` stops only at critical pressure,
+to observe how the engine sheds its cache. The runtime oracle in `test-real` has
+no production memory guard: the prepared weights, and then what the runtime
+allocates as it runs, must fit in what macOS has available above its reserve,
+so it stops, naming what it needs, while other programs hold that memory. With
+only desktop applications open, a 24 GB Mac runs it for those variants.
 
 `make test-engine-cpu` builds the affine source oracle so it cannot break
 unnoticed, but no target runs it because it needs real models: after
@@ -1081,11 +1154,16 @@ make test-performance-real MODEL=mlx-community/Qwen3.8-27B-4bit BASELINE=/path/t
 The first characterizes this build: the decode widths B1-B4 and a 14,096-token
 partial-prefix request, three samples each, in
 `build/release/<owner>--<repo>[--VARIANT]/backend-benchmark.json`;
-`make benchmark-backend MODEL=...` adds the 2K to 128K contexts. The second
-compares this build with a retained checkout's in ABBA order, as the release
-check does ([Release check](#release-check)), and writes
+`make benchmark-backend MODEL=...` adds the 2K to 128K contexts the memory
+plan holds. The second compares this build with a retained checkout's in ABBA
+order, as the release check does ([Release check](#release-check)), and writes
 `backend-regression.json` there. Neither is a comparison with another engine
 or a test of agent task quality.
+
+`benchmark-backend` lists the contexts the memory plan cannot hold in its
+report. Its cache checks reuse each context's cached prefix, so they need that
+memory free: when other programs leave too little, the engine evicts cached
+prefixes and the checks fail, naming what each lookup found.
 
 For a same-machine HTTP regression check, retain the previous `splash` binary
 **and its adjacent `splash.metallib`**, then run from the candidate checkout:
@@ -1161,5 +1239,5 @@ publicly accessible. Check the installed bottle on a supported Mac without
 developer tools; building from the source tree is not an installation check.
 
 The runtime package allowlists engine, Python, server and launcher files; tests,
-benchmarks and developer documents are excluded. User model links and Hermes
-sessions survive upgrades; downloads remain in the Hugging Face cache.
+benchmarks and developer documents are excluded. User model links survive
+upgrades; downloads remain in the Hugging Face cache.

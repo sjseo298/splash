@@ -220,14 +220,25 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
       hostAvailable, reservedBytes_);
   bool engineFits = !overflows && observed <= limitBytes_ &&
                     requested <= limitBytes_ - observed;
+  // Growth leaves the warning margin free above the host's reserve, except
+  // back to the serving footprint: that is what a request is served from,
+  // and a pressure pass that released it must not leave the server unable
+  // to start one while other applications hold the margin.
+  const bool withinServingFootprint =
+      !overflows && observed <= servingFootprintBytes_ &&
+      requested <= servingFootprintBytes_ - observed;
+  const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
+  const uint64_t hostMargin = withinServingFootprint ? 0 : kHostWarningMarginBytes;
   bool hostFits = ignoreHostPressure() ||
-      hostHeadroomBytes(hostAvailable, requested) >= kHostWarningMarginBytes;
+      (requested <= hostRoom && hostRoom - requested >= hostMargin);
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure
   // so the paced reclaim frees toward the recovery margin for it.
   if (engineFits && !hostFits)
     hostConstrained_ = true;
-  if (!engineFits || (!ignoreHostPressure() && (!hostFits || hostConstrained_)) ||
+  if (!engineFits ||
+      (!ignoreHostPressure() &&
+       (!hostFits || (hostHeld() && !withinServingFootprint))) ||
       pressure == MemoryPressure::Critical) {
     if (failure)
       *failure = !engineFits ? metal::AllocationFailure::EngineBudget
@@ -264,6 +275,11 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
+void MemoryGovernor::markServingFootprint() noexcept {
+  std::lock_guard lock(mutex_);
+  servingFootprintBytes_ = observedResidentBytes(true);
+}
+
 void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
   if (outcome == ReclaimOutcome::Untargeted)
     return;
@@ -286,12 +302,13 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       hostAvailable, reservedBytes_);
   bool hostGrowthAllowed = ignoreHostPressure() ||
       (effectivePressure != MemoryPressure::Critical &&
-       !hostConstrained_ && hostHeadroom >= kHostWarningMarginBytes);
+       !hostHeld() && hostHeadroom >= kHostWarningMarginBytes);
   bool growthAllowed = (effectivePressure != MemoryPressure::Critical) &&
                        hostGrowthAllowed && used < limitBytes_;
   return {
       limitBytes_,
       observed,
+      servingFootprintBytes_,
       reservedBytes_,
       used < limitBytes_ ? limitBytes_ - used : 0,
       effectivePressure,
@@ -349,8 +366,12 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // Comprobar si el presupuesto de Metal del motor está ajustado (< 1 GiB de margen)
   // o si hay una solicitud esperando memoria. Si es así, se debe desalojar memoria
   // ociosa y prefijos antiguos para asegurar que la solicitud activa disponga de espacio.
+  // Solo aplica cuando el presupuesto puede albergar el margen (>= 2 GiB); con
+  // límites menores se conserva la política upstream.
   constexpr uint64_t kEngineTargetMargin = 1ULL << 30; // 1 GiB
-  const bool engineLowHeadroom = snapshot.headroomBytes < kEngineTargetMargin;
+  const bool engineLowHeadroom =
+      snapshot.limitBytes >= 2 * kEngineTargetMargin &&
+      snapshot.headroomBytes < kEngineTargetMargin;
 
   if (snapshot.pressure == MemoryPressure::Normal && !requestWaiting && !engineLowHeadroom) {
     nextReclaimMilliseconds_ = 0.0;
@@ -360,7 +381,7 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
     return continued_.value_or(MemoryReclaimDirective{true, false, 0});
   // The host samples every 500 ms. Allow counters to settle between batches,
   // but keep responding if another application continues consuming memory.
-  nextReclaimMilliseconds_ = nowMilliseconds + 500.0;
+  nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
   continued_.reset();
 
   // Missing telemetry pauses allocation, but is not evidence that live

@@ -40,8 +40,8 @@ For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/s
 
 ## Use the API
 
-OpenAI Chat Completions and Responses, and Anthropic Messages, with streaming,
-tool calls, JSON Schema output, images, and inline PDFs:
+OpenAI Chat Completions, Responses and Completions, and Anthropic Messages,
+with streaming, tool calls, JSON Schema output, images, and inline PDFs:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \

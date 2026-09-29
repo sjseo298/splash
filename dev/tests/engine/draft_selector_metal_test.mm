@@ -65,6 +65,12 @@ private:
   uint64_t state_;
 };
 
+// Target sampling takes the model's stop tokens: here one in the first shard
+// and one in the last, so a lane that excludes them skips them in both.
+std::array<uint32_t, 2> stopTokens(uint32_t vocabulary) {
+  return {1, vocabulary - 2};
+}
+
 MetalBuffer allocate(MetalBackend &backend, uint64_t bytes) {
   MetalBuffer buffer =
       backend.allocateBuffer(bytes, BufferStorage::Shared, "draft selector");
@@ -304,15 +310,17 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
       fillRow(logits + (lane * kRows + row) * vocabulary, vocabulary,
               row % 2 ? Pattern::Ties : Pattern::Peaked, random);
   }
+  const auto stops = stopTokens(vocabulary);
   CommandGraph graph;
-  sampling.addVerify(graph, policies, batch);
+  sampling.addVerify(graph, policies, batch, stops[0], stops[1]);
   static_cast<void>(backend.submitCommand(graph.dispatches()));
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     auto single = buffers(1);
     std::memcpy(single.logits.contents(), logits + lane * kRows * vocabulary,
                 single.logits.sizeBytes());
     CommandGraph reference;
-    sampling.addVerify(reference, std::span(policies).subspan(lane, 1), single);
+    sampling.addVerify(reference, std::span(policies).subspan(lane, 1), single,
+                       stops[0], stops[1]);
     static_cast<void>(backend.submitCommand(reference.dispatches()));
     if (policies[lane].samples()) {
       const uint64_t offset = uint64_t{lane} * kRows * kTargetSamplingCandidates;
@@ -398,10 +406,12 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
     }
     require(mass == 1.0, "top-1 target is not normalized");
   };
+  const auto stops = stopTokens(vocabulary);
   for (const float temperature : {0.0F, 0.8F}) {
     poison();
     CommandGraph initial;
-    sampling.addInitial(initial, {1, temperature, 0.5F, true}, b, kRows - 1);
+    sampling.addInitial(initial, {1, temperature, 0.5F, true}, b, kRows - 1,
+                        stops[0], stops[1]);
     static_cast<void>(backend.submitCommand(initial.dispatches()));
     const uint32_t id = expected(kRows - 1, 0);
     require(static_cast<uint32_t *>(b.outputTokens.contents())[0] == id,
@@ -413,7 +423,7 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
   for (uint32_t lane = 0; lane < lanes; ++lane)
     policies[lane] = {1, lane % 2 ? 0.8F : 0.0F, 0.5F, true};
   CommandGraph verify;
-  sampling.addVerify(verify, policies, b);
+  sampling.addVerify(verify, policies, b, stops[0], stops[1]);
   static_cast<void>(backend.submitCommand(verify.dispatches()));
   for (uint32_t row = 0; row < rows; ++row) {
     const uint32_t maskRow = row / kRows * (kRows + 1) + row % kRows + 1;
@@ -425,19 +435,167 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
   const SamplingPolicy greedy{1, 0.0F, 1.0F, false};
   poison();
   CommandGraph initialArgmax;
-  sampling.addInitial(initialArgmax, greedy, b, kRows - 1);
+  sampling.addInitial(initialArgmax, greedy, b, kRows - 1, stops[0], stops[1]);
   static_cast<void>(backend.submitCommand(initialArgmax.dispatches()));
   require(static_cast<uint32_t *>(b.outputTokens.contents())[0] ==
               expected(kRows - 1, kUnmasked),
           "initial argmax differs from CPU argmax");
   poison();
   CommandGraph verifyArgmax;
-  sampling.addVerify(verifyArgmax, std::vector<SamplingPolicy>(lanes, greedy), b);
+  sampling.addVerify(verifyArgmax, std::vector<SamplingPolicy>(lanes, greedy), b,
+                     stops[0], stops[1]);
   static_cast<void>(backend.submitCommand(verifyArgmax.dispatches()));
   for (uint32_t row = 0; row < rows; ++row)
     require(static_cast<uint32_t *>(b.outputTokens.contents())[row] ==
                 expected(row, kUnmasked),
             "batched argmax differs from CPU argmax");
+}
+
+// A lane that ignores end-of-sequence never selects a stop token: not in the
+// sample after a prefill chunk, not in any verify row, greedy or sampled,
+// alone or batched beside lanes that keep them, and a stop token its draft
+// proposes is rejected. The stop tokens lead every row, so a lane that keeps
+// them selects one; the other lanes take the row's best remaining token.
+void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
+  const uint32_t rows = kLanes * kRows;
+  const auto space = Sampling::workspace(rows);
+  const auto stops = stopTokens(vocabulary);
+  Sampling sampling(backend, vocabulary, kRows);
+  SamplingBuffers b{
+      allocate(backend, uint64_t{rows} * vocabulary * sizeof(float)),
+      allocate(backend, space.partialIdsBytes),
+      allocate(backend, space.partialValuesBytes),
+      allocate(backend, space.topIdsBytes),
+      allocate(backend, space.topProbabilitiesBytes),
+      allocate(backend, uint64_t{kLanes} * 2 * kRows * sizeof(float)),
+      allocate(backend, uint64_t{kLanes} * (kRows + 1) * ((vocabulary + 31) / 32) * 4),
+      allocate(backend, uint64_t{rows} * sizeof(uint32_t)),
+      allocate(backend, space.argmaxValuesBytes),
+      allocate(backend, space.argmaxIndicesBytes)};
+  const auto best = [&](uint32_t row) { return 5 + row * 7919 % (vocabulary - 8); };
+  auto *logits = static_cast<float *>(b.logits.contents());
+  for (uint32_t row = 0; row < rows; ++row) {
+    float *values = logits + uint64_t{row} * vocabulary;
+    for (uint32_t token = 0; token < vocabulary; ++token)
+      values[token] = -4.0F + float(token % 7) * 0.01F;
+    values[best(row)] = 8.0F;
+    values[stops[0]] = 12.0F;
+    values[stops[1]] = 11.0F;
+  }
+  auto *uniforms = static_cast<float *>(b.uniforms.contents());
+  const auto *tokens = static_cast<const uint32_t *>(b.outputTokens.contents());
+  const auto *ids = static_cast<const uint32_t *>(b.topIds.contents());
+  const auto *probabilities =
+      static_cast<const float *>(b.topProbabilities.contents());
+  const auto stop = [&](uint32_t token) {
+    return token == stops[0] || token == stops[1];
+  };
+  // Whether a row's sparse target distribution gives a stop token any mass.
+  const auto stopMass = [&](uint32_t row) {
+    for (uint32_t rank = 0; rank < kTargetSamplingCandidates; ++rank) {
+      const uint64_t index = uint64_t{row} * kTargetSamplingCandidates + rank;
+      if (stop(ids[index]) && probabilities[index] > 0.0F)
+        return true;
+    }
+    return false;
+  };
+  auto poison = [&] {
+    for (const auto &buffer : {b.partialIds, b.partialValues, b.topIds,
+                              b.topProbabilities, b.outputTokens})
+      std::memset(buffer.contents(), 0xA5, buffer.sizeBytes());
+  };
+
+  for (const bool excludes : {false, true}) {
+    for (const float temperature : {0.0F, 0.8F}) {
+      for (const float uniform : {0.0F, 0.5F, 0.999F}) {
+        poison();
+        uniforms[0] = uniform;
+        CommandGraph initial;
+        sampling.addInitial(initial, {32, temperature, 1.0F, false, excludes}, b,
+                            kRows - 1, stops[0], stops[1]);
+        static_cast<void>(backend.submitCommand(initial.dispatches()));
+        if (excludes)
+          require(tokens[0] == best(kRows - 1) ||
+                      (temperature > 0.0F && tokens[0] < vocabulary &&
+                       !stop(tokens[0])),
+                  "an excluding lane selected a stop token after prefill");
+        else
+          require(stop(tokens[0]), "the initial sample skipped the stop tokens");
+      }
+    }
+  }
+
+  // Drafts propose the first stop token, with all of their mass on it.
+  const auto proposalSpace = Sampling::draftWorkspace(kLanes * kPositions);
+  AcceptanceBuffers acceptance{
+      allocate(backend, uint64_t{kLanes} * kPositions * sizeof(uint32_t)),
+      allocate(backend, proposalSpace.candidatesBytes),
+      allocate(backend, proposalSpace.proposalProbabilitiesBytes),
+      b.topIds,
+      b.topProbabilities,
+      b.uniforms,
+      b.outputTokens,
+      allocate(backend, kLanes * sizeof(uint32_t)),
+      allocate(backend, kLanes * sizeof(uint32_t)),
+      allocate(backend, kLanes * sizeof(uint32_t))};
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    static_cast<uint32_t *>(acceptance.proposedTokens.contents())[lane * kPositions] =
+        stops[0];
+    static_cast<uint32_t *>(acceptance.candidates.contents())
+        [uint64_t{lane} * kPositions * kCandidates] = stops[0];
+    static_cast<float *>(acceptance.proposalProbabilities.contents())
+        [uint64_t{lane} * kPositions * kCandidates] = 1.0F;
+  }
+  std::fill(uniforms, uniforms + kLanes * 2 * kRows, 0.5F);
+  const std::array<uint32_t, kLanes> maximumRetained{kRows, kRows, kRows, kRows};
+  for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
+    for (uint32_t excludeMask = 0; excludeMask < (1U << lanes); ++excludeMask) {
+      for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
+        std::vector<SamplingPolicy> policies;
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          policies.push_back({32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F,
+                              1.0F, false, (excludeMask >> lane & 1U) != 0});
+        poison();
+        CommandGraph verify;
+        sampling.addVerify(verify, policies, b, stops[0], stops[1]);
+        static_cast<void>(backend.submitCommand(verify.dispatches()));
+        for (uint32_t row = 0; row < lanes * kRows; ++row) {
+          const SamplingPolicy &policy = policies[row / kRows];
+          if (policy.samples())
+            require(stopMass(row) != policy.excludesStopTokens,
+                    "a verify distribution mishandled the stop tokens");
+          else
+            require(tokens[row] ==
+                        (policy.excludesStopTokens ? best(row) : stops[0]),
+                    "a greedy verify row mishandled the stop tokens");
+        }
+        CommandGraph accept;
+        sampling.addAcceptance(accept, acceptance,
+                               std::span(maximumRetained).first(lanes), policies,
+                               stops[0], stops[1]);
+        static_cast<void>(backend.submitCommand(accept.dispatches()));
+        const auto *retained =
+            static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
+        const auto *anchors =
+            static_cast<const uint32_t *>(acceptance.nextAnchors.contents());
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+          const uint32_t *output = tokens + lane * kRows;
+          if (!policies[lane].excludesStopTokens) {
+            require(retained[lane] == 1 && output[0] == stops[0] &&
+                        anchors[lane] == stops[0],
+                    "the target did not accept the drafted stop token");
+            continue;
+          }
+          require(retained[lane] >= 1 && retained[lane] <= kRows &&
+                      !stop(anchors[lane]),
+                  "an excluding lane accepted a stop token");
+          for (uint32_t index = 0; index < retained[lane]; ++index)
+            require(output[index] < vocabulary && !stop(output[index]),
+                    "an excluding lane accepted a stop token");
+        }
+      }
+    }
+  }
 }
 
 void invalidRequests(MetalBackend &backend) {
@@ -480,9 +638,11 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: draft-selector METALLIB");
     MetalBackend backend(argv[1]);
     invalidRequests(backend);
-    for (const uint32_t vocabulary : {1003U, 248320U})
+    for (const uint32_t vocabulary : {1003U, 248320U}) {
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
         targetTop1(backend, vocabulary, lanes);
+      excludedStopTokens(backend, vocabulary);
+    }
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
       for (uint32_t mask = 0; mask < (1U << lanes); ++mask)
         mixedVerify(backend, lanes, mask);

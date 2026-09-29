@@ -8,6 +8,7 @@ from urllib.parse import quote
 
 from dev.tests import test_server as fixtures
 from dev.tests.engine.test_json_responses import PATHS, request_body, stream_events
+from dev.tests.engine.test_launcher import keep_stop_signals
 from install import launcher
 from server import frontend
 from server import server as api
@@ -198,6 +199,7 @@ class ServedModelNamesTests(unittest.TestCase):
             self.assertEqual(launcher._parse_served_model_name(name), name)
 
     def test_launcher_forwards_repeated_aliases(self):
+        keep_stop_signals(self)
         with (
             tempfile.TemporaryDirectory() as tmp,
             mock.patch.object(launcher, "RUNTIME_DIR", Path(tmp)),

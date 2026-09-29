@@ -119,7 +119,6 @@ public:
 private:
   enum class Scratch : uint32_t {
     Patches,
-    Positions,
     RopeCos,
     RopeSin,
     Hidden,

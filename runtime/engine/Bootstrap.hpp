@@ -91,7 +91,9 @@ private:
 
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
-    NativeLoopConfig nativeLoop;
+    // A zero engine maxContext is what the memory plan holds, as serve's
+    // default; a larger one than that fails the bootstrap.
+    NativeLoopConfig nativeLoop{.engine = {.maxContext = 0}};
     protocol::ProtocolLimits protocolLimits;
 };
 

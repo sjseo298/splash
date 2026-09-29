@@ -30,6 +30,11 @@ struct EngineRequest final {
   RequestPriority priority = RequestPriority::Normal;
   BatchCohort cohort = BatchCohort::Greedy;
   std::vector<uint32_t> prompt;
+  // Trailing prompt tokens a later request may not share (a chat template's
+  // generation prompt, which the next turn may render differently), so
+  // reusable state is kept before them. Zero when unknown; it must leave at
+  // least one prompt token.
+  uint32_t generationPromptTokens = 0;
   std::vector<ImageSpan> images;
   std::vector<uint8_t> imagePixels;
   uint32_t maxNewTokens = 0;
@@ -41,10 +46,12 @@ struct EngineRequest final {
   // generated, and the raw final-position logits at these ids are returned in
   // the completion callback. maxNewTokens must be zero.
   std::vector<uint32_t> scoreTokens{};
+  // RequestFlag bits.
+  uint32_t flags = 0;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
-    return {id,        cohort,   prompt,     images, imagePixels,
-            maxNewTokens, sampling, constraint, scoreTokens};
+    return {id,           cohort,   prompt,     images,      imagePixels,
+            maxNewTokens, sampling, constraint, scoreTokens, flags};
   }
 };
 

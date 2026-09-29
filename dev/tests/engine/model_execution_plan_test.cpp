@@ -152,7 +152,7 @@ void checkMixedLayouts() {
   target.layers.front().gateProjection = up;
   require(target.logitsProjection.layout() == ops::WeightLayout::Affine64,
           "mixed fixture must keep an affine vocabulary head");
-  for (uint32_t family : {9U, 10U}) {
+  for (uint32_t family : {9U, 10U, 11U}) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 16;
@@ -252,7 +252,7 @@ int main() {
     checkMixedLayouts();
     const auto dense = package<model::Qwen3_8Weights>();
     const auto sparse = package<model::Qwen3_6MoeWeights>();
-    for (uint32_t family : {9U, 10U}) {
+    for (uint32_t family : {9U, 10U, 11U}) {
       checkPackage(dense, family);
       checkPackage(sparse, family);
     }

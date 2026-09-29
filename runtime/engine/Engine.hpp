@@ -116,8 +116,13 @@ private:
 
   struct ResourceWait final {
     StateFailure reason = StateFailure::None;
+    // What refused the memory at the latest attempt.
+    metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
     std::optional<double> startedMilliseconds;
     double deadlineMilliseconds = 0.0;
+    // The latest tick at which a lane submitted before the request had work
+    // in flight; the limit restarts from it.
+    double earlierLaneWorkMilliseconds = 0.0;
     double retryMilliseconds = 0.0;
     uint64_t epoch = 0;
     // Memory is on its way back; the limit fires only without progress.
@@ -132,6 +137,9 @@ private:
     };
 
     EngineRequest request;
+    // Its place in submission order. Earlier requests' lanes hold memory it
+    // may wait for, so their work restarts its resource wait's limit.
+    uint64_t sequence = 0;
     std::optional<uint32_t> stateCell;
     bool suspended = false;
     uint32_t promptTokens = 0;
@@ -185,6 +193,11 @@ private:
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
+  // Where the state a later request resumes from is kept: the last whole
+  // page before the replay's final input token and, while the lane replays
+  // only its prompt, before the prompt's generation prompt.
+  [[nodiscard]] static uint32_t
+  replayStateBoundary(const Request &request) noexcept;
   [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
                                                       const Request &right);
   [[nodiscard]] bool pendingSharedPrefill(const Request &request,
@@ -243,15 +256,18 @@ private:
                         double nowMilliseconds);
   [[nodiscard]] bool resourceRetryReady(const Request &request,
                                         double nowMilliseconds) const noexcept;
-  // With `pending`, memory is on its way back (pages of demoted blocks land
-  // within commands): the wait limit measures time without progress, so it
-  // moves out with every retry that follows progress and never fires while
+  // The wait keeps the denial's allocation failure for its timeout message.
+  // With a pending denial, memory is on its way back (pages of demoted blocks
+  // land within commands): the wait limit measures time without progress, so
+  // it moves out with every retry that follows progress and never fires while
   // progress has been made since the last attempt.
   void deferResourceRetry(Request &request, double nowMilliseconds,
-                          StateFailure reason = StateFailure::MemoryPressure,
-                          bool pending = false) noexcept;
+                          const Denial &denial,
+                          StateFailure reason = StateFailure::MemoryPressure) noexcept;
   // The wait limit tick() enforces, or zero while it enforces none: a
-  // pending wait that has seen progress waits for its next attempt.
+  // pending wait that has seen progress waits for its next attempt. The
+  // limit restarts whenever a lane submitted before the request has work in
+  // flight.
   [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
