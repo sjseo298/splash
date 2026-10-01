@@ -321,7 +321,7 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(
             argv,
-            ["/bin/hermes", "chat", "--provider", "custom", "--model", MODEL],
+            ["/bin/hermes", "--provider", "custom", "--model", MODEL],
         )
         self.assertEqual(
             env,
@@ -357,6 +357,17 @@ class ClientTests(unittest.TestCase):
             {path.name for path in self.hermes_root.iterdir()},
             {"config.yaml", "profiles"},
         )
+
+    def test_hermes_arguments_pass_through_as_hermes_takes_them(self):
+        # Hermes takes --provider and --model before any subcommand; -q is
+        # chat's, and -z the top level's.
+        for args in (["chat", "-q", "Hello"], ["sessions", "list"], ["-z", "Hello"]):
+            with self.subTest(args=args):
+                argv, _ = self.command("hermes", client_args=args)
+                self.assertEqual(
+                    argv,
+                    ["/bin/hermes", "--provider", "custom", "--model", MODEL, *args],
+                )
 
     def test_hermes_names_a_profile_per_port(self):
         for port, name in ((8000, "splash"), (8001, "splash-8001")):
@@ -458,7 +469,7 @@ class ClientTests(unittest.TestCase):
                                 "thinkingLevelMap": {"off": "none"},
                                 "input": ["text", "image"],
                                 "contextWindow": 102400,
-                                "maxTokens": 25600,
+                                "maxTokens": 32768,
                             }
                         ],
                     }
@@ -1310,7 +1321,7 @@ class InstalledCodexTests(unittest.TestCase):
         # The installed client and production HTTP adapter are real. A
         # controlled length stop keeps this boundary test independent of model text.
         runtime = FakeRuntime(*(Plan([[4]], reason="length") for _ in range(32)))
-        harness = Harness(runtime, max_context=131072, default_max_new=16, timeout=60)
+        harness = Harness(runtime, max_context=131072, timeout=60)
         self.addCleanup(harness.close)
         base_url = f"http://127.0.0.1:{harness.server.server_port}"
         with tempfile.TemporaryDirectory() as directory:
@@ -1376,6 +1387,13 @@ class InstalledCodexTests(unittest.TestCase):
                 32,
                 "client exhausted the bounded truncation fixture",
             )
+            # Codex names no output limit, so each request may use all the
+            # context its prompt leaves.
+            for request in runtime.requests:
+                self.assertEqual(
+                    request.logical_max_output_tokens,
+                    131072 - len(request.prompt_tokens),
+                )
             rows = [
                 json.loads(line) for line in stdout.splitlines() if line.startswith("{")
             ]

@@ -771,6 +771,11 @@ class AgentRunnerTests(unittest.TestCase):
                         if session:
                             expected += ["--session", session]
                         self.assertEqual(argv[1:], expected)
+                    if name == "hermes":
+                        expected = ["chat", "--oneshot", "--query-file", "-"]
+                        if session:
+                            expected += ["--resume", session]
+                        self.assertEqual(argv[1:], expected)
 
     def test_opencode_runs_as_splash_launches_it(self):
         # OpenCode 2 reaches the inline configuration only through a private
