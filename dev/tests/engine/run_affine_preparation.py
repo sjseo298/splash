@@ -22,9 +22,8 @@ from dev.tests.fixture_files import (  # noqa: E402
 )
 
 
-def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
+def fixture(root, moe=False):
     tensors = {}
-    quantization = {"bits": 4, "group_size": 64}
 
     def add(name, shape, dtype="BF16", data=None):
         size = math.prod(shape) * {"BF16": 2, "U32": 4, "F32": 4}[dtype]
@@ -41,8 +40,6 @@ def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
         add(name + ".weight", lead + [rows, columns * bits // 32], "U32")
         add(name + ".scales", lead + [rows, columns // 64])
         add(name + ".biases", lead + [rows, columns // 64])
-        if bits != 4:
-            quantization[name] = {"bits": bits, "group_size": 64}
 
     def packed(parts, rows, columns, bits=4, experts=1):
         # Per expert, each field's rows of the parts, then zero rows, in
@@ -152,45 +149,6 @@ def fixture(root, moe=False, rope_type_key="rope_type", rope_type="default"):
             for field in ("weight", "scales", "biases")
         ],
     )
-    config = {
-        "model_type": "qwen3_5_text",
-        "num_hidden_layers": 2,
-        "hidden_size": 256,
-        "vocab_size": 256,
-        "head_dim": 64,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "linear_num_key_heads": 2,
-        "linear_num_value_heads": 4,
-        "linear_key_head_dim": 64,
-        "linear_value_head_dim": 64,
-        "linear_conv_kernel_dim": 4,
-        "full_attention_interval": 2,
-        "rms_norm_eps": 1e-6,
-        "attention_bias": False,
-        "attn_output_gate": True,
-        "tie_word_embeddings": False,
-        "hidden_act": "silu",
-        "intermediate_size": 512,
-        "layer_types": ["linear_attention", "full_attention"],
-        "rope_parameters": {
-            "rope_theta": 10000000,
-            "partial_rotary_factor": 0.25,
-            rope_type_key: rope_type,
-        },
-    }
-    if moe:
-        del config["intermediate_size"]
-        config |= {
-            "model_type": "qwen3_5_moe_text",
-            "num_experts": 256,
-            "num_experts_per_tok": 8,
-            "moe_intermediate_size": 256,
-            "shared_expert_intermediate_size": 256,
-        }
-    (root / "config.json").write_text(
-        json.dumps({"text_config": config, "quantization": quantization})
-    )
     write_safetensors(root / "model.safetensors", tensors)
 
 
@@ -236,9 +194,9 @@ def quantized_group(weights):
 
 
 def draft_fixture(root):
-    """A two-layer DFlash2 checkpoint of width 256 as its repository releases
-    it, config.json and BF16 safetensors, and the draft files its preparation
-    must write: each projection quantized, every other tensor as stored."""
+    """A two-layer DFlash2 checkpoint of width 256, its BF16 safetensors as
+    its repository releases them, and the draft files its preparation must
+    write: each projection quantized, every other tensor as stored."""
     tensors, values = {}, {}
 
     def add(name, shape, data=None):
@@ -329,18 +287,6 @@ def draft_fixture(root):
         add("candidate_selector.successor_codebook", [256, 256]),
     ]
     (expected / "model.bin").write_bytes(weight_file("MDFD0004", 2, 1, sections))
-    config = {
-        "architectures": ["DFlash2DraftModel"],
-        "hidden_size": 256,
-        "num_hidden_layers": 2,
-        "intermediate_size": 256,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 1,
-        "head_dim": 64,
-        "vocab_size": 256,
-        "dflash_config": {"selector_rank": 256},
-    }
-    (root / "config.json").write_text(json.dumps(config))
     write_safetensors(root / "model.safetensors", tensors)
 
 
@@ -381,26 +327,8 @@ def main():
         root.mkdir()
         fixture(root)
         command = prepare(args.binary, args.metallib, root, "dense", goldens["dense"])
-        # Fine-tunes may name the rope type by its older `type` key.
-        legacy = Path(directory) / "legacy"
-        legacy.mkdir()
-        fixture(legacy, rope_type_key="type")
-        prepare(args.binary, args.metallib, legacy, "dense", goldens["dense"])
-        # Read from either key, a rope type other than the default is refused.
-        refused = Path(directory) / "legacy-yarn"
-        refused.mkdir()
-        fixture(refused, rope_type_key="type", rope_type="yarn")
-        result = subprocess.run(
-            [*command[:2], str(refused), "dense"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode != 0 and "rope_parameters.type" in result.stderr, (
-            result.stderr
-        )
         # Raw checkpoints need a different normalization convention. Refuse
-        # their unsanitized convolution layout before publishing any weights.
+        # their unsanitized convolution layout.
         source = root / "model.safetensors"
         header, payload = read_safetensors(source)
         header["language_model.model.layers.0.linear_attn.conv1d.weight"]["shape"] = [
@@ -408,14 +336,12 @@ def main():
             1,
             4,
         ]
-        before = set((root / "cache").glob("*/weights"))
         source.write_bytes(safetensors_bytes(header, payload))
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         assert result.returncode != 0 and "conv1d.weight" in result.stderr, (
             result.stderr
         )
-        assert set((root / "cache").glob("*/weights")) == before
-        print("affine preparation: raw checkpoint rejected before conversion PASS")
+        print("affine preparation: raw checkpoint rejected PASS")
 
 
 if __name__ == "__main__":

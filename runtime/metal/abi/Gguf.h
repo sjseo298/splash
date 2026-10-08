@@ -46,16 +46,25 @@ inline constexpr uint64_t table16_sums_per_tile(uint32_t width) {
 // chunk; the simdgroups of the last tile whose rows start past `rows` skip
 // their matmuls.
 struct GgufPrefillParams {
-  uint32_t output_size; // columns of this segment
   uint32_t input_size;  // K
   uint32_t rows;        // rows of the chunk
-  uint32_t out_stride;  // row stride of the destination (0 = output_size)
+  uint32_t out_stride;  // columns of a destination row
   uint32_t out_offset;  // first destination column of this segment
 };
-static_assert(sizeof(GgufPrefillParams) == 20, "GGUF prefill parameters are 20 bytes on both sides");
+static_assert(sizeof(GgufPrefillParams) == 16, "GGUF prefill parameters are 16 bytes on both sides");
+// The residual prefill kernels over a view of the leading inputs of wider weight rows
+// (gguf_prefill_<format>_r_leading_inputs): each row of the planes holds plane_input_size inputs, of which the
+// projection reads the first prefill.input_size.
+struct GgufPrefillLeadingParams {
+  GgufPrefillParams prefill;
+  uint32_t plane_input_size;
+};
+static_assert(sizeof(GgufPrefillLeadingParams) == 20,
+              "GGUF leading-input prefill parameters are 20 bytes on both sides");
 
-// Decode tiles of both families (the register tile on Apple9, the staged
-// tile elsewhere and for prefill chunks of up to 32 rows): one tensor per
+// Decode tiles: the register tile, which Apple9 runs but for the projections
+// it stages (ops/LinearGguf.cpp, apple9Stages), and the staged tile, which
+// runs every other decode and prefill chunks of up to 32 rows. One tensor per
 // dispatch, over the dispatch's tiles (grid.x) and K partitions (grid.y).
 struct GgufDecodeParams {
   uint32_t input_size;  // K
@@ -105,9 +114,8 @@ struct GgufRotationParams {
 static_assert(sizeof(GgufRotationParams) == 4, "GGUF rotation parameters are 4 bytes on both sides");
 
 // fp32 projection of a GGUF float tensor (kernels/shared/gguf_float.metal):
-// out[r][out_offset + n] = sum_k x[r][k] * W[n][k] for rows r < rows, W as
-// stored ([output_size][input_size] floats of ggml type GGUF_TYPE_F32).
-#define GGUF_TYPE_F32 0u
+// out[r][out_offset + n] = sum_k x[r][k] * W[n][k] for rows r < rows, W the
+// fp32 weights as stored ([output_size][input_size]).
 struct GgufFloatParams {
   uint32_t rows;
   uint32_t input_size;  // K, a multiple of 8
@@ -116,7 +124,3 @@ struct GgufFloatParams {
   uint32_t out_offset;  // first destination column
 };
 static_assert(sizeof(GgufFloatParams) == 20, "GGUF float parameters are 20 bytes on both sides");
-
-#define GGUF_EPILOGUE_NONE 0u
-#define GGUF_EPILOGUE_RESIDUAL 1u
-#define GGUF_EPILOGUE_UP_WITH_GATE 2u
