@@ -194,9 +194,8 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
                     requested <= limitBytes_ - observed;
   // Growth leaves the warning margin free above the host's reserve and waits
   // for the recovery margin once the host has run short, unless a request
-  // in service needs it (setServing). The bypass waives the headroom and
-  // every hold but a system-critical pressure.
-  const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
+  // in service needs it (setServing) or host pressure is bypassed. The bypass
+  // waives the headroom checks and every hold but a system-critical pressure.  const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
   const bool hostRoomFits =
       requested <= hostRoom && hostRoom - requested >= kHostWarningMarginBytes;
   // A request that only the host headroom refuses waits for host memory
@@ -205,8 +204,7 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   if (!ignoreHostPressure() && engineFits && !serving_ && !hostRoomFits)
     host_.constrained = true;
   const bool hostRefuses = pressure == MemoryPressure::Critical ||
-      (!ignoreHostPressure() && !serving_ && (!hostRoomFits || host_.held()));
-  if (hostRefuses || !engineFits) {
+      (!ignoreHostPressure() && !serving_ && (!hostRoomFits || host_.held()));  if (hostRefuses || !engineFits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
     failure = hostRefuses ? metal::AllocationFailure::HostPressure
@@ -239,6 +237,10 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
 
 void MemoryGovernor::setServing(bool serving) noexcept {
   serving_ = serving;
+}
+
+void MemoryGovernor::setRequestWaiting(bool waiting) noexcept {
+  requestWaiting_ = waiting;
 }
 
 void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
@@ -276,8 +278,7 @@ MemoryGovernor::snapshot(const std::optional<uint64_t> &hostAvailable,
   const MemoryPressure pressure = effectivePressure(host);
   bool hostGrowthAllowed = ignoreHostPressure() ||
       (pressure != MemoryPressure::Critical && !host.held() &&
-       hostHeadroom >= kHostWarningMarginBytes);
-  return {
+       hostHeadroom >= kHostWarningMarginBytes);  return {
       limitBytes_,
       observed,
       used < limitBytes_ ? limitBytes_ - used : 0,
@@ -351,9 +352,6 @@ std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
     return MemoryReclaimDirective{.critical = true};
   if (nowMilliseconds < nextReclaimMilliseconds_)
     return continued_.value_or(MemoryReclaimDirective{});
-  // The host samples every 500 ms. Allow counters to settle between batches,
-  // but keep responding if another application continues consuming memory.
-  nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
   continued_.reset();
 
   // Missing telemetry pauses allocation, but is not evidence that live
@@ -367,13 +365,14 @@ std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
   uint64_t desired = 0;
   if (engineLowHeadroom) {
     desired = kEngineTargetMargin - snapshot.headroomBytes;
-  } else if (snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes) {
+  } else if (!ignoreHostPressure() && snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes) {
     desired = kHostRecoveryMarginBytes - snapshot.hostHeadroomBytes;
   }
   // Recovering the last stretch to the watermark is worth far less than the
   // resume point it would otherwise discard, so a pass with nothing waiting
   // keeps that publication and takes the rest. A waiting request outranks it.
-  return MemoryReclaimDirective{
+  if (desired)
+    nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;  return MemoryReclaimDirective{
       .targetBytes = std::min(desired, kHostWarningMarginBytes),
       .keepResumePoint = !requestWaiting};
 }
