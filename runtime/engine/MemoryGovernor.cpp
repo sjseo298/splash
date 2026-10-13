@@ -195,7 +195,8 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   // Growth leaves the warning margin free above the host's reserve and waits
   // for the recovery margin once the host has run short, unless a request
   // in service needs it (setServing) or host pressure is bypassed. The bypass
-  // waives the headroom checks and every hold but a system-critical pressure.  const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
+  // waives the headroom checks and every hold but a system-critical pressure.
+  const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
   const bool hostRoomFits =
       requested <= hostRoom && hostRoom - requested >= kHostWarningMarginBytes;
   // A request that only the host headroom refuses waits for host memory
@@ -204,7 +205,9 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   if (!ignoreHostPressure() && engineFits && !serving_ && !hostRoomFits)
     host_.constrained = true;
   const bool hostRefuses = pressure == MemoryPressure::Critical ||
-      (!ignoreHostPressure() && !serving_ && (!hostRoomFits || host_.held()));  if (hostRefuses || !engineFits) {
+      (!ignoreHostPressure() && !serving_ && (!hostRoomFits || host_.held()));
+
+  if (hostRefuses || !engineFits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
     failure = hostRefuses ? metal::AllocationFailure::HostPressure
@@ -372,8 +375,9 @@ std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
   // resume point it would otherwise discard, so a pass with nothing waiting
   // keeps that publication and takes the rest. A waiting request outranks it.
   if (desired)
-    nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;  return MemoryReclaimDirective{
-      .targetBytes = std::min(desired, kHostWarningMarginBytes),
+    nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
+
+  return MemoryReclaimDirective{      .targetBytes = std::min(desired, kHostWarningMarginBytes),
       .keepResumePoint = !requestWaiting};
 }
 

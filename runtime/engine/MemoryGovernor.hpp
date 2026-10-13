@@ -134,7 +134,8 @@ public:
   // speculative and keeps the resume point. A budget that holds two one-GiB
   // margins reclaims toward the lower one even while the host stays calm.
   // When host pressure is bypassed (ignoreHostPressure), only critical OS
-  // pressure stops growth; the warning/recovery margins are waived.  [[nodiscard]] std::optional<MemoryReclaimDirective>
+  // pressure stops growth; the warning/recovery margins are waived.
+  [[nodiscard]] std::optional<MemoryReclaimDirective>
   update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
          bool requestWaiting) noexcept;
   // What the pass of `directive` achieved. The passes up to the next
