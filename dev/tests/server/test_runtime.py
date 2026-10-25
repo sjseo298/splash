@@ -355,6 +355,48 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.completion_tokens, 3)
         self.assertEqual(result.reason, wire.FinishReason.LENGTH)
 
+    def test_bounded_length_done_ends_short_of_the_logical_max(self):
+        # A bound of the engine's own, the SSD cache's quota or the memory a
+        # lone lane could not grow past, ends a request before its logical
+        # maximum; a bounded end at that maximum breaks the protocol.
+        for completion, valid in ((2, True), (3, False)):
+            with self.subTest(completion=completion):
+                factory = FakeFactory()
+                runtime = engine_runtime.MultiplexedRuntime(
+                    process_factory=factory, eager_start=True
+                )
+                self.addCleanup(runtime.close)
+                process = factory.processes[0]
+                call = runtime.submit(request(15, logical_max_output_tokens=3))
+                process.send(wire.StartEvent(call.request_id, 0, 0))
+                process.send(
+                    wire.TokensEvent(
+                        call.request_id, 0, tuple(range(20, 20 + completion))
+                    )
+                )
+                process.send(
+                    wire.DoneEvent(
+                        call.request_id,
+                        wire.FinishReason.LENGTH,
+                        2,
+                        completion,
+                        10,
+                        20,
+                        30,
+                        (),
+                        bounded=True,
+                    )
+                )
+                if valid:
+                    result = call.result(1.0)
+                    self.assertTrue(result.bounded)
+                    self.assertEqual(result.completion_tokens, completion)
+                else:
+                    with self.assertRaisesRegex(
+                        engine_runtime.ProtocolFatal, "fewer than logical maximum 3"
+                    ):
+                        call.result(1.0)
+
     def test_stop_done_at_logical_max_is_valid(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -1392,6 +1434,56 @@ class RuntimeTests(unittest.TestCase):
                 eager_start=True,
             )
         self.assertIsNotNone(factory.processes[0].poll())
+
+    def test_startup_ends_with_the_failure_its_engine_reports(self):
+        message = (
+            "--max-context 1000000 exceeds the 790521 tokens the model and "
+            "this Mac's memory allow; omit it or pass at most 790521"
+        )
+        factory = FakeFactory(
+            initial_output=native_peer.serialize_event(
+                wire.ErrorEvent(
+                    wire.FailureClass.ENGINE_UNHEALTHY,
+                    0,
+                    False,
+                    b"bootstrap_failed",
+                    message.encode(),
+                )
+            )
+        )
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        failures = []
+        runtime.on_engine_failure = lambda error, _served: failures.append(error)
+        with mock.patch.object(runtime._crash_trace, "dump"):
+            with self.assertRaises(engine_runtime.EngineUnhealthy) as caught:
+                runtime.wait_ready(1)
+            self.assertEqual(str(caught.exception), message)
+            # The engine is stopped; it never served, so on_engine_failure
+            # hears nothing.
+            factory.processes[0].wait(1)
+            self.assertFalse(runtime.ready)
+            self.assertEqual(failures, [])
+            # A failed start does not keep the next one from starting.
+            factory.initial_output = None
+            self.assertTrue(runtime.wait_ready(1))
+        self.assertEqual(len(factory.processes), 2)
+
+    def test_startup_refuses_other_events_before_ready(self):
+        for event in (
+            wire.ErrorEvent(
+                wire.FailureClass.PROTOCOL_FATAL, 0, False, b"bad_frame", b"x"
+            ),
+            wire.StatusJsonEvent(1, b"{}"),
+        ):
+            with self.subTest(event=event):
+                factory = FakeFactory(initial_output=native_peer.serialize_event(event))
+                runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+                self.addCleanup(runtime.close)
+                with self.assertRaisesRegex(
+                    engine_runtime.ProtocolFatal, "before ReadyEvent"
+                ):
+                    runtime.wait_ready(1)
 
     def test_concurrent_waiters_share_one_failed_startup(self):
         factory = FakeFactory(initial_output=b"")

@@ -15,6 +15,7 @@
 // decode over a bf16 state is checked against the fp32 decode.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
+#include "TestFamilies.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
@@ -58,8 +59,9 @@ constexpr uint32_t kTaps = SPLASH_GDN_CONVOLUTION_TAPS, kCarried = kTaps - 1;
 constexpr uint32_t kLayers = 2;
 // The scales of the normalized q and k rows.
 constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
-constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
-                             GdnShape{16, 32, 128, 8192, 12544}};
+// Every family's shape (Qwen3.8-Flash-Next's gate is sigmoid(z), the others'
+// silu(z)).
+const std::vector<GdnShape> kShapes = splash::test::familyGdnShapes();
 
 double roundBfloat(double value) {
   return bf16ToFloat(floatToBf16(static_cast<float>(value)));
@@ -95,6 +97,8 @@ private:
 };
 
 double sigmoid(double value) { return 1.0 / (1.0 + std::exp(-value)); }
+// The output gate of a GDN of `shape`: sigmoid(z), or silu(z) = z sigmoid(z).
+double outputGate(const GdnShape &shape, double z) { return shape.sigmoidGate ? sigmoid(z) : z * sigmoid(z); }
 
 // The production state cell layout: every layer's conv rows, then every
 // layer's recurrent state, both padded to 16 KiB.
@@ -511,8 +515,8 @@ void checkStep(const Fixture &fixture, const StepInputs &step, uint32_t layer, u
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
         const double normalized = roundBfloat(exact[dim]);
         const double gate = bf16ToFloat(packed[zOffset + head * kHeadDim + dim]);
-        const double reference = normalized * gate * sigmoid(gate);
-        const double derivative = inverse * std::fabs(normWeight(fixture.mixerNorm, dim) * gate * sigmoid(gate));
+        const double reference = normalized * outputGate(shape, gate);
+        const double derivative = inverse * std::fabs(normWeight(fixture.mixerNorm, dim) * outputGate(shape, gate));
         require(closeBfloat(hidden[dim], reference, 3.0,
                             1e-6 + derivative * std::ldexp(magnitudes[token * kHeadDim + dim], -7)),
                 where + ": hidden mismatch");
@@ -1045,7 +1049,7 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
 }
 
 void rejectsInvalid(MetalBackend &backend) {
-  const GdnShape &shape = kShapes[1];
+  const GdnShape &shape = kShapes.front();
   Fixture fixture(backend, shape, 1);
   CommandGraph graph;
   for (const uint32_t lanes : {0U, kMaxLanes + 1})

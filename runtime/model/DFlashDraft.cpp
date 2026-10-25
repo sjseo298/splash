@@ -2,7 +2,9 @@
 #include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
 #include "metal/abi/DraftAttention.h"
+#include "ops/Embedding.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -15,7 +17,7 @@ void requireLayout(const DFlashDraftLayout &layout) {
       !layout.dynamicSize || !layout.qkvSize || !layout.attentionSize ||
       !layout.intermediateSize || !layout.attentionHeadDimension ||
       !(layout.rotaryTheta > 0.0F) ||
-      !layout.targetHiddenSize || !layout.selectorRank ||
+      !layout.targetLayerCount || !layout.selectorRank ||
       !layout.kvHeads) {
     throw WeightStoreError("DFlash draft layout contains a zero dimension");
   }
@@ -56,6 +58,35 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
 }
 
 } // namespace
+
+DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers,
+                              uint32_t intermediateSize, float rotaryTheta, std::span<const uint32_t> targetLayers) {
+  constexpr uint32_t most = ExecutionLimits::maximumDraftTargetLayers;
+  if (targetLayers.empty() || targetLayers.size() > most ||
+      std::ranges::adjacent_find(targetLayers, std::ranges::greater_equal{}) != targetLayers.end())
+    throw std::invalid_argument("a DFlash2 draft reads 1 to " + std::to_string(most) +
+                                " target layers, ascending");
+  if (!layers) throw std::invalid_argument("a DFlash2 draft has at least one layer");
+  // Its projections quantize in groups of 64 columns (DraftCheckpoint.cpp).
+  if (!intermediateSize || intermediateSize % 64)
+    throw std::invalid_argument("a DFlash2 draft's intermediate size is a positive multiple of 64");
+  if (!(rotaryTheta > 0)) throw std::invalid_argument("a DFlash2 draft's rotary theta is positive");
+  DFlashDraftLayout layout{.layers = layers,
+                           .hiddenSize = hiddenSize,
+                           .vocabularySize = vocabularySize,
+                           .dynamicSize = draft_dynamic_width(hiddenSize),
+                           .qkvSize = SPLASH_DRAFT_QKV_WIDTH,
+                           .attentionSize = SPLASH_DRAFT_ATTENTION_WIDTH,
+                           .intermediateSize = intermediateSize,
+                           .attentionHeadDimension = SPLASH_DRAFT_HEAD_DIMENSION,
+                           .rotaryTheta = rotaryTheta,
+                           .selectorRank = SPLASH_DRAFT_SELECTOR_RANK,
+                           .kvHeads = SPLASH_DRAFT_KV_HEADS,
+                           .targetLayerCount = static_cast<uint32_t>(targetLayers.size())};
+  std::ranges::copy(targetLayers, layout.targetLayers.begin());
+  requireLayout(layout);
+  return layout;
+}
 
 DFlashDraftRing::DFlashDraftRing(
     metal::MetalBackend &backend, std::shared_ptr<StateAllocationTracker> tracker,
@@ -195,6 +226,24 @@ void DFlashDraft::addContextKv(metal::CommandGraph &graph,
   }
 }
 
+uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
+  const ops::Linear &linear = operators_.linear();
+  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  uint32_t storageRows = rows;
+  const auto include = [&](const ops::Projection &p) {
+    storageRows = std::max(storageRows, linear.decodeStorageRows(rows, p.shape()));
+  };
+  for (const DFlashDraftLayerWeights &layer : weights_.layers)
+    for (const ops::Projection *p : {&layer.attentionDynamic, &layer.qkvProjection, &layer.outputProjection,
+                                     &layer.mlpDynamic, &layer.gateProjection, &layer.upProjection,
+                                     &layer.downProjection})
+      include(*p);
+  include(weights_.contextProjection);
+  include(weights_.selectorProjection);
+  for (const ops::Projection &p : contextKvProjections_) include(p);
+  return storageRows / ExecutionLimits::draftQueryRows;
+}
+
 void DFlashDraft::addDecode(
     metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
     const ops::Projection &vocabularyProjection,
@@ -295,6 +344,12 @@ void DFlashDraft::addDecode(
              weights_.selectorProjection, linear.decodePlan(weights_.selectorProjection, lanes));
 }
 
+void DFlashDraft::addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const {
+  if (!weights_.maskEmbedding) return;
+  ops::Embedding::addDraftMaskRows(graph, weights_.maskEmbedding, std::move(rows), weights_.layout.hiddenSize,
+                                   lanes);
+}
+
 void DFlashDraft::addContextCommit(
     metal::CommandGraph &graph, DFlashContextBuffers buffers,
     std::span<const uint32_t> startPositions) const {
@@ -384,7 +439,7 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
   {
     WeightFile file = files.model();
     result.contextProjection = readBlockProjection(
-        file, layout.hiddenSize, layout.targetHiddenSize,
+        file, layout.hiddenSize, layout.targetHiddenSize(),
         "context-projection");
     result.hiddenNorm = readNorm(file, layout.hiddenSize, false, "hidden-norm");
     result.finalNorm = readNorm(file, layout.hiddenSize, false, "final-norm");
@@ -399,6 +454,8 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
         file.section(codebookBytes, "predecessor-codebook");
     result.successorCodebook =
         file.section(codebookBytes, "successor-codebook");
+    if (files.hasMaskEmbedding())
+      result.maskEmbedding = file.section(uint64_t{layout.hiddenSize} * kBFloat16Bytes, "mask-embedding");
     file.finish();
     result.files.push_back(file.record());
   }

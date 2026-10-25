@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/ReclaimClass.hpp"
 #include "metal/MetalBackend.hpp"
 
 #include <cstdint>
@@ -7,6 +8,8 @@
 #include <optional>
 
 namespace splash::engine {
+
+struct EngineMemoryBreakdown;
 
 struct HostMemoryPages {
   // Mach's free_count, which includes the speculative pages.
@@ -118,10 +121,17 @@ struct MemoryGovernorSnapshot {
 // the newest state publication (else the newest checkpoint), the point a
 // follow-up request resumes from; only a shrink nothing waits for can afford
 // to, or one under macOS's warning, which holds a waiting request back too.
+// upTo is the highest class the pass takes. A shrink nothing waits for takes
+// nothing in use, under macOS's warning too: the states the requests in
+// service restore from and publish for their follow-ups, and the KV they
+// restore through. What it would free there goes back to those requests'
+// growth, which neither the host's margin nor the warning holds back, and
+// the replay point it would take is the next resume point.
 struct MemoryReclaimDirective {
   bool critical = false;
   uint64_t targetBytes = 0;
   bool keepResumePoint = false;
+  ReclaimClass upTo = ReclaimClass::InUse;
 };
 
 // What a reclaim pass made of its directive's target.
@@ -186,9 +196,17 @@ public:
   // must exceed hostReserveBytes, which macOS keeps; growth that no request
   // in service needs keeps hostSpareReserveBytes of its spare memory, and
   // the warning margin above them, for other applications.
+  // hostHeldBytes, host memory held outside Metal (the streamed table's
+  // row cache), is charged in full.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes, uint64_t hostSpareReserveBytes,
-                 HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes);
+                 HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes, uint64_t hostHeldBytes = 0);
+  // The governor of an engine that `budget` plans, as a start builds it: the
+  // hard budget is its limit, the plan's pipeline and runtime reserves are
+  // the untracked reserve, the host keeps the reserves EngineMemoryPolicy
+  // sets for the Mac's memory, and the streamed table's host memory is
+  // charged in full.
+  MemoryGovernor(metal::MetalBackend &backend, const EngineMemoryBreakdown &budget, HostMemoryProvider hostMemory);
 
   // The only way to reserve memory. Low-level storage/model components
   // receive only this transactional callback, so allocation stays governed
@@ -293,6 +311,7 @@ private:
   uint64_t hostSpareReserveBytes_ = 0;
   HostMemoryProvider hostMemory_;
   uint64_t untrackedReserveBytes_ = 0;
+  uint64_t hostHeldBytes_ = 0;
   uint64_t reservedBytes_ = 0;
   bool serving_ = false;
   bool requestWaiting_ = false;

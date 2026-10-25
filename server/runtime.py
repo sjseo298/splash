@@ -65,11 +65,14 @@ class RequestFailed(EngineRuntimeError):
         message: bytes,
         *,
         retryable: bool = False,
+        retry_after_seconds: int = 0,
     ):
         self.request_id = request_id
         self.code = code
         self.message_bytes = message
         self.retryable = retryable
+        # When a retry may succeed, in seconds; 0 for at once.
+        self.retry_after_seconds = retry_after_seconds
         text = message.decode("utf-8", errors="replace")
         machine_code = code.decode("ascii", errors="replace")
         super().__init__(f"request {request_id} failed [{machine_code}]: {text}")
@@ -80,6 +83,7 @@ class RequestFailed(EngineRuntimeError):
             self.code,
             self.message_bytes,
             retryable=self.retryable,
+            retry_after_seconds=self.retry_after_seconds,
         )
 
 
@@ -337,13 +341,17 @@ class RuntimeCall:
                 and not completion_tokens
             ):
                 raise ProtocolFatal("DoneEvent arrived before StartEvent")
-            if (
-                done.reason is wire.FinishReason.LENGTH
-                and completion_tokens != logical_max
+            # Only a bound of the engine's own ends a request with LENGTH short of
+            # its logical maximum.
+            if done.reason is wire.FinishReason.LENGTH and (
+                completion_tokens >= logical_max
+                if done.bounded
+                else completion_tokens != logical_max
             ):
                 raise ProtocolFatal(
                     f"length-finished DoneEvent has {completion_tokens} tokens; "
-                    f"expected logical maximum {logical_max}"
+                    f"expected {'fewer than ' if done.bounded else ''}logical "
+                    f"maximum {logical_max}"
                 )
             expected_scores = self._score_tokens
             if expected_scores:
@@ -1173,7 +1181,12 @@ class MultiplexedRuntime:
         with self._state_lock:
             if generation != self._generation or self._terminal_error is not None:
                 return
-            if self._ready_message is None:
+            # Before its ReadyEvent an engine sends nothing but why its start
+            # failed (runtime/main.mm reportStartFailure).
+            if self._ready_message is None and not (
+                isinstance(message, wire.ErrorEvent)
+                and message.failure_class is wire.FailureClass.ENGINE_UNHEALTHY
+            ):
                 raise ProtocolFatal("native event arrived before ReadyEvent")
 
         if isinstance(message, wire.StatusJsonEvent):
@@ -1236,6 +1249,7 @@ class MultiplexedRuntime:
                     event.code,
                     event.message,
                     retryable=event.retryable,
+                    retry_after_seconds=event.retry_after_seconds,
                 ),
             )
             return
