@@ -232,3 +232,24 @@ macOS, plus an opt-in real-model release gate.
   engine free of concrete models and client-specific behavior.
 - **Deterministic artifacts.** Weight golden hashes, kernel identity, and
   the build identity make "what this binary runs" reproducible and checked.
+
+## Fork extensions (local)
+
+The additions this fork layers on top of upstream, kept in step with each
+merge:
+
+- **Host-pressure bypass.** `splash serve --ignore-host-memory-pressure`
+  (or `SPLASH_IGNORE_HOST_PRESSURE=1`) tells the `MemoryGovernor` to waive
+  macOS's dynamic host-memory admission — headroom checks and every hold but
+  a system-critical one — so a start proceeds with the model's full context
+  even while the system reports pressure (`ignoreHostPressure`).
+- **Headroom-driven reclaim.** The governor triggers cache and state reclaim
+  when engine headroom runs low, not only after a refused allocation
+  (`reclaimed` in `MemoryGovernor.cpp`), holding the recovery margin without
+  waiting for an OOM-style refusal.
+- **Recovery drain timeout.** A start that waits for drained resources during
+  recovery fails within its own wait budget instead of stalling the lane
+  (`Engine::drainingForRecovery`).
+- **Coverage.** `dev/tests/engine/memory_headroom_reclaim_test.cpp` pins the
+  headroom and reclaim behavior; it builds and runs as part of
+  `test-engine-cpu` (`TEST_MEMORY_HEADROOM_RECLAIM_TEST` in `dev/native.mk`).
