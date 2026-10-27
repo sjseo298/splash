@@ -402,13 +402,9 @@ class GgufMetadataTests(unittest.TestCase):
                 "ffn_gate_up_exps.weight F32 [(]1 tensor[)]",
             ),
             # Floats only where the loader reads floats: not a projection, an
-            # F32 or BF16 router and an F32, BF16 or F16 norm, never a
-            # quantized one.
+            # F32 or BF16 router (or a quantized one, never F16) and an F32,
+            # BF16 or F16 norm, never a quantized one.
             ({"blk.3.attn_q.weight": GGML["F32"]}, "attn_q.weight F32"),
-            (
-                {"blk.0.ffn_gate_inp.weight": GGML["Q8_0"]},
-                "ffn_gate_inp.weight Q8_0",
-            ),
             ({"blk.0.ffn_gate_inp.weight": GGML["F16"]}, "ffn_gate_inp.weight F16"),
             ({"output_norm.weight": GGML["Q8_0"]}, "output_norm.weight Q8_0"),
             (

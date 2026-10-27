@@ -72,7 +72,8 @@ Zsh after `compinit`, or `install/completions/splash.fish` for fish.
 
 Completion suggests commands, the upstream models the README starts with and
 installed models, a GGUF's `OWNER/REPO:VARIANT` included, without network
-access.
+access. It also completes local paths for `--model-dir`, `--draft-model` and
+`--mmproj`.
 
 ## Server configuration
 
@@ -82,7 +83,9 @@ access.
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`. See [upstream model loading](#upstream-model-loading). |
+| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`; with `--model-dir`, the name the API reports. See [upstream model loading](#upstream-model-loading). |
+| `--model-dir` | None | Prepare a local GGUF file or GGUF/MLX model directory without the Hub. See [local model files](#local-model-files). |
+| `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
 | `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
@@ -752,6 +755,13 @@ template that cannot give the thinking a request asks for, one that always or
 never thinks, renders as it can, and the request reasons as its prompt does. A
 template that refuses a request's messages returns 400 with its reason.
 
+Flint's template has no thinking switch: its generation prompt is
+`<|assistant|>` alone, whatever the effort or `enable_thinking`, and the model
+decides each turn whether to reason. Both reach its template and change
+nothing; a reply whose output opens with `<think>` returns that block as its
+reasoning, and any other reply is all answer
+([chat formats](#chat-formats)).
+
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
@@ -819,14 +829,15 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 1200
 
 A budget applies only where generation starts in a thinking block, and one the
 output limit reaches first changes nothing; the output limit can also cut the
-end short. Where the output may call a tool, a call's opening ends thinking
-too, so the end never lands inside a call. The engine takes any `<tool_call>`
-token for that opening, while the reply's reasoning ends only where
-`<tool_call>` is followed by `\n<function=`: a stray `<tool_call>` in the
-thinking ends the budget's count while the reasoning goes on, and the
-request's `reasoning_tokens` can then exceed the budget. Only the end is
-forced, and a close the model selects itself before the budget ends the count.
-Text completions have no reasoning split and refuse a budget with 400.
+end short. A model that opens its thinking itself, as Flint does, never starts
+in one, and a budget caps nothing for it. Where the output may call a tool, a
+call's opening ends thinking too, so the end never lands inside a call. The
+engine takes any `<tool_call>` token for that opening, while the reply's
+reasoning ends only where `<tool_call>` is followed by `\n<function=`: a stray
+`<tool_call>` in the thinking ends the budget's count while the reasoning goes
+on, and the request's `reasoning_tokens` can then exceed the budget. Only the
+end is forced, and a close the model selects itself before the budget ends the
+count. Text completions have no reasoning split and refuse a budget with 400.
 
 ## Agent launchers
 
@@ -974,14 +985,23 @@ below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
 
 Responses takes `input` and `instructions`, function `tools` and `namespace`
-groups of them, `tool_choice`, `parallel_tool_calls`, `reasoning.effort`,
-`thinking_token_budget`, `text.format` for structured output,
-`max_output_tokens`, the sampling fields, Chat's `ignore_eos`,
-`chat_template_kwargs` and `preserve_thinking`, and `store` and
-`previous_response_id` ([Responses state](#responses-state)). Reasoning comes
-back as `reasoning` output items. `conversation`, `background: true` and
+groups of them, custom (freeform) `tools`, `tool_choice`,
+`parallel_tool_calls`, `reasoning.effort`, `thinking_token_budget`,
+`text.format` for structured output, `max_output_tokens`, the sampling fields,
+Chat's `ignore_eos`, `chat_template_kwargs` and `preserve_thinking`, and `store`
+and `previous_response_id` ([Responses state](#responses-state)). Reasoning
+comes back as `reasoning` output items. `conversation`, `background: true` and
 `truncation` other than `disabled` return 400; Splash compacts nothing, so
 `context_management` leaves the input as sent.
+
+A custom tool, such as Codex's `apply_patch`, reaches the model as a function
+of one string parameter, `input`, whose description carries the tool's
+`format` (its grammar, or plain text); the grammar describes the input and
+does not constrain it. A call comes back as a `custom_tool_call` item with the
+input as the model wrote it, streamed as one
+`response.custom_tool_call_input.delta` and `.done` when the call closes;
+`custom_tool_call` and `custom_tool_call_output` items are taken as input, and
+`tool_choice` `{"type": "custom", "name": ...}` names one.
 
 Messages takes `max_tokens`, `system`, `messages`, custom `tools` (every one
 declared in the prompt, `defer_loading` ones too, so a `tool_result`'s
@@ -1186,9 +1206,22 @@ completions empty-text chunks, Responses `response.in_progress`, and Messages
 `ping`. Queueing and prompt preparation do not advance this counter.
 Non-streaming requests cannot enable it.
 
+Usage counts cached prompt tokens and the output tokens spent reasoning in each
+API's own fields: Chat `prompt_tokens_details.cached_tokens` and
+`completion_tokens_details.reasoning_tokens`, Responses
+`input_tokens_details.cached_tokens` and `output_tokens_details.reasoning_tokens`,
+and Messages `cache_read_input_tokens` (with `input_tokens` the uncached rest)
+and `output_tokens_details.thinking_tokens`, in a stream's `message_delta`.
+Responses `cache_write_tokens` is 0: clients price cache writes apart from the
+rest of the uncached input, and the prefix cache keeps a prompt as prefill
+computes it, at no cost of its own. So uncached input is `input_tokens` less
+`cached_tokens`, as in Messages, which reports no `cache_creation_input_tokens`.
+
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
-even without `include_usage`. `prompt_n` and `predicted_n` are the full prompt
+even without `include_usage`. Messages and Responses include the same object
+in a complete response, and in a stream in `message_delta` and in the response
+of `response.completed` or `response.incomplete`. `prompt_n` and `predicted_n` are the full prompt
 and output counts; `cache_n` is the cached prompt count. `prompt_ms` measures
 native start to first emission, and `predicted_ms` measures first emission to
 completion. These elapsed intervals exclude the initial admission queue and
@@ -1271,11 +1304,15 @@ not give: `["integer", "any"]` constrains no type, and
 Calls are not validated against their schemas; a client reports what its tool
 rejects. A `stop` string may cut a call ([request fields](#request-fields)).
 
-The output is read as the chat template lays calls out: a call opens at
+The output is read as the chat template lays calls out, in the family's
+syntax ([chat formats](#chat-formats)). In Qwen's XML a call opens at
 `<tool_call>` and the newline before `<function=`, and a value ends at
 `\n</parameter>\n` where the next parameter, `</function>` or `</tool_call>`
-follows, so a value may hold the tags in any other order, as a file an agent
-writes may. Tags written otherwise are text. Besides:
+follows; in Flint's GLM tags a call opens at `<tool_call>`, the function's name
+follows it up to the first tag, and a value ends at `</arg_value>` where the
+next `<arg_key>` or `</tool_call>` follows. A value may hold the tags in any
+other order, as a file an agent writes may. Tags written otherwise are text.
+Besides:
 
 - names lose the space around them, and a call that names no function is
   dropped, as is a `</think>` in text;
@@ -1290,20 +1327,22 @@ writes may. Tags written otherwise are text. Besides:
   within the 128 levels the server reads where a request carries them deepest,
   as a `tool_use` block's `input` in a Messages history, five levels into the
   body;
-- a call's opening also ends the reasoning where a call may follow.
+- a call's opening also ends the reasoning where a call may follow, but for a
+  model that opens its reasoning itself, as Flint does, which closes it before
+  a call.
 
 `dev/tests/server/test_tool_call_reading.py` holds model outputs with the calls
-and content they read as.
+and content they read as, and `dev/tests/server/test_chat_formats.py` Flint's.
 
 A strict tool's schema is checked against its JSON Schema dialect on arrival,
 and every tool's arguments are framed through schema composition and local
 references, which give each parameter its types. A strict tool's framed
 arguments are closed, so that an object or an array takes nothing it does not
-declare. Its values are written in Qwen XML: raw text where any string may be
-the value, whose pattern, format and length go unenforced; otherwise one of the
-values each member of the value's union lists, as its text, or JSON of a member
-that lists none, leaving out array item bounds and `multipleOf` above 64 and
-patterns the grammar cannot compile (look-around, word boundaries,
+declare. Its values are written in the family's tags: raw text where any string
+may be the value, whose pattern, format and length go unenforced; otherwise one
+of the values each member of the value's union lists, as its text, or JSON of a
+member that lists none, leaving out array item bounds and `multipleOf` above 64
+and patterns the grammar cannot compile (look-around, word boundaries,
 backreferences). The framed schemas of a request's strict tools, whose grammars
 are built together, are limited to 16 MiB in all. Any other tool is framed when
 a call first names it, for its parameters' types alone, which take no copy of
@@ -1438,7 +1477,11 @@ system prompt and A–P option order. It returns the exact rendered prompt's SHA
 (each lone surrogate read as U+FFFD, as every prompt is tokenized),
 answer token IDs, raw option logits, normalized probabilities and zero completion
 tokens. Every answer label must round-trip as one token, including at the actual
-assistant prompt boundary. Besides the row it takes `model`, `timeout`,
+assistant prompt boundary. Prompts render without thinking, as effort `none`
+renders them. A model that opens its reasoning itself (Flint), which no effort
+turns off, would open it where the generation prompt ends: its prompt ends with
+an empty think block, `<think></think>`, and the answer slots are read after it,
+where its answer starts. Besides the row it takes `model`, `timeout`,
 `priority` and `cache_salt` as the generation APIs do ([request
 fields](#request-fields)); other generation controls return errors rather than
 silently changing the scoring protocol. SemIf-derived code retains its MIT
@@ -1459,10 +1502,10 @@ share the scheduler. Disconnects and timeouts cancel the current question.
 
 Preparation renders each prompt once, then enforces the context limit and the
 batch token budget before the per-slot boundary checks. A label can change only
-the tokens after the prompt's last `<|im_end|>`, which the tokenizer encodes on
-its own, so each check encodes that end with the option appended rather than
-the whole prompt. The checks observe the request deadline and stop when the
-client disconnects.
+the tokens after the prompt's last message boundary (`<|im_end|>`, or Flint's
+`<|assistant|>`), which the tokenizer encodes on its own, so each check encodes
+that end with the option appended rather than the whole prompt. The checks
+observe the request deadline and stop when the client disconnects.
 Prompts that exceed the context limit are rejected, not truncated.
 
 System One validation uses 422 `detail` arrays; successful responses contain
@@ -1492,11 +1535,13 @@ Proxy consumers can use these fields; additional fields may be added:
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | While routed experts stream, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); absent for a target whose KV stays in memory, whose plan's `memory_plan.budget.kv_spill` is `null` |
+| `kv.window` | For a target with sliding-window layers, its [windows](#sliding-windows): the `window_pages` a row's window and a state's tail keep Full, whether pages past every window give up their windowed layers' K/V (`trim`, off with the native `--kv-window-trim off`), the pool's `full_pages` and `slim_pages` in use and the Slim extents' `slim_bytes`, the `pinned_blocks` states' tails hold, the `trimmed_pages` since engine start, the `upgrades` of blocks that took the page of a writer that computed them again, and the `refused_states` whose tail was not Full; absent for other targets |
+| `memory_plan.budget.kv_window` | For a target whose pages give up a window's layers, a Slim page's `slim_page_bytes` and the `floor_pages` a lane keeps Full, by which one request's KV capacity is counted; absent for other targets |
 | `memory_plan.budget.context_bounds` | What bounds `maximum_context_tokens` ([memory and context](#memory-and-context)): the model's `window`, one request's KV in memory (`resident`), the longest context a block-sparse target's floors hold (`spilled`) and its SSD cache's room holds (`disk`), and the `bound` that sets the limit: `model`, `memory` or `disk` |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `verify_rows` | The rows of a draft block decode cycles verify ([drafts](#drafts), `--verify-rows`): `auto` where the verify budget chooses them (a MoE target under the default), `all` where they verify every row the output limit leaves (a dense target, or `--verify-rows all`) |
-| `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
+| `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
 | `metrics.decode_cycle_ms` | Total engine time of the decode commands, each from the previous command's completion (or its plan after idleness) to its own: the GPU command plus the host work between commands |
@@ -1504,6 +1549,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
+| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
 
@@ -1635,13 +1681,20 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp` in `runtime/model/`) is an
-architecture, whose code its families share, and each family is a value of it in
-one list, `model::kFamilies` (`ModelDescriptor.hpp`): another size of an
-architecture is one more value there, its draft in `families.FAMILIES`, and, for
-a GDN or attention shape no family had, its kernel instances and a row of the
-compiled shapes in `ops/GDN.cpp` or `ops/PagedAttention.cpp`. The kernel tests
-take every family's shapes from that list (`dev/tests/engine/TestFamilies.hpp`).
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
+`runtime/model/`) is an architecture, whose code its families share, and each
+family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
+another size of an architecture is one more value there, its draft in
+`families.FAMILIES`, and, for a GDN or attention shape no family had, its kernel
+instances and a row of the compiled shapes in `ops/GDN.cpp` or
+`ops/PagedAttention.cpp`. The kernel tests take every family's shapes from that
+list (`dev/tests/engine/TestFamilies.hpp`). A Qwen config holds its text model
+under `text_config`; Flint's is flat, its keys at the top level, which the check
+reads only for a model type whose configs are flat (a layout type's
+`flatConfig`). Flint loads from a GGUF only, and its configuration is held to
+Flint's values key by key (its widths, router, window, `layer_types`,
+`no_rope_layer_indices`, `mlp_only_layers` and `eos_token_id`; `softmax_type`,
+`rope_theta` and the rest where it states them).
 An MLX target must declare `quantization` in `config.json` in formats it loads
 ([MLX targets](#mlx-targets)). Every start checks the configuration again.
 Remote Python code is not loaded.
@@ -1681,8 +1734,10 @@ each quantized tensor in the format mlx-lm infers from its tensors, an affine
 NVFP4, at the checkpoint's bits per weight (NVFP4's at 4.625, its tensor scale
 stored once per 256 weights); projections and experts as block planes, a
 quantized token table as native rows and an unquantized one as its bf16 rows.
-The block MoE kernels read the router and the shared-expert gate in F32, so
-these load as the F32 values of their quantization, and so do GDN alpha and
+The MoE router keeps its format too, a quantized one as native rows, an
+unquantized one as its bf16 or F32 rows, which the float projection runs
+([Kernels](#kernels)). The MoE selection reads the shared-expert gate in F32,
+so it loads as the F32 values of its quantization, and so do GDN alpha and
 beta unless both are in one format. Norms stay bf16 and the GDN value heads in
 MLX's grouped order.
 
@@ -1748,7 +1803,9 @@ and lists every unsupported tensor in one error:
   IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
 - token embeddings: any of the linears' formats;
 - norms: F32, BF16 or F16, loaded as the F32 values they hold;
-- the MoE router: F32 or BF16, which the float projection runs as stored;
+- the MoE router: F32, BF16 or any of the linears' quantized formats (not
+  F16), which the float projection runs as stored, a quantized one as its
+  native rows (as an MLX target's quantized router loads);
 - the shared-expert scalar gate: F32, BF16 or Q8_0, loaded as the F32 values
   it holds;
 - the GDN convolution, decay and time-step bias: F32;
@@ -1759,7 +1816,24 @@ and lists every unsupported tensor in one error:
   gather (`gguf_embed_f32_<format>`), GGML's own F32 values. A BF16 or F16
   pair stays such a float segment: it reads the input unrotated, as Prism's
   BF16 alpha and beta need, and leaves the GDN input projection on Apple9's
-  register tile, which takes no F16.
+  register tile, which takes no F16;
+- Flint's attention sinks: F32, as llama.cpp writes them.
+
+Flint's GGUFs (`flint`, as llama.cpp writes them from release b11803) differ
+from Qwen's beyond their tensor types: every layer attends, its norm before the
+FFN is `ffn_norm`, `leading_dense_block_count` leading layers have a dense FFN
+and the others a MoE whose shared expert has no gate, and each layer carries
+its attention sinks, `attn_sinks.weight`. Its derived configuration is flat,
+as Flint's config.json is, and holds the keys of that file the header states
+(`gguf.flint_text_config`): every size, the experts each token takes, the
+router (`router_score_function` from `expert_gating_func`, `norm_topk_prob`),
+`mlp_only_layers`, `sliding_window`, `layer_types` from
+`attention.sliding_window_pattern`, `no_rope_layer_indices` from
+`attention.rope_pattern`, and `eos_token_id` from
+`tokenizer.ggml.eog_token_ids`; the engine's check holds each to the family's,
+the two layer patterns included, which the scalar metadata leaves out. The
+token table must be of a format: RecursiveSI's int4 GGUF, whose table is F32,
+is refused before its download.
 
 A variant no root file names may be a folder of a split GGUF's parts, as
 repositories publish files too large for one
@@ -1866,14 +1940,17 @@ architecture never replaces one that loads.
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
-target's, and its attention (32 query and 8 KV heads of 128), selector (rank
-256, 16 candidates) and 2048-token window are those the kernels are built for,
-and its block at least their 8 rows, of which a cycle drafts the first (the
-Qwen3.5-122B-A10B draft was trained to fill 16; `readDraftLayout` in
-`ModelDescriptor.mm`); the kernels take any hidden width of whole 16-channel
-convolution groups. A draft's rows after its anchor read the target's token
-table row of the mask token, unless its release ships that token's BF16
-embedding, which they read instead (`DFlashDraft::addMaskRows`):
+target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
+its reserved special tokens, 150019 to 150143, as its
+`dflash_config.mask_token_id`, which the target's layout then holds,
+`QwenTargetDimensions::firstDraftMaskToken`), and its attention (32 query and
+8 KV heads of 128), selector (rank 256, 16 candidates) and 2048-token window are
+those the kernels are built for, and its block at least their 8 rows, of which a
+cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
+`readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
+whole 16-channel convolution groups. A draft's rows after its anchor read the
+target's token table row of the mask token, unless its release ships that
+token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):
 `mask_embedding.safetensors`, one tensor `mask_embedding` of the hidden size.
 A quantized table can lose the row: Qwen3.5-122B-A10B's is of order 1e-6,
 below what the fp16 block scales of Q8_0 and the K-quants hold, so its GGUFs
@@ -1962,7 +2039,9 @@ BF16. The processor configuration (MLX `preprocessor_config.json`, or the
 `image_processor` object of `processor_config.json`, where newer Transformers
 releases save it; the GGUF's `clip.vision` metadata) must describe the one
 preprocessing Splash implements (`server/images.py`); it is checked before any
-weight download and not installed.
+weight download and not installed. The models of a family without a vision
+tower (Flint; `vision` in `install/families.py`) serve text only: their
+installation reads no projector, with or without `--language-only`.
 
 Both sources are written into one image, which the one BF16 vision operator
 reads: BF16 tensors are
@@ -1972,6 +2051,15 @@ Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
 F32, all of them BF16-exact, and loads byte-identical to the MLX tower.
 Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
 use are rejected.
+
+A prefill command encodes the images whose rows begin in it, from no cached
+rows, in a command of its own, and is submitted once that command has
+completed: an encode takes about 0.3 s for a 1000 x 1400 page on an M5 Max
+and seconds for a 4-megapixel image on a small GPU, which Metal would count
+against the 5 s it gives the prefill command's first host step or Neural
+Engine wait ([Host steps](#host-steps)). The scheduler counts the encodes'
+time in what the prefill owes decoding requests, and leaves it out of its
+prefill estimate.
 
 `--language-only` links and loads no vision weights and removes them from
 memory accounting. It skips a GGUF's mmproj download and an MLX shard that
@@ -1992,8 +2080,11 @@ An MLX target's configuration, tokenizer files and chat template come from its
 resolved snapshot. For GGUF, `install/gguf.py` reads the selected file's
 metadata without mapping or decoding weight tensors. Vocabulary IDs, BPE merge
 ranks, control/user-defined token types, BOS/EOS/padding IDs and template text
-come from that file; the supported `gpt2/qwen35` profile supplies the NFC and
-byte-level pre-tokenization algorithms. Unknown profiles, malformed metadata
+come from that file; the supported profiles supply the pre-tokenization
+algorithms: `gpt2/qwen35` NFC and Qwen's split, `gpt2/flint` Flint's three
+splits (digits in runs of up to three, runs of Han and kana, then o200k's
+pattern) without a normalizer, each before byte-level BPE, as the release's
+own tokenizer.json has them. Unknown profiles, malformed metadata
 and automatic BOS/EOS insertion are rejected, with no cross-repository
 fallback; GGUF sidecar tokenizer/config files do not override embedded metadata.
 Model geometry is translated from the same metadata, subtracting any declared
@@ -2042,7 +2133,70 @@ Every request, including image placeholder, token-count and judgment
 startup; tokenizer files and the tokenizer object are unchanged. The probe's
 upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
+### Chat formats
+
+Each family's model frames its reasoning and lays out its tool calls in a
+format of its own, a value of `server/chat_format.py` that `families.FAMILIES`
+names for the family. The server reads and constrains a model's output in the
+format of the family its installation found, which the assembly records:
+
+- Qwen's (`QWEN`): the generation prompt opens a think block where the request
+  thinks, calls are Qwen3-Coder's XML (`QWEN_XML`), and `<|endoftext|>` and
+  `<|im_end|>` stop.
+- Flint's (`FLINT`): the generation prompt is `<|assistant|>` alone, and the
+  model opens a think block itself, as its first token, when it reasons; calls
+  are GLM-4.7's argument tags (`GLM_ARGS`),
+  `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`,
+  each tag a token; `<|end_of_text|>`, `<|user|>`, `<|observation|>` and
+  `<|developer|>` stop.
+
+A format holds the model's vocabulary and the engine's stop tokens, which are
+its target layout's; the tokens of `</think>`, of `<think>` where the model
+opens its reasoning itself, and of `<tool_call>`; the call syntax; and the
+special token after which prompt tokenization reuses a cached prompt's tokens,
+`<|im_end|>` or `<|assistant|>`. Startup checks that the tokenizer encodes each
+as the format has it. Grammars write reasoning and calls as the format lays
+them out: Flint's optional think block may come before any constrained output,
+and its tags, which the grammar compiler takes as tokens rather than text, are
+written as their tokens. A model that opens its reasoning itself closes it
+before a call, so a `<tool_call>` inside its think block is reasoning, as
+Flint's own parser reads it.
+
+Flint's template renders as shipped: its roles, the tools block it adds before
+the first message that is not a system message, each assistant turn's
+reasoning and calls, and tool results as `<|observation|>` turns. Request
+preparation merges leading system and developer messages into one system
+message for every family, so a developer message renders as `<|system|>`.
+
 ### Local model files
+
+`splash serve --model-dir PATH` prepares the target at `PATH` with
+`install.local.prepare_local_model` and starts the server on the directory it
+returns. `PATH` names a GGUF file, any part of a split GGUF, a directory
+holding one GGUF target, or an MLX model directory. It names the target
+directly, rather than a library to search by repository ID:
+
+```sh
+splash serve --model local/qwen \
+  --model-dir /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --draft-model /models/Qwen3.8-27B-DFlash2 \
+  --mmproj /models/Qwen3.8-27B-GGUF/mmproj-BF16.gguf
+```
+
+`--model` remains required in `OWNER/REPO[:VARIANT]` form as the API's model
+name; it selects no files and makes no Hub request in this mode. Preparation
+never contacts the Hub, whether or not `--offline` is set. `--draft-model`
+must name a local compatible DFlash2 draft directory; without one, the
+family's released draft must already be in the Hub cache at the commit its
+default branch records, as `hf download REPO` leaves it. A missing draft is
+refused with its download instruction; it is never downloaded implicitly.
+
+`--mmproj` supplies a local BF16, F32 or F16 GGUF vision projector. Without
+one, a GGUF serves text only. An MLX target uses its own vision tower unless
+`--language-only` is set. `--revision` cannot be combined with `--model-dir`,
+and `--mmproj` requires `--model-dir` and cannot be combined with
+`--language-only`. Files are linked, and each start prepares them again under
+the same validation, publication and lifetime rules described below.
 
 An application that downloads models itself prepares them for the server
 with `install.local.prepare_local_model`, the installer's one public
@@ -2081,8 +2235,9 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
   `hf download incoai/Qwen3.8-27B-DFlash2` does; `splash serve` downloads by
   commit, which records none.
 - `mmproj`: a GGUF target's vision projector ([Vision](#vision)); without
-  one, a GGUF target serves text only. An MLX target serves images with the
-  tower in its checkpoint unless `language_only=True`.
+  one, a GGUF target serves text only, and a target of a family without a
+  vision tower refuses one. An MLX target serves images with the tower in
+  its checkpoint unless `language_only=True`.
 - `models_dir`: where prepared models are kept, Splash's own models
   directory by default ([files Splash writes](#files-splash-writes)).
 
@@ -2142,7 +2297,8 @@ shape; `frontend.py` prepares
 requests and history; `backend.py` owns native request lifecycles. `judgments.py`
 owns finite-choice prompts, validation and typed answer math. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete
-responses alike, and `constraints.py` compiles token constraints. Messages and
+responses alike, in the family's chat format (`chat_format.py`), and
+`constraints.py` compiles token constraints. Messages and
 Responses build streamed and complete responses from the same block sequence;
 the one difference is a call cut by the token limit or a stop sequence, which a
 complete Messages response leaves out. `make architecture-check` prevents lower
@@ -2264,7 +2420,7 @@ Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
 BF16 or F16 hyper-connection projections ([GGUF targets](#gguf-targets)), and
 in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
-target's quantized router and shared-expert gate, and its quantized GDN alpha
+target's quantized shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
 ([MLX targets](#mlx-targets)) or a Model Optimizer or compressed-tensors
 target's in NVFP4 or FP8, and a GGUF's quantized alpha or beta beside one of
@@ -2302,8 +2458,14 @@ reads the sources at about the speed of the disk that holds them
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,
-`rope.dimension_count`, `attention.layer_norm_rms_epsilon`, and no
-`rope.scaling.type` but `none`), and plans the `MDGG0001` layout.
+`rope.dimension_count`, which a Flint GGUF, whose RoPE rotates whole heads,
+need not state, `attention.layer_norm_rms_epsilon`, and no
+`rope.scaling.type` but `none`), and plans the `MDGG0001` layout. A Flint
+GGUF's family keys hold its window, leading dense layers, shared expert's
+slices, sigmoid router and normalized, unscaled routing weights
+(`expert_weights_scale` 1) and its two layer patterns to the family's, and
+a router bias (`ffn_exp_probs_b`), which its blocks would not add, is
+refused.
 `GgufPreparation` stages rows in image order on the CPU within the
 staging bound, splitting rows wider than it into column chunks, and runs the
 `gguf_repack` kernel, which writes their planes into the image. Embeddings and
@@ -2381,8 +2543,36 @@ through `BlockTargetFormat`, which reads each tensor as one block-quantized
 `QuantizedSegment` (a fused projection's tensors in output column order), the
 norms as F32 (bf16 for an MLX checkpoint), and keeps the GDN output projection's
 input in the source's value-head order, llama.cpp's tiled or MLX's grouped.
-Both Qwen families share one layout
-(`QwenHybridLayout`) and its validator.
+Every family's layout derives `QwenHybridLayout`, whose validator
+(`requireQwenLayout`) it shares.
+
+A family's target is a `QwenTarget` (`QwenTarget.hpp`) composed of the blocks
+every Qwen target shares: a step's checks and plans, the GDN and attention
+mixers, the FFNs of a residual of one row (a dense SwiGLU and a MoE block's
+routing and experts), the draft's captures and the normed head. The Qwen3.5
+architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`), Flash-Next's
+(`Qwen4ExpTarget`) and Flint's (`FlintTarget`) each compose them into their own
+layer loop. What a family changes in a block is a value of its layout
+(`QwenTargetDimensions`), read by the shared block rather than branched on: an
+attention layer's variant (`QwenTargetGeometry::attentionVariant`: rotated by
+the target's RoPE unless `unrotatedLayers` names it, over a sliding window of
+`slidingWindow` keys where `slidingLayers` does), for which a step plans the
+windowed layers apart; the learned sinks, which a layer's
+`QwenAttentionWeights` carry where its geometry adds them; the MoE router and
+the shared expert's slices and gate (`QwenTargetDimensions::moeBlockShape`);
+and the leading layers of a MoE target whose FFN is dense
+(`leadingDenseLayers`), whose blocks, and streamed experts, are the MoE layers'
+alone. The output gate (`attentionGate`) and the RoPE pairs (`rotaryPairs`) are
+values the attention kernels compile with their geometry (`kCompiledAttention`),
+to which a target holds its layout's (`PagedAttention::compiles`). Flint
+(`Flint.hpp`) has no GDN layers (`fullAttentionPeriod` 1): its 49 layers
+attend, 35 over a window of the 512 keys before a row's with RoPE over whole
+heads and 14 over every key without RoPE, each with its sinks; its first two
+layers' FFN is dense and the others' a MoE of a sigmoid router and an ungated
+shared expert of two slices; its norms are plain, as its GGUFs store them. Its
+layer images (`GgufImage.cpp`, `FlintGguf`) hold its input norm, attention,
+sinks, the norm before its FFN and its FFN, which `loadFlintWeights` reads with
+the Qwen readers.
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever
@@ -2392,20 +2582,56 @@ for decode.
 
 ### Kernels
 
-Every tensor keeps its stored format: the F32 norm multipliers, GDN decay, the
-MoE router and shared-expert scalar gate, and GDN alpha/beta when a file
-stores them as F32 stay F32 and run in fp32, as llama.cpp keeps them (Apple10
-prefill chunks multiply the router and alpha/beta on the neural accelerator as
-three bf16 parts per weight that sum to it exactly, so only fp32 accumulation
-rounds). The GDN convolution and time-step bias become bf16 under the exact
-rule.
+Every tensor keeps its stored format: the F32 norm multipliers, GDN decay,
+shared-expert scalar gate, and GDN alpha/beta when a file stores them as F32
+stay F32 and run in fp32, as llama.cpp keeps them. The MoE router runs in fp32
+in the format its checkpoint holds it: a GGUF's F32 or BF16 values, or the
+native rows of a quantized router (an MLX checkpoint's 8-bit affine one), each
+weight the fp32 value the token gather decodes, so its scores are those of the
+F32 tensor of its values bit for bit (Apple10 prefill chunks multiply the
+router and alpha/beta on the neural accelerator as three bf16 parts per weight
+that sum to it exactly, so only fp32 accumulation rounds). Its scores pick the
+experts, so it stays off the block tiles, whose staged and prefill tiles round
+the weights to half; in decode they are slower on its narrow grid as well: on a
+32-core M5 Max the 35B's router as 8-bit planes takes 6.3, 8.7, 11.1 and 15.6
+us at one to four lanes on the register tile, its native rows 5.2, 6.3, 7.4 and
+8.5 us on the float projection (prefill chunks: 58-74 us on the prefill tile at
+64 to 2048 rows, 10-184 us on the float tiles, faster up to about 550 rows;
+weights DRAM-cold). The GDN convolution and time-step bias become bf16 under
+the exact rule.
 
 Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
 Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels of
 `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`, which feed the codes themselves to
-bf16 matrix operations with one fp32 epilogue per coefficient group, so every output is the bf16
-rounding of its fp32-accumulated sum. They read their activations as the Table16 table
-(`kernels/common/gguf_sgmatrix.h`) that the input's producer writes, or
+bf16 matrix operations, each chain of 32 inputs (16 for 16-input scales) closed by its fp32 scale,
+so every output is the bf16 rounding of its fp32-accumulated sum. The coefficient
+group is the inputs one scale covers (a format's `Group`: 16, 32, or the groups of a meta unit that
+share one, as MLX affine's groups of 64 and 128, PQ2_0, Q2_0, FP8 and BF16 do): a simdgroup decodes
+a column's coefficients into threadgroup memory once per group, and a format with a min adds its
+term, the min times the sum of those inputs, once per group but at least once per 64-input span of
+the table, from that span's sums (a group of 128 gathering four sums across two spans took 4.5-8.8%
+more time at four lanes than a term per span). The MMA shares Apple9's FP32 pipe with that epilogue;
+on a 10-core M4, against a decode and min term per 32 inputs, MLX 4-bit g64 at the 19 projection
+shapes of the 27B and 35B and their drafts takes up to 2.7% less time per shape at one lane (none on
+the 35B's GDN in-projection, most on the LM heads and the 35B draft's down projection), 1.7-3.7% at
+two and three and 3.3-4.6% at four, which over a B1 DFlash2 cycle's calls of those shapes is 16.67
+instead of 16.89 ms on the 35B and 165.80 instead of 168.06 ms on the 27B; MLX g128 takes 1.7-1.9%
+less in total at one to three lanes and 3.6% at four, though not 4-bit 2048 x 4096 at one to three.
+A chain over a whole 64-input group instead leaves a lane two dependent chains per simdgroup where
+it has four, and took 1-6% more time at one to three lanes. A zero point is such a term too,
+entered where it costs no epilogue: codes with one enter as 160 + code - zero, and the term's last
+chain starts from -160 times the sum of its inputs, from the table's sums of 32 once per group and
+span where a scale covers 32 inputs or more (Q4_0, Q5_0, IQ1_S, PQ2_0, Q2_0), and from the table's
+seed of 16 inputs per chain where scales cover 16 (Q6_K, Q3_K, IQ1_M). On the 10-core M4, against a
+decode and a seeded chain per 16 inputs, those five formats at projection shapes of 2048 to 17408
+columns take 1.4-7.1% less time at one lane and 3.5-8.0% at two to four. The zero point as an
+epilogue term instead, b * sum with b = -(128 + zero) s, took up to 3.3 points more (IQ1_S at one
+lane, 2.0-2.7 in Q4_0 and Q5_0 at two to four), and so did chains of 32 seeded with the sum of two
+16-input seeds; code - zero as the operand, its chains starting from zero, took 2.0-5.9% less time
+than seeded chains at three and four lanes in Q6_K, Q3_K and IQ1_M but up to 3.5% more at one and
+two (Q3_K at one lane), and on the 32-core M5 Max up to 3.9% more at one lane (IQ1_M at 512 x
+2048). They read their activations as the
+Table16 table (`kernels/common/gguf_sgmatrix.h`) that the input's producer writes, or
 `decode_linear_gguf_prepare` when none did. The formats whose operands those kernels build from
 grid lookups, IQ3_XXS, the IQ2 formats and IQ1 (`apple9StagesFormat`), and Q2_K from two lanes
 decode faster on the staged tile there, which a projection all of whose segments are in them
@@ -2421,42 +2647,128 @@ threadgroup memory (`kernels/common/gguf_staged.h`) for MPP `matmul2d`, the neur
 path, on bf16 activations. A decode step whose grid is narrow there, fewer than one and a half
 threadgroups per core (half that in formats of fewer than four bits per weight), runs on the
 register tile instead, whose 128 threads per column tile keep more of its cores' loads in flight
-than the staged tile's 64 (`apple10Registers`). A step's weights, and
+than the staged tile's 64 (`apple10Registers`). Its coefficient groups apply there too: on the
+32-core M5 Max the 35B's MLX 4-bit g64 projections of 2048 columns, which take the register tile
+at one lane, take 1.6-2.2% less time at their splits (GDN out, the draft's down and its context
+commit's fc), and the 320 x 10240 hyper-connection projections, which take it at every lane,
+0.4-1.8% less in MLX 4-bit and 8-bit g64 at one to three lanes and 4.4-5.2% at four, BF16 the
+same; with a zero point's term per group, against a decode and a seeded chain per 16 inputs, Q4_0,
+Q5_0, Q2_0, PQ2_0 and IQ1_S at 320 to 2048 columns, at the lanes that take the tile, take 1.0-4.2%
+less time at one lane and 2.1-5.9% at two to four. Partitions of under 512 inputs at sixteen splits
+(one or two coefficient units) take 2-10%
+more time at one to three lanes, which the tiers never pick, as sixteen keep 512 inputs per
+partition; at eight, partitions of one unit took 4.1% less to 0.8% more. A step's weights, and
 its meta unit when it enters a new one, load while the previous step's matmul runs
 (`gguf_staged_steps`): their DRAM round trips overlap a matmul. On Apple10 from 16 cores each
 column tile of a decode projection starts its walk over its K partition at its own step
 (`staged_first_step`, `LinearConfig::spread`), so the tiles do not all wait on the same freshly
 written slice of the input at once; the MoE experts, prefill, Apple9 and fewer cores walk in
-lockstep. There a dense gate/up pair whose tensors share their format also decodes in one
-dispatch (`LinearConfig::oneGateUpPass`), each simdgroup staging both tensors' columns, so a
-chain's serial steps serve both. Its output is bitwise the two passes' at the same K split; it
-splits K as one projection of the pair's columns, and where that split differs from theirs, its
-sums are reassociated. A step of three request lanes runs the 32-row tile over four lanes of
-storage. On Apple10 one lane runs the 16-row tile over two lanes of storage
-(`LinearConfig::sixteenRows`), its padding lane computed and discarded, where its staged plan is
-unsplit and the projection's quantized segments store fewer than four and a half bits per weight
-together (`ProjectionShape::underFourAndHalfBits`), a gate/up pair where both its tensors' own
-plans do: the lane's rows are bitwise the 8-row tile's, in less time (the 27B UD-IQ3_XXS decodes
-one lane 3.3-3.6% faster on a 12-core M6). Split plans take more time on it, as does Q4_K's
-4.5 bits on the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
-(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. Every projection
-splits its K across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups
-per core, inputs per partition and partitions, from measured occupancy, Apple9's staged tile taking
-the register tile's of eight partitions) that does not depend on the batch width. Partitions stop
-at eight, but the register tile splits a grid that eight leave below three threadgroups per core
-into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's hyper-connection down
-projection, 320 columns over 10240 inputs; measured on Apple10). The MoE experts
+lockstep. There a dense gate/up pair whose tensors share their format may also decode in one
+dispatch (`LinearConfig::oneGateUpPass`), each simdgroup staging both tensors' columns, where
+the staged split law below takes it. Its output is bitwise the two passes' at the same K split;
+where its split differs from the two passes', its sums are reassociated. A step of three request
+lanes runs the 32-row tile over four lanes of storage. On Apple10 one lane runs the 16-row tile
+over two lanes of storage (`LinearConfig::sixteenRows`), its padding lane computed and
+discarded, where its staged plan is unsplit and the projection's quantized segments store fewer
+than four and a half bits per weight together (`ProjectionShape::underFourAndHalfBits()`), an
+unsplit gate/up pair where both its tensors' own plans do: the lane's rows are bitwise the 8-row
+tile's, in less time (the 27B UD-IQ3_XXS decodes one lane 3.3-3.6% faster on a 12-core M6).
+Split, the padding lane's partials double the split's traffic: on the narrow grids where the law
+splits K most (the 35B's, the 122B's and Flash-Next's output projections, 1 to 1.5 threadgroups
+per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more time than the
+8-row tile at the same split on a 32-core M5 Max (IQ3_XXS, IQ2_XS and Q2_K, and IQ4_XS where it
+stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
+the 27B's 5120-column projections in four on the M5 Max. Q4_K's 4.5 bits take more time on it on
+the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
+(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows.
+
+Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
+by one wave law (`apple10Staged` in `runtime/ops/LinearGguf.cpp`), for decode steps and short
+prefill chunks alike: it takes the split (of at most eight partitions keeping 512 inputs each)
+and passes of least predicted time, ties to fewer partitions, then one pass. Each tile kernel
+has an occupancy (`StagedOccupancy`): a core runs `resident` of its threadgroups at once, so a
+grid runs in waves of that many per core (10 for the two-simdgroup tile, 16 for the
+one-simdgroup pair, both measured); a grid of one wave takes at least `saturating` threadgroups'
+time per step (with fewer a core waits on its chains' latency), and a last wave after others at
+least `following`'s, since it starts as the one before drains. Each threadgroup streams 64
+columns of a K step of the projection's bits per weight (`ProjectionShape::weightBits16`, the
+most a format stores where the formats are unknown, which bounds the scratch), and a split
+grid's threadgroups each also store their fp32 partials of the tile's rows, which the last
+partition reads back. The constants come from sweeps of 2 to 40 threadgroups per core on the
+32-core M5 Max, the 20-core M5 Pro and the 12-core M6 (`gguf-projection-benchmark`, which times
+a gate/up pair in both pass modes; MLX 4-bit and six GGUF formats at 2048 and 5120 inputs,
+gate/up pairs in MLX 4-bit): time per byte steps up past 10 and 16 threadgroups per core at one
+and two lanes (past 8 or 9 of the two-simdgroup tile on the M5 Pro), and the 32-row tile of
+three and four lanes steps past 9 on the M5 Max, 8 on the M5 Pro and 11 on the M6, which the law
+leaves out. The floors are fitted, not measured: a grid search over every measured case's
+fastest split gave 6 and 10 for `saturating` (a lone chain measures 5.4 and 9 threadgroups'
+bytes) and 2 and 3 for `following` (one threadgroup per core past a full wave measures 2.7-3.5
+of the tile's and 6-8.5 of the pair's); they stand in for what the law leaves out. Floors at the
+measured trailing waves take as much time in total on the sweeps but leave more cases slower.
+The law's totals on the sweeps (1.1%, 1.6% and 0.05% less time than the earlier rules on the M5
+Max, the M5 Pro and the M6) are in-sample, the fit's own records; the ABBA decode runs and a
+16-core emulation are the only out-of-sample checks, and the down projections' 17408 inputs,
+pairs in other formats and low-bit pairs take the law unmeasured. On the 12-core M6 the 35B draft's
+fc projection (2048 columns over 16384 inputs) runs two partitions instead of four at three and
+four lanes, 1.0-1.2% (2 us a cycle) more, within the 1.2-1.4% the benchmark varies between
+repeats; the law keeps it. The benchmark times the 27B's IQ4_XS gate/up pair 6.5% slower in two
+passes than in one at three and four lanes on the M5 Max (318.0 against 298.5 us), yet in the 27B
+UD-Q4_K_M's decode cycles at a 1024-token prompt the law's two passes took 0.8-1.2% less time there
+than a build running IQ4_XS pairs in one pass (1.2-1.8% at one and two lanes, six runs each), so the
+law keeps them.
+
+The law tells a gate/up pair's pass modes apart only where a last wave falls below its floor. On
+the M5 Max the 27B gate/up pair runs two passes (one pass would put 17 threadgroups on each
+core, the 17th a second wave alone: 333 us against 245 at one lane). Where both modes' last
+waves clear their floors the law predicts the same time for both, and the tie takes one pass,
+which the sweeps measure faster in 133 of 152 tied cases (by up to 22%) and slower at 20 and 36
+one-pass threadgroups per core (by up to 20%, most at one lane): a 20-core M5 Pro (27.2 per
+core) and a 40-core M5 Max (13.6) run one. A 16-core M5 Pro puts 34 one-pass threadgroups on
+each core (16, 16 and 2), where the law takes two passes at every lane count; emulated by width
+on the M5 Max, two passes take 9-12% less time than one unsplit pass, the earlier rule's plan,
+at one and two lanes but 7% more at three and four (the 32-row tile's lower residency), so there
+the 27B gate/up pair's three- and four-lane steps lose about 7%. The law keeps that loss: a 32-row
+residency of 8, which gives those steps back, sends the 32-core M5 Max's 27B pair to one pass at
+three and four lanes, 19-26% slower than its two passes, and a pair efficiency factor (0.92-0.97)
+fits the sweeps worse; no 16-core Mac has measured the case. Fewer than 16 cores run two
+passes whatever the law (`spreadsStagedDecode`): a 12-core M6 took 2-11% more in one. The law's
+plans depend on the batch width, since partials grow with the rows, so a request's greedy output
+may change with the requests batched with it (the 27B MLX's decode cycles of three and four
+lanes and the 35B MLX's of two to four, and of one at other prompt lengths, yield other tokens per
+cycle than before), and with it a step's time: on the 32-core M5 Max's 35B MLX at two lanes, where
+only the draft's gate/up pair changes (one partition to two), cycles took 0.5-1.1% more at a
+1024-token prompt but 0.9% less to 0.7% more at 640, 896, 1280 and 1536 tokens, tokens per cycle
+moving both ways, so that step follows the text rather than the kernel. The
+register tile and Apple9's staged tile, whose matrix operations share the FP32 pipe or run exact in
+registers without a residency step in their time, split by tiers (`decodeSplits`: threadgroups per
+core, inputs per partition and partitions, measured on a 40-core M3 Max, Apple9's staged tile taking
+the register tile's of eight partitions) that do not depend on the batch width.
+Partitions stop at eight, but the register tile splits a grid that eight leave below three
+threadgroups per core into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's
+hyper-connection down projection, 320 columns over 10240 inputs; measured on Apple10). The MoE
+experts
 (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register
 form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which
-Apple9 takes for experts mostly in the formats it stages (`MoeShape::expertFormat`) and for
-experts with an F16 weight (`MoeShape::registerFormats`). One `MoeShape` serves all of a model's
+Apple9 takes on GPUs of 10 cores or fewer (the base M3 and M4), and on larger ones for experts
+mostly in the formats it stages (`MoeShape::expertFormat`) and for experts with an F16 weight
+(`MoeShape::registerFormats`). One `MoeShape` serves all of a model's
 MoE layers, so one F16 routed or shared expert tensor in any layer stages every layer's experts
-there. Their
-passes launch the live tiles alone: the grouping kernel writes each pass's grid with the tile
-count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirectThreadgroups`).
-The staged tile runs gate and up in one pass, a gate and an up simdgroup on the same columns,
-bitwise the two passes' intermediate; the simdgroups share one pair table where gate and up share
-their routed and their shared formats.
+there. A block routes as one of the routings the kernels compile (`ops::kCompiledMoeRoutings`):
+its router weights a row's top k experts by the softmax of their scores (`MoeRouter::Softmax`,
+the Qwen families) or by each one's sigmoid over the sum of theirs (`SigmoidNormalized`, Flint),
+and every row also visits the `MoeShape::sharedSlices` slices of the shared expert, ids `experts`
+on, of the routed experts' width, each weighted by the sigmoid of the block's scalar gate
+(`sharedGate`) or by 1. A shared expert wider than the routed ones runs as such slices in the
+grouped passes: the planner keeps its gate and up rows and lays its down projection out as column
+windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow slice s - 1's
+(`moe_gguf_segment`). The select kernel names the routing's select suffix
+(`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
+(`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
+unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes
+each pass's grid with the tile count, and the pass reads it as an indirect dispatch
+(`ComputeDispatch::indirectThreadgroups`). The staged tile runs gate and up in one pass, a gate
+and an up simdgroup on the same columns, bitwise the two passes' intermediate; the simdgroups
+share one pair table where gate and up share their routed and their shared formats.
 An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the column tile
 (`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
 products in different orders: a route's output depends on how many rows the step routes to its
@@ -2468,8 +2780,35 @@ of one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
 which runs two projections of one input in one dispatch where they take the same tile (the
 indexer's query and key, each on the tile of its own width), and the token rows are gathered by
-one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU family, core
-count, shape and format.
+one template in `kernels/shared/embedding.metal`. The float projection reads a quantized format's
+rows (`QuantizedSegment::rows`) through the gather's decode
+(`kernels/common/gguf_embedding_formats.h`), the MLX affine formats as runs of 8 codes with their
+block's scale and bias, read a step ahead and decoded once for the step's products, and writes
+their products in fp32, the router's scores. The 35B's 8-bit affine router (256 x 2048, 0.56 MB
+a layer against its F32 values' 2.1 MB) trades the bytes it saves for its decode: at one to four
+lanes it takes 5.2, 6.3, 7.4 and 8.5 us on a 32-core M5 Max against 6.7, 7.1, 7.5 and 8.2 for its
+F32 values (4% slower at four lanes), 6.3, 8.3, 10.4 and 12.6 against 14.7, 16.1, 16.5 and 17.9
+on a 12-core M6, and 10.9, 14.7, 17.9 and 21.1 against 22.2, 23.9, 26.2 and 28.0 on a 10-core M4;
+the 122B's (256 x 3072) 6.7, 8.4, 10.0 and 11.5 against 9.0, 9.5, 10.0 and 10.9 on the M5 Max
+(`gguf-projection-benchmark float-af8g64 256 2048`, weights DRAM-cold). In the 35B's one-lane
+decode on the M5 Max its dispatch takes 8.4 us a layer against 9.45 (`decode-profile`, ABBA, 4
+runs of 96 cycles a build): 0.04 ms of a 14.7 ms cycle, within the cycle's noise. Prefill chunks
+of 1024 to 2048 rows on the M5 Max's accelerator tile, where the decode lies on each step's
+critical path, take -10% to +7% of the F32 values' time, and the M4's simdgroup tile -3% to +6%
+at 64 to 2048 rows.
+A float projection takes the neural accelerator tile on Apple10 from 16 rows and a grid of its
+64 x 32 tiles of 1.5 per core for BF16 values, 2 for F32 values and 3 for a quantized format's rows,
+by the bf16 parts the tile stages a weight as (one, three, three decoded; `Linear::ggufFloatTile`).
+Where the two tiles take the same time on a 32-core M5 Max and a 12-core M6
+(`gguf-projection-benchmark float-<format>`, rows in steps of 64): F32 at 2.0-2.67 tiles per core
+for 256 columns of 2048 or 3072 inputs, and 1.75-2.0 (M6) or 2.0 and above (M5 Max) for the 64 and
+96 of GDN alpha/beta; quantized rows at 2.67-4.0 (8-bit and 4-bit affine, Q8_0, Q4_K). Over those
+points the rule's tile takes at most 13% (F32) and 6% (quantized rows) longer than the faster one,
+where 1.5 for every weight took up to 42% and 61% longer; on the M5 Max the 35B's native router rows
+take 52.6 us at 512 rows on the simdgroup tile against 71.8 on the accelerator's. BF16 crosses at
+0.67-1.33, under its rule, which keeps a decode step's 16 to 32 rows of a 512-column router off the
+accelerator tile on 12 cores (1.6-1.8x the simdgroup tile's time there). These plans are fixed
+rules of GPU family, core count, shape and format.
 
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized segments,
@@ -2486,11 +2825,12 @@ leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lane
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
 `moe_expert_gguf_m<rows>_gate_up`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode, and in prefill one
-`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN and
-attention-gate variants that also write the register kernels' input table carry `table16` in
-their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
-SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
-register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
+`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN,
+attention-gate and attention-gather variants that also write the register kernels' input
+table carry `table16` in their names. The epilogue kinds of both GGUF families are in
+`kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
+`kernels/common/activation.h`, and the MMA helpers every register kernel uses, GGUF or fp32, in
+`kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
@@ -2506,10 +2846,10 @@ PrismML-Eng/llama.cpp 01ae597) in `gguf-reference`, and `gguf-planner` checks th
 plans; both run in `make test-engine-cpu`.
 `make test-engine-metal` runs `gguf-preparation`, which checks every format's planes, as the
 production executor and its `gguf_repack` kernel write them, bitwise against the reference,
-the alpha/beta, norm, convolution and router bytes they write and the golden images; then
-`gguf-dequant`, the staged tile's dequantizer, built with the production Metal flags, against
-the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the rotated
-PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
+also as column windows, the alpha/beta, norm, convolution and router bytes they write and the
+golden images; then `gguf-dequant`, the staged tile's dequantizer, built with the production Metal
+flags, against the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the
+rotated PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
 `gguf-projection`, every GGUF projection through `ops::Linear` with each tile forced, so both
 decode tiles run on every GPU, each in every format it takes (the register tile all but F16), at
 one to four lanes, every K split and epilogue, fused segments, every format's gate with the next
@@ -2519,20 +2859,46 @@ split, and one lane on the staged 16-row tile bitwise against the 8-row tile; an
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
 every format it takes as each routed and shared expert tensor, against fp64, and bitwise against
-the full grids and two gate/up passes. The goldens and how to regenerate them are
+the full grids and two gate/up passes; `gguf-moe-e512` runs it at Qwen3.8-Flash-Next's 512
+experts and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated
+shared slices. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
-Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
-weights DRAM-cold. `make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one
-projection (up to three fused formats and widths, then `K` and an optional epilogue) on both
-decode tiles at one to four lanes (one lane also on the staged 16-row tile, `staged16`) and
-every K split, and marks the device policy's pick, or, with a trailing `prefill=R[,R...]`
-after the epilogue and the round count, one format's 128-row prefill tile at each chunk of `R`
-rows (more than 32); the formats `float-bf16` and `float-f32` time the float projection
+Two benchmark tools repeat the measurements behind the GGUF split law and tiers and the MoE plans,
+with the weights DRAM-cold (each command of the projection benchmark reads a ring of weight copies
+of at least 384 MiB, however small the tensor). `make benchmark-gguf-projection
+GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one projection (up to three fused formats and widths,
+then `K` and an optional epilogue) on both decode tiles at one to four lanes (one lane also on the
+staged 16-row tile, `staged16`; a gate/up pair on the staged tile in two passes, `staged`, and where
+the walks spread also in one, `pair` and `pair16`) and every K split, and marks the device policy's
+pick; widths emulate core counts, since the policy counts threadgroups per core. Or, with a trailing
+`prefill=R[,R...]` after the epilogue and the round count, one format's 128-row prefill tile at each
+chunk of `R` rows (more than 32); the formats `float-bf16` and `float-f32`, and `float-<format>` for
+a quantized format's native rows (such as `float-af8g64`), time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
-`Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape
-on the device's plans and the other GGUF tile.
+`Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
+or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
+device's plans and the other GGUF tile.
+
+Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
+query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
+256 is unnamed) in a value order, each compiled with the variants its layers take, which a layer
+selects with an `ops::AttentionVariant`. Its queries and keys are rotated by the geometry's
+RoPE, or not (NoPE: `qkv…_nope`, which binds no tables); and each row attends its whole history,
+or a window of the keys before it (`…_w512`: a row at position p attends p − 512 to p). A
+windowed split and reduce start at the page of their tile's first row's window start
+(`splash_attention_first_page`), each row masking the keys before its own, and a windowed verify
+lane's or prefill tile's splits stop at the 18 pages such a window reads
+(`kv::windowAttentionPages`). A geometry with learned sinks (`reduce…_sinks`) binds the layer's,
+an F32 per query head, to the reduce, which adds each to its row's softmax after the splits, in
+their order, as a key with no value; one without an output gate (`gather`) gives the
+out-projection its attention rows as they are. The RoPE tables are of the target geometry's pairs
+(`rope_build_tables`, or `rope_build_tables_p64` for 64). `make test-engine-metal` runs
+`attention-variants`, every variant through the production encoders against fp64, and
+`make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes flint-window,flint-full'` times
+Flint's two kinds of layers with their sinks: a window of 512 keys with RoPE, and the whole
+history without.
 
 ### Sparse attention
 
@@ -2832,6 +3198,19 @@ submitCommandAsync or wait() threw (its encoding failed after its first
 buffers were committed, or the watchdog or a shutdown gave the command up),
 so the work owns what it touches.
 
+Metal fails a command buffer whose event wait is still unmet 5 s after its
+queue reached the wait ("Caused GPU Timeout Error"), and with it the command
+and the engine. The backend commits a command's buffers as it encodes them, so
+the queue reaches a command's first host step, or Neural Engine wait, as the
+command is submitted, whatever GPU work runs ahead of it, and each later one
+once the one before it was met (macOS 27, M5 Max and M5 Pro; a wait committed
+behind 4.5 s of work and met 1 s after it fails at 5.0 s). The work between
+two steps, with the step, must therefore end within 5 s, which the
+scheduler's prefill slices keep with room to spare. Work outside them runs as
+a command of its own: a prefill command's image encodes, seconds of GPU work
+on a small GPU, run first, and the prefill command is submitted once they
+have completed ([Vision](#vision)).
+
 A step about as short as the GPU's wake-up can keep the GPU awake: one GPU
 thread spins through it until the CPU ends it, so the work after it starts at
 once and at full clocks. The spin sees the CPU end it only through a memory
@@ -2868,27 +3247,39 @@ pressure and swap.
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
 each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
-budget's pages unused (`Layout::extentPagesFor`). Each extent has a form
-(`kv::PageForm`): a Full extent holds its pages' K/V and then, for a layout
-with a block index, their index plane; an Index extent only the plane, for
-pages whose K/V is on the SSD, and only a pool that spills allocates one. A
-page moves to the other form, its references with it, when its K/V leaves
-memory or comes back (`KvPool::movePages`). The pool allocates an extent
-when it needs one of its pages. When it is built it allocates the runway, the
-extents of the first 64 pages, which startup warmup runs on; nothing but the
-pool allocates or releases an extent. An extent whose last page is free stays
-allocated until a reclaim releases it, at once and only between commands: memory
-pressure, an admission the budget denies, the publication of a replay point in
-use or a junction, or startup cleanup. Kernels reach a page through the GPU
-address in its request's page table, so no command binds KV; the command
-queue's residency set makes extents resident for every command buffer. The host reaches the same memory
-(`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
-returns free pages before it evicts anything: an empty extent as it is, and the
-free pages scattered over the others of its form as soon as they cover the
-extent of that form that holds the fewest pages, whose pages the pool copies to
-them (`KvPool::compactExtent`): a Full extent before an Index one, unless the
-reclaim needs the memory of one form, as a shortfall of Index pages needs Full
-memory.
+budget's pages unused (`Layout::extentPagesFor`). The regions follow the
+layers, except that a layout with a sliding window (`Layout::windowTokens`,
+over the layers `windowedLayers` names) places the regions of the layers no
+window bounds first and then the windowed layers', each in layer order
+(`Layout::region`): what a row reads of a page every window has passed lies in
+its first regions, and a page's SSD slot holds them first too. Each extent has
+a form (`kv::PageForm`), which holds the first of a Full extent's regions
+(`Layout::regions`) and then, for a layout with a block index, their index
+plane: a Full extent every layer's; an Index extent none, only the plane, for
+pages whose K/V is on the SSD, and only a pool that spills allocates one; and a
+Slim extent, only of a layout with a sliding window whose slots hold a page's
+spans in order (`Layout::slimmable`), those of the layers no window bounds, for
+a page every row's window has passed. A layer's region sits at one offset in
+every extent that holds it, so the kernels reach a Slim page as they reach a
+Full one, through a real page table entry; only an Index page's is absent. A
+page moves to another form, its references with it, when its K/V leaves memory
+or comes back, or when it gives up its windowed layers' K/V
+(`KvPool::movePages`), and the copy takes what both forms hold. The pool
+allocates an extent when it needs one of its pages. When it is built it
+allocates the runway, the extents of the first 64 pages, which startup warmup
+runs on; nothing but the pool allocates or releases an extent. An extent whose
+last page is free stays allocated until a reclaim releases it, at once and only
+between commands: memory pressure, an admission the budget denies, the
+publication of a replay point in use or a junction, or startup cleanup. Kernels
+reach a page through the GPU address in its request's page table, so no command
+binds KV; the command queue's residency set makes extents resident for every
+command buffer. The host reaches the same memory (`PageStorage::spans`), which
+is how the disk tier moves pages. A reclaim returns free pages before it evicts
+anything: an empty extent as it is, and the free pages scattered over the others
+of its form as soon as they cover the extent of that form that holds the fewest
+pages, whose pages the pool copies to them (`KvPool::compactExtent`): a Full
+extent before a Slim one and a Slim one before an Index one, unless the reclaim
+needs the memory of one form, as a shortfall of Index pages needs Full memory.
 The blocks and requests on those pages follow them, a page a disk transfer reads
 or writes stays where it is, and a pass that evicts everything copies only what
 is left afterwards. Every extent a pass empties is released, except that a
@@ -3131,7 +3522,82 @@ GDN layer's dispatches stop there to store the state and go on from it, and
 the state's window is a copy of the lane's as the chunk finds it plus the
 chunk's rows before the boundary, since the chunk's later rows take the slots
 of the state's oldest rows in the lane's window. A state at the chunk's end is
-copied from the lane after it.
+copied from the lane after it. A target without GDN layers keeps no GDN state:
+its cells have no bytes, every lane and state shares one empty cell that holds
+no memory, so a lane holds the draft's rings and window and a cached state the
+window alone, and `state.idle_gdn_cells` stays 0.
+
+### Sliding windows
+
+A target whose layers include sliding-window ones (`kv::Layout::windowTokens`,
+over the layers `windowedLayers` names) pages every layer, and a row of a
+windowed layer reads only the `windowTokens` keys before its own. Once every
+row that will run has passed a page by a window, its windowed layers' K/V is
+read no more, and the page gives it up for the Slim form, which keeps the
+layers no window bounds (`kv::PageForm::Slim`): for Flint 14 of 49 layers, 462
+KiB of a page's 1.58 MiB in int8. A cached state needs its tail, the
+`windowPages` blocks that end at its block (`Layout::windowPages`, 16 for a
+512-token window), Full, since a request resuming there reads them whole: so a
+cached prefix restores at a state as ever (`Cache::restoreRequest`), and states
+closer than a window share the pages of their tails. The cache keeps it so
+(`CacheWindowPolicy`):
+
+- Between commands, before any lane grows, `Cache::trimWindows` moves to the
+  Slim form every Full page that every request holding it has published
+  `windowPages` blocks past (its next command's rows, at or past its published
+  blocks, read no key on it), that no state's tail holds and that no transfer
+  moves, the cached pages no request holds and the pages requests keep beside
+  their blocks among them. The Slim runway's free pages take them first,
+  then extents memory allows: while a request is in service, memory it
+  needs, as its KV is, so the host's pause does not hold them back and a long
+  prompt's passed pages trim as it prefills. A refusal leaves pages Full for
+  the next pass: memory, never correctness. A multi-pass prefill publishes
+  only once its last pass ends, so its rows' windows stay Full between
+  passes.
+- Every state, in RAM or on the SSD, pins its tail (`KvCache::countState`, a
+  bounded walk beside the counts of the states below); only its removal
+  unpins the tail, which the next pass trims: a state written to the SSD
+  keeps its entry and its tail Full, on a request's own chain too, where the
+  plan's floor (`kvWindowFloorPages`) does not count it.
+- A writer that computes a block again keeps its own page, which the block
+  takes once no transfer moves the block's (`KvCache::insert`,
+  `kv.window.upgrades`), rather than moving onto the block's page as a
+  writer of another layout does: its window reads the page whole, which a
+  Slim page no longer is, and were it to move onto a Full one, what it reads
+  would depend on whether trimming had taken the block's windowed layers.
+  Requests that hold the old page keep it, as a page of their own the next
+  passes trim once their windows have passed it. A copy of a Slim page goes,
+  there and where a disk-only block takes a writer's page: a block's copy
+  holds at least what its page holds, should the page leave.
+- A state is published only on a Full tail (`Cache::stateTailFull`), which a
+  command leaves where it computed or held the tail in its window; the engine
+  counts one it refuses as a failed publication. A start takes back a
+  persistent restore point only with Full copies of its tail.
+- Each cut of a request's page table checks that every page from the window
+  before its published blocks on is Full, always (`Cache::cutPageTable`).
+- A KV slot holds what its page holds when it is written, and its record
+  names the form (`KvSlotLabel`); a restore allocates that form. A restore
+  point persists its tail Full, as RAM holds it.
+
+So no byte a kernel reads changes: a run with trimming off
+(`--kv-window-trim off`, the native argument validation passes) emits the
+same tokens and logits wherever memory lets it cache what a run with
+trimming on caches, only taking the memory of Full pages. The memory plan
+counts on trimming, with it off too, so a validation run keeps within what
+Full pages hold: one request's KV capacity is the Full pages its lane keeps,
+its window's, the pages a command writes (a chunk, or a group of four where
+the routed experts stream) and one more (`kvWindowFloorPages`), in whole Full
+extents, and the pages of as many whole Slim extents as the rest holds, since an
+extent holds pages of one form; the pool's page ids cover the Slim pages the
+hard budget could hold. A Full shortfall takes trims first, then, while the Slim
+pool has room for their tails, states, a checkpoint first, each followed by a
+trim of the tail it unpinned, while those trims free pages, before any KV leaf
+goes (`Cache::reclaimForPages`). At the memory wall, where the Slim runway
+cannot refill, no state goes for its tail, and the victims go as without a
+window, dead leaves before ordinary states. A state the SSD cache keeps unpins
+nothing: each step that keeps extents (`CacheReclaimMode::KeepExtents`) writes
+one more state there before any leaf goes. Empty Slim extents beyond the runway
+go for the retry to grow by.
 
 ### Disk tier
 
@@ -3236,12 +3702,15 @@ chain whose newest blocks have no copy, as a finished request's prompt past the
 chain it restored, so leaves RAM one write at a time, and an allocation refused
 meanwhile waits for each write. Unneeded
 tails are dropped without writing, before any state, together with any disk
-copies below them. Writes run on their file's IO worker. A KV page is restored
-by the engine's SSD readers (`SsdReaders`), which
-read what the page's form holds, its index alone or the whole page, with one
-aligned read into memory of their own, and scatter it into the page; the
-restores asked for between two submissions (`KvTier::submitRestores`) go out
-together, index restores on every reader and whole ones on at most
+copies below them. Writes run on their file's IO worker. A KV page's slot
+holds what the page holds as it is written: a Slim page's is the first part of a
+Full page's payload, its regions in their order, and the block keeps the form of
+its copy (`KvCache::copyForm`), which a restore of the block allocates its page
+in. A KV page is restored by the engine's SSD readers (`SsdReaders`), which read
+what the page's form holds, its index alone, a Slim page's payload or the whole
+page, with one aligned read into memory of their own, and scatter it into the
+page; the restores asked for between two submissions (`KvTier::submitRestores`)
+go out together, index restores on every reader and whole ones on at most
 `KvPageTier::kWholeRestoreReaders`. A state is restored on its file's worker.
 Either way the transfer runs beside whatever command the model runs: a cached
 page is never written by a command, and no command uses a page before its read
@@ -3320,7 +3789,9 @@ one of each segment: the page's index, then each block's record. A state that
 fails it on its first read is a miss. Every read of a KV copy a restart took
 back checks the segments it covers: a whole or index restore that fails is a
 miss, and a block or history read that fails is `kv_unreadable` for the
-requests that read it.
+requests that read it. A KV record of a layout with a sliding window also names
+the form of the page its slot holds (`KvSlotLabel`), and a start takes back
+only the forms it restores.
 
 `/status` reports the shared quota, its limit, the write budget and KV
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
@@ -3454,7 +3925,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window |
-| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
+| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; where `/status` reports `reasoning_switch` `false` (Flint), it gives each request whose answer it checks room for the model's reasoning and leaves out the thinking budget's check; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build, in which both builds' `weight-digests` take `WEIGHT_DIGESTS_ARGS` (`dev/benchmarks/backend_regression.py`) |
@@ -3613,7 +4084,12 @@ that model alone once the Mac has cooled.
 
 `.venv/bin/python dev/tools/kernel_identity.py BASELINE/build build` compares
 the AIR of each kernel the decode path may run in the two builds'
-`splash.metallib` (`--match` for others) and fails if any differs.
+`splash.metallib` (`--match` for others) and fails if any differs. The helpers
+a kernel's module defines are compared in the order they appear there, not by
+name: C++ names them for their template values, which a kernel template that
+gains a value renames without changing their code. So are the numbers of its
+lambdas' anonymous classes and its classes' names in the alias metadata, which
+the same change renames.
 
 Two pairs of constants in `runtime/engine/Protocol.hpp` and `server/protocol.py`
 version what the server and the engine exchange. When the native wire layout
@@ -3679,7 +4155,14 @@ window, the fp32 logits of the prefill's final position and of ROWS decode
 positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
 also takes `--kv-format`, `--state-format`, `--expert-memory` and
-`--ple-memory`.
+`--ple-memory`, and, with `--captures yes`, writes the output rows of the
+target layers the model's draft reads (its `target_layer_ids`) at the
+positions a window's prefill computed, in one command, to
+`OUTPUT-END.captures.f32` (fp32, a row per position of each layer's hidden
+values in the draft's layer order), which a reference's residuals after those
+layers compare with (`dev/tools/flint_reference.py` writes Flint's,
+`residuals.npy`): a draft of the layers to compare, such as a test draft whose
+`fc` reads them, makes them its captures.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that
