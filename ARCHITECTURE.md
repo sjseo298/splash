@@ -129,8 +129,10 @@ depends on test code.
 - `ModelFactory` plans all loaders before any image is written, so every
   source's metadata is validated first; `ModelDescriptor` reads the
   installation's `model.json`.
-- Execution: `Runtime` runs a prepared step; `Qwen3_8` and `Qwen3_6Moe`
-  implement the supported targets, `DFlashDraft` the speculative draft,
+- Execution: `Runtime` runs a prepared step; the per-family code in
+  `runtime/model` (`Qwen3_8`, `Qwen3_6Moe`, upstream's `Qwen4Exp`/`Qwen4Steps`
+  and `Flint`/`FlintTarget`) implements the supported targets, `DFlashDraft`
+  the speculative draft,
   `QwenVision` the vision tower, `ExecutionPlans` the per-phase command
   plans; `QwenState`, `StateLayout`, `StateTransfer`, `GgufImage*`,
   `SafetensorsCheckpoint`, `WeightSource`, `WeightStore`, `Crc32c` support
@@ -247,9 +249,11 @@ merge:
   when engine headroom runs low, not only after a refused allocation
   (`reclaimed` in `MemoryGovernor.cpp`), holding the recovery margin without
   waiting for an OOM-style refusal.
-- **Recovery drain timeout.** A start that waits for drained resources during
-  recovery fails within its own wait budget instead of stalling the lane
-  (`Engine::drainingForRecovery`).
+- **Recovery drain timeout** *(pending re-application)*. A start that waits
+  for drained resources during recovery should fail within its own wait budget
+  instead of stalling the lane; this extension was superseded when a previous
+  upstream integration rewrote `Engine.cpp` and is queued to be re-applied on
+  the current engine before it counts as shipped.
 - **Coverage.** `dev/tests/engine/memory_headroom_reclaim_test.cpp` pins the
   headroom and reclaim behavior; it builds and runs as part of
   `test-engine-cpu` (`TEST_MEMORY_HEADROOM_RECLAIM_TEST` in `dev/native.mk`).
