@@ -7,7 +7,7 @@ optional Neural Engine prefill, and automatic memory planning.
 
 This document describes the structure of the codebase. For configuration,
 the API reference, internals deep-dives, building, and testing, see
-[DEVELOPMENT.md](DEVELOPMENT.md).
+[docs/](docs/README.md).
 
 ## Layers
 
