@@ -205,6 +205,9 @@ class PostRoute:
 
 POST_ROUTES = {
     "/v1/chat/completions": PostRoute("_post_chat_completions", OPENAI_ERRORS),
+    "/v1/chat/completions/count_tokens": PostRoute(
+        "_post_chat_count_tokens", OPENAI_ERRORS, prompt_only=True
+    ),
     "/v1/completions": PostRoute("_post_completions", OPENAI_ERRORS),
     "/v1/responses": PostRoute("_post_responses", OPENAI_ERRORS),
     "/v1/messages": PostRoute("_post_messages", ANTHROPIC_ERRORS),
@@ -592,6 +595,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "context_length": self.app.max_context,
                     "vision": self.app.vision,
                     "input_modalities": self.app.input_modalities,
+                    "reasoning": self.app.reasoning,
                     **(
                         {"root": self.app.response_model}
                         if name != self.app.response_model
@@ -783,6 +787,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if body.get("stream"):
             return job, self._anthropic_stream
         return job, self._anthropic_complete
+
+    def _post_chat_count_tokens(self, body, deadline):
+        tokens = self.app.count_tokens(body, deadline=deadline)
+        self._json(200, {"input_tokens": tokens})
 
     def _post_count_tokens(self, body, deadline):
         prompt = anthropic_to_chat_prompt(
@@ -1868,7 +1876,7 @@ def main():
             if effective_context % 1024 == 0
             else f"{effective_context:,}"
         )
-        mode = "" if readiness.vision else " · language only"
+        mode = "" if readiness.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
     except (

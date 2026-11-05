@@ -3476,9 +3476,10 @@ void testKvAStateInUseNeedsGoesLast() {
 // Marks count per block: requests sharing it each hold one, a mark taken
 // before the publication applies to it, and so does one on a block whose
 // state left and was published again. Only a publication that is itself in
-// use displaces a state in use, after every other state; ordinary and
-// optional publications never do. The chain's request runs, so no KV
-// competes with the states.
+// use displaces a state in use, after every other state, in a step of its
+// own (Cache::reclaimInUseState) once reclaimOneState finds nothing;
+// ordinary and optional publications never do. The chain's request runs, so
+// no KV competes with the states.
 void testStateUsesAreCountedPerBlock() {
   CacheFixture fixture(nullptr, true);
   const auto resident = [&](uint32_t block) {
@@ -3499,7 +3500,9 @@ void testStateUsesAreCountedPerBlock() {
           "recycling took the state in use before an ordinary one");
   require(!fixture.cache.reclaimOneState(StateClass::Checkpoint, true) && resident(0),
           "an optional publication at a used block took a state in use");
-  require(fixture.cache.reclaimOneState(StateClass::InUse, true) && !resident(0) &&
+  require(!fixture.cache.reclaimOneState(StateClass::InUse, true) && resident(0),
+          "a publication in use took a state in use before its step of its own");
+  require(fixture.cache.reclaimInUseState() && !resident(0) &&
               fixture.cache.snapshot().stateCache.inUseEvictions == 1,
           "a publication in use could not recycle the last state in use");
   fixture.publish(0);
@@ -3734,13 +3737,12 @@ void testRecycleNeverDropsAStateInUseForTheWriteSlot() {
   StateUse held = fixture.cache.useState(fixture.blocks[1]);
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
   StateUse publishing = fixture.cache.useState(fixture.blocks[2]);
-  require(!fixture.cache.reclaimOneState(StateClass::InUse, true) &&
+  require(!fixture.cache.reclaimOneState(StateClass::InUse, true) && !fixture.cache.reclaimInUseState() &&
               fixture.cache.stateResident(fixture.blocks[1]) &&
               fixture.cache.snapshot().stateCache.inUseEvictions == 0,
           "a state in use was dropped for a busy write slot");
   control->ready = true;
-  require(fixture.cache.pollTransfers() &&
-              fixture.cache.reclaimOneState(StateClass::InUse, true) &&
+  require(fixture.cache.pollTransfers() && fixture.cache.reclaimInUseState() &&
               fixture.lookup(65).resumeBoundary() == 64 &&
               fixture.cache.snapshot().stateCache.offloads == 2,
           "the state in use was not written for the publication in use");
@@ -3765,8 +3767,7 @@ void testDiskReplacementTakesStatesInUseLast() {
   };
   StateUse oldest = fixture.cache.useState(fixture.blocks[0]);
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), false);
-  require(fixture.cache.reclaimOneState(StateClass::InUse, true) &&
-              fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimInUseState() && fixture.cache.pollTransfers(),
           "the oldest state in use was not written");
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
   require(fixture.cache.reclaimOneState(StateClass::Ordinary, false) && fixture.cache.pollTransfers() &&
@@ -3775,8 +3776,8 @@ void testDiskReplacementTakesStatesInUseLast() {
   // The quota is full: a write in use gives up the ordinary copy.
   StateUse older = fixture.cache.useState(fixture.blocks[2]);
   fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), false);
-  require(fixture.cache.reclaimOneState(StateClass::InUse, true) &&
-              fixture.cache.pollTransfers() && cached(65) == 32 && cached(97) == 96 &&
+  require(fixture.cache.reclaimInUseState() && fixture.cache.pollTransfers() && cached(65) == 32 &&
+              cached(97) == 96 &&
               inUseEvictions() == 0,
           "a write in use replaced a copy in use before an ordinary one");
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
@@ -4069,8 +4070,8 @@ void testOrdinaryPublicationWaitsForTheWriteSlot() {
 // While the engine may not grow, an extent's bytes give a state's buffers
 // nothing: a publication in use leaves KV and extents where they are and
 // recycles states like any other publication, the oldest in use after the
-// ordinary ones. With growth each step says what it gave, buffers or an
-// extent.
+// ordinary ones, in a step of its own (Cache::reclaimInUseState). With
+// growth each step says what it gave, buffers or an extent.
 void testPublicationInUseWithoutGrowthTakesStatesAlone() {
   test::TestKvStorage storage{8, 100, 1};
   KvPool pool{storage, 8};
@@ -4091,11 +4092,14 @@ void testPublicationInUseWithoutGrowthTakesStatesAlone() {
   require(room && room.extentBytes == 0 && !cache.stateResident(stated[1]) && blocks() == 8 &&
               allocated() == 8 && cache.lookup(older, {}).kvBoundary == 64,
           "without growth the publication took KV ahead of the ordinary state");
-  room = cache.reclaimOneState(StateClass::InUse, false);
+  require(!cache.reclaimOneState(StateClass::InUse, false) && cache.stateResident(other),
+          "the publication took the state in use before its step of its own");
+  room = cache.reclaimInUseState();
   require(room && room.extentBytes == 0 && !cache.stateResident(other) && blocks() == 8 &&
               allocated() == 8 && cache.snapshot().stateCache.inUseEvictions == 1,
           "without growth the publication took KV ahead of the state in use");
-  require(!cache.reclaimOneState(StateClass::InUse, false) && blocks() == 8 && allocated() == 8,
+  require(!cache.reclaimOneState(StateClass::InUse, false) && !cache.reclaimInUseState() && blocks() == 8 &&
+              allocated() == 8,
           "without growth the publication took KV once no state was left");
   room = cache.reclaimOneState(StateClass::InUse, true);
   require(room && room.extentBytes == 100 && blocks() == 7 && allocated() == 7,
@@ -4133,7 +4137,8 @@ void testPublicationInUseLeavesKvInUse() {
 // A reservation cannot wait for a demotion: a publication in use passes over
 // every leaf whose page returns only once a copy is written, here each older
 // leaf, which holds a state only the disk holds. It starts no demotion, so it
-// displaces no disk copy, and recycles the oldest state in use instead.
+// displaces no disk copy, finds nothing ordinary, and recycles the oldest
+// state in use instead (Cache::reclaimInUseState).
 void testInUsePublicationStartsNoDemotion() {
   test::TestKvStorage storage{6, 100, 1};
   KvPool pool{storage, 6};
@@ -4154,7 +4159,8 @@ void testInUsePublicationStartsNoDemotion() {
   const uint64_t point = cacheChain(cache, 4, 1, true).second[0];
   StateUse use = cache.useState(point);
   const CacheSnapshot before = cache.snapshot();
-  const StateRoom room = cache.reclaimOneState(StateClass::InUse, true);
+  require(!cache.reclaimOneState(StateClass::InUse, true), "a publication in use found an ordinary victim");
+  const StateRoom room = cache.reclaimInUseState();
   const CacheSnapshot after = cache.snapshot();
   require(room && room.extentBytes == 0 && tier.demotions == 0 &&
               !cache.stateResident(other) && after.stateCache.inUseEvictions == 1 &&
@@ -4169,7 +4175,8 @@ void testInUsePublicationStartsNoDemotion() {
 // KV gives a publication in use memory only through an extent it empties.
 // Where the pages requests hold leave no extent to empty, three held in each
 // of two extents, no KV goes: the stateless chain on the other two pages
-// stays, nothing is copied, and the oldest state in use is recycled.
+// stays, nothing is copied, and the oldest state in use is recycled
+// (Cache::reclaimInUseState).
 void testInUsePublicationTakesNoKvWhenNoExtentCanEmpty() {
   test::TestKvStorage storage{8, 100, 4};
   KvPool pool{storage, 8};
@@ -4183,7 +4190,8 @@ void testInUsePublicationTakesNoKvWhenNoExtentCanEmpty() {
   require(std::ranges::equal(cache.pageTable(1).pages, std::vector<uint32_t>{0, 1, 2}) &&
               std::ranges::equal(cache.pageTable(3).pages, std::vector<uint32_t>{5, 6, 7}),
           "fixture geometry changed");
-  const StateRoom room = cache.reclaimOneState(StateClass::InUse, true);
+  require(!cache.reclaimOneState(StateClass::InUse, true), "a publication in use found an ordinary victim");
+  const StateRoom room = cache.reclaimInUseState();
   require(room && room.extentBytes == 0 && !cache.stateResident(other) &&
               cache.snapshot().stateCache.inUseEvictions == 1 &&
               cache.snapshot().pool.pagesPrefix == 8 && storage.copies.empty(),
@@ -5358,6 +5366,35 @@ void testBlocksAreWrittenOnce() {
   spill.cache.endRequest(2);
 }
 
+// The copies a Spill request owes give back Full pages while the SSD cache
+// writes them, whichever is written first: its dense history's, whose pages
+// stay Full, and the owed copies after them free theirs. They count past the
+// Index pages free now, which the Full extents they empty fund. Nothing is on
+// its way back while no copy is written.
+void testOwedCopiesReturnWhileAnyIsWritten() {
+  // A dense history of four pages; one write at a time.
+  Spilling spill(CacheSpillPolicy{4, 1});
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 1;
+  const std::vector<uint32_t> tokens = Spilling::prompt(1, 12);
+  spill.start(1, tokens, 12);
+  require(!spill.cache.owedCopiesReturn(1, kv::PageForm::Full),
+          "copies no write had started gave memory back");
+  require(spill.cache.writeThrough() == 1, "the first copy was not written");
+  // Seven of its pages spill once their copies land: past the dense history
+  // and before the window. Three Full pages are free, four Index pages.
+  require(spill.pool.freePageCount(kv::PageForm::Full) == 3 &&
+              spill.pool.freePageCount(kv::PageForm::Index) == 4,
+          "the pool did not hold the expected free pages");
+  require(spill.cache.owedCopiesReturn(10, kv::PageForm::Full) &&
+              !spill.cache.owedCopiesReturn(11, kv::PageForm::Full),
+          "the copies owed behind the dense history's gave back other than their pages");
+  require(!spill.cache.owedCopiesReturn(1, kv::PageForm::Index), "owed copies gave back Index pages");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  spill.cache.endRequest(1);
+  spill.cache.checkInvariants();
+}
+
 // A Resident request that computes a chain on disk again keeps the blocks'
 // copies, which hold what another command computed, and writes nothing. A
 // Spill request that holds those blocks later owes copies of their pages,
@@ -5870,6 +5907,7 @@ int main() {
     testConversionSpillsTheHistoryWithCopiesAtOnce();
     testEveryHolderDecidesWhetherAPageSpills();
     testBlocksAreWrittenOnce();
+    testOwedCopiesReturnWhileAnyIsWritten();
     testRecomputedBlocksSpillToCopiesOfTheirPages();
     testUnreadableCopyLeavesWithItsHolders();
     testCutsShareUnchangedChunks();

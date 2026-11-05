@@ -314,7 +314,7 @@ def run_images(port: int, model: str, nonce: str) -> None:
     # prompt the same image comes from the embedding cache without the vision
     # tower, unless the cache let its rows go since the image was encoded
     # (images.embedding_evictions), as it does to give memory back, under
-    # macOS's warning for one (DEVELOPMENT.md, Admission and eviction): the
+    # macOS's warning for one (docs/internals.md, Admission and eviction): the
     # image is then encoded again, once. An eviction that should not have
     # happened passes here too: the engine tests check which reclaims take the
     # rows. A different image behind identical placeholder tokens must not
@@ -1775,8 +1775,10 @@ def add_server_arguments(parser):
     )
     parser.add_argument(
         "--expert-memory",
-        help="serve a MoE model's routed experts from RAM slots of this size in "
-        "all, reading the others from the SSD (splash serve --expert-memory)",
+        help="serve a MoE model's routed experts from RAM slots that keep at "
+        "least this size in all, reading the others from the SSD (splash serve "
+        "--expert-memory); where memory holds every expert they load whole, "
+        "and streaming them takes a smaller --max-memory too",
     )
     parser.add_argument(
         "--verify-rows",
