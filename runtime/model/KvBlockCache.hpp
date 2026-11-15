@@ -33,14 +33,18 @@
 // the engine thread owns it between commands (resizing, merging statistics);
 // a step owns what it reads, so that one its command gave up may still run.
 
+#include "Checked.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/KvExtent.h"
+#include "metal/abi/PagedAttention.h"
 #include "model/KvReadStats.hpp"
 #include "model/Model.hpp"
 #include "model/SsdReaders.hpp"
 #include "ops/KvSlotFormat.hpp"
 #include "ops/PagedAttention.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -71,6 +75,20 @@ public:
   ~KvBlockCache();
   KvBlockCache(const KvBlockCache &) = delete;
   KvBlockCache &operator=(const KvBlockCache &) = delete;
+  // The page table a cache of a pool's `layout`, `laneSlots` and
+  // `targetBytes` (KvBlockCacheOptions) maps its pages through, which it
+  // allocates as it is built and holds until it goes: an entry for each page
+  // of the most extents it holds, its target's or the floors of every lane at
+  // once, in whole host pages, as Metal allocates them, in whichever extent
+  // size the pool takes (kv::Layout::mostOverExtents), so that the memory
+  // plan, made before the pool's, counts it (KvSpillPlan::tableBytes);
+  // 32,768 bytes for Qwen3.8-Flash-Next's ten 256-page extents of int8 KV.
+  [[nodiscard]] static constexpr uint64_t tableBytes(const kv::Layout &layout, uint32_t laneSlots,
+                                                     uint64_t targetBytes) {
+    return layout.mostOverExtents([&](uint32_t extentPages) {
+      return alignUp(mostPages(layout, extentPages, laneSlots, targetBytes) * sizeof(SplashKvPage));
+    });
+  }
 
   // Between commands. The floor of the lane, whose request decodes over
   // Index pages: the cache grows to required(n), (n + 1) laneSlots per
@@ -78,11 +96,28 @@ public:
   // releaseLane() gives it back when the request ends or is suspended.
   [[nodiscard]] ModelMemoryAdmission reserveLane(uint32_t stateLane);
   void releaseLane(uint32_t stateLane) noexcept;
-  // Between commands, optionally: at most one extent more toward the target.
-  [[nodiscard]] ModelMemoryAdmission growTowardTarget();
+  // Whether the lane holds its floor: reserveLane() granted it, and
+  // releaseLane() has not given it back.
+  [[nodiscard]] bool holdsLane(uint32_t stateLane) const;
+  // Whether a lane reads cache above the floors: a lane holds a floor and
+  // the target is past the floors. Else the extents above the floors cost
+  // only their rebuild.
+  [[nodiscard]] bool readsAboveFloor() const noexcept;
+  // The bytes the floors of `lanes` more lanes need together, in whole
+  // extents once for them all, past the extents that stay for them: all
+  // while a lane reads above the floors, else the floors held.
+  [[nodiscard]] uint64_t lanesShortfallBytes(uint32_t lanes) const;
+  // Between commands, optionally: at most one extent more toward the target,
+  // under `admit`.
+  [[nodiscard]] metal::AllocationResult growTowardTarget(const metal::AllocationAdmission &admit);
   // An idle reclaim: the cache's last extent above its floors, in bytes;
   // zero at its floors. A reclaim that needs more calls again.
   [[nodiscard]] uint64_t releaseAboveFloor();
+  // The bytes of one extent, what the cache grows and gives back at a time.
+  [[nodiscard]] uint64_t extentBytes() const noexcept;
+  // The floors of `lanes` lanes in whole extents, whatever the cache holds:
+  // zero for none.
+  [[nodiscard]] uint64_t floorBytes(uint32_t lanes) const noexcept;
 
   // After `layer`'s block lists: a host step that resolves the entries of
   // lane l's list, whose pages' sources are lanes[l] (null for a lane none
@@ -99,11 +134,31 @@ public:
   [[nodiscard]] std::vector<KvReadFailure> takeFailures();
 
   // Engine thread, once a command completed: its resolves' counts, and the
-  // totals of every command's.
-  void mergeStats(const KvReadStats &stats);
+  // totals of every command's. Returns the bytes its resolves read.
+  uint64_t mergeStats(const KvReadStats &stats);
   [[nodiscard]] KvBlockCacheStats stats() const;
 
 private:
+  // A cache's extents: those of the floors of `lanes` lanes, (lanes + 1)
+  // laneSlots slots a layer at 2^SPLASH_ATTENTION_LOCATION_BLOCK_BITS a page;
+  // those of a target of `targetBytes`; and the pages of the most it holds,
+  // its target's or the floors of every lane at once.
+  [[nodiscard]] static constexpr uint32_t floorExtents(uint32_t lanes, uint32_t laneSlots,
+                                                       uint32_t extentPages) noexcept {
+    const uint64_t extentSlots = uint64_t{extentPages} << SPLASH_ATTENTION_LOCATION_BLOCK_BITS;
+    return lanes ? static_cast<uint32_t>(((uint64_t{lanes} + 1) * laneSlots + extentSlots - 1) / extentSlots) : 0;
+  }
+  [[nodiscard]] static constexpr uint32_t targetExtents(const kv::Layout &layout, uint32_t extentPages,
+                                                        uint64_t targetBytes) noexcept {
+    return static_cast<uint32_t>(targetBytes / (uint64_t{extentPages} * layout.kvBytesPerModelPage()));
+  }
+  [[nodiscard]] static constexpr uint64_t mostPages(const kv::Layout &layout, uint32_t extentPages,
+                                                    uint32_t laneSlots, uint64_t targetBytes) noexcept {
+    return uint64_t{std::max(targetExtents(layout, extentPages, targetBytes),
+                             floorExtents(ExecutionLimits::maximumBatchWidth, laneSlots, extentPages))} *
+           extentPages;
+  }
+
   struct Impl;
   std::shared_ptr<Impl> impl_;
 };

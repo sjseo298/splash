@@ -20,6 +20,12 @@ kernel void test_add_u32(device uint *values [[buffer(0)]],
     }
 }
 
+// Adds function constant 0 to the first word: a pipeline per value.
+constant uint kTestIncrement [[function_constant(0)]];
+kernel void test_add_constant_u32(device uint *values [[buffer(0)]]) {
+    values[0] += kTestIncrement;
+}
+
 // Row r of the grid writes word x of the buffer at table[r], which no
 // dispatch binds; addressed_check_u32 reads it back the same way.
 kernel void addressed_write_u32(device const ulong *table [[buffer(0)]],
@@ -65,7 +71,6 @@ kernel void address_table_check_u32(device atomic_uint *mismatches [[buffer(0)]]
     }
 }
 
-// A host_step_wait that ends without seeing its release, as a spin would on a
-// Metal that stopped honoring its memory scope: the test of the backend's
-// spin check names this library host-step.metallib.
+// A host_step_wait that ends at once, without seeing its release: a test
+// of the backend's spin check names this library host-step.metallib.
 kernel void host_step_wait() {}

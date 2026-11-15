@@ -9,6 +9,7 @@
 #include "LinearNumerics.hpp"
 #include "NormReference.hpp"
 #include "TestFamilies.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -29,8 +30,16 @@
 
 namespace {
 
+// The attention row these plans take: the Apple10 row (KernelCalibration.hpp),
+// with int8 activations on (kInt8), or off, where its plans score bf16
+// queries (kBf16).
+constexpr splash::ops::AttentionCalibration kApple10Row = splash::ops::kApple10Attention;
+constexpr splash::ops::Int8Activations kInt8 = splash::ops::Int8Activations::On;
+constexpr splash::ops::Int8Activations kBf16 = splash::ops::Int8Activations::Off;
+
 using namespace splash;
 using test::HostKvExtents;
+using test::attentionRow;
 using test::bf16ToFloat;
 using test::floatToBf16;
 using test::moveBlock;
@@ -52,15 +61,30 @@ using splash::test::require;
 using Geometry = splash::test::AttentionGeometry;
 const std::vector<Geometry> kGeometries = splash::test::familyAttentionGeometries();
 
+// Whether a layout's attention reads the blocks its index selects (the
+// sparse kernels).
+bool selectsBlocks(kv::Layout layout) { return layout.reads == kv::Reads::SelectedBlocks; }
+
 // The parts of a layout's tiles, each a threadgroup of the split grid's x
 // beside its KV head.
 uint32_t tileParts(uint32_t queryHeads, kv::Layout layout) {
-  return layout.valuesTokenMajor ? 1 : SPLASH_ATTENTION_TILE_PARTS(queryHeads / layout.kvHeads);
+  return selectsBlocks(layout) ? 1 : SPLASH_ATTENTION_TILE_PARTS(queryHeads / layout.kvHeads);
+}
+
+// A prefill tile's history splits (PagedAttention.cpp prefillSplits): one
+// per 32 pages the chunk's rows see, no fewer than 32 shared out over its
+// tiles, and no more than 32 nor 256 (the longest chunk's tiles) over them;
+// a sparse tile's, which reads its list, the 32 shared out alone.
+uint32_t prefillSplits(uint32_t rows, uint32_t history, bool sparse) {
+  const uint32_t tiles = (rows + 7) / 8;
+  const uint64_t pages = sparse ? 0 : (uint64_t{history} + rows + 31) / 32;
+  const uint32_t shared = std::clamp(32U / tiles, 1U, 32U);
+  return static_cast<uint32_t>(std::clamp<uint64_t>(pages / 32, shared, std::clamp(256U / tiles, shared, 32U)));
 }
 
 // A layout's split or reduce pipeline of a phase ("prefill" or "verify").
 std::string pipelineName(std::string_view phase, bool split, uint32_t queryHeads, kv::Layout layout) {
-  const bool sparse = layout.valuesTokenMajor;
+  const bool sparse = selectsBlocks(layout);
   // The kernels of four KV heads, the first compiled, have no suffix.
   const std::string suffix = layout.kvHeads == 4 ? "" : "_kv" + std::to_string(layout.kvHeads) + "_g" +
                                                             std::to_string(queryHeads / layout.kvHeads);
@@ -84,8 +108,9 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
   // Enumerate nonsquare grids and partial final tiles. Each logical partial
   // belongs to exactly one query tile, KV head part and balanced history
   // split.
-  for (const uint32_t rows : {17U, 257U, 2048U}) {
-    const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
+  for (const auto [rows, history] : {std::pair{17U, 0U}, std::pair{257U, 0U}, std::pair{257U, 65536U},
+                                     std::pair{2048U, 131072U}}) {
+    const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kApple10Row, kBf16);
     const uint32_t tiles = (rows + 7) / 8;
     require(plan.splitGroups.x == headParts &&
                 plan.splitGroups.y == tiles && plan.splitGroups.z == plan.splits,
@@ -122,34 +147,46 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   const std::string prefillSplit = pipelineName("prefill", true, queryHeads, layout);
   const std::string prefillReduce = pipelineName("prefill", false, queryHeads, layout);
   checkPrefillSlotOrientation(queryHeads, layout);
-  for (uint32_t rows = 1; rows <= 2048; ++rows) {
-    const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
-    const uint32_t tiles = (rows + 7) / 8;
-    const uint32_t splits = std::clamp(32U / tiles, 1U, 32U);
-    require(plan.rows == rows && plan.splits == splits, "prefill plan lost actual rows");
-    require(plan.splitPipeline == prefillSplit && plan.reducePipeline == prefillReduce,
-            "prefill plan runs the wrong pipelines");
-    require(plan.splitGroups.x == layout.kvHeads * tileParts(queryHeads, layout) &&
-                plan.splitGroups.y == tiles && plan.splitGroups.z == splits &&
-                plan.reduceGroups.x == layout.kvHeads &&
-                plan.reduceGroups.y == 8 * queryHeads / layout.kvHeads &&
-                plan.reduceGroups.z == tiles,
-            "prefill split/reduce geometry disagrees");
-    const uint64_t fused = uint64_t{tiles} * splits * 8 * queryHeads;
-    require(plan.workspace.partialsBytes == fused * 256 * 4 &&
-                plan.workspace.statisticsBytes == fused * 2 * 4,
-            "prefill split dispatch and exact scratch disagree");
-    const auto bound = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
-    require(bound.partialsBytes >= plan.workspace.partialsBytes &&
-                bound.statisticsBytes >= plan.workspace.statisticsBytes,
-            "prefill arena omitted a valid shorter plan");
-  }
+  // A short history's chunk shares out 32 splits over its tiles; over a
+  // longer one a tile takes a split per 32 pages, up to the longest chunk's
+  // tiles in all.
+  for (const auto [rows, history, splits] :
+       {std::array{1U, 0U, 32U}, std::array{64U, 0U, 4U}, std::array{256U, 1500U, 1U}, std::array{64U, 4096U, 4U},
+        std::array{256U, 4096U, 4U}, std::array{64U, 8192U, 8U}, std::array{256U, 16384U, 8U},
+        std::array{64U, 65536U, 32U}, std::array{256U, 131072U, 8U}, std::array{512U, 65536U, 4U},
+        std::array{300U, 65536U, 6U}, std::array{2048U, 131072U, 1U}})
+    require(ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kApple10Row, kBf16).splits ==
+                (selectsBlocks(layout) ? std::clamp(32U / ((rows + 7) / 8), 1U, 32U) : splits),
+            "prefill split count does not follow its rows and history");
+  for (uint32_t rows = 1; rows <= 2048; ++rows)
+    for (const uint32_t history : {0U, 4000U, 8192U, 32768U, 131072U, 1'000'000U}) {
+      const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kApple10Row, kBf16);
+      const uint32_t tiles = (rows + 7) / 8;
+      const uint32_t splits = prefillSplits(rows, history, selectsBlocks(layout));
+      require(plan.rows == rows && plan.splits == splits, "prefill plan lost actual rows");
+      require(plan.splitPipeline == prefillSplit && plan.reducePipeline == prefillReduce,
+              "prefill plan runs the wrong pipelines");
+      require(plan.splitGroups.x == layout.kvHeads * tileParts(queryHeads, layout) &&
+                  plan.splitGroups.y == tiles && plan.splitGroups.z == splits &&
+                  plan.reduceGroups.x == layout.kvHeads &&
+                  plan.reduceGroups.y == 8 * queryHeads / layout.kvHeads &&
+                  plan.reduceGroups.z == tiles,
+              "prefill split/reduce geometry disagrees");
+      const uint64_t fused = uint64_t{tiles} * splits * 8 * queryHeads;
+      require(plan.workspace.partialsBytes == fused * 256 * 4 &&
+                  plan.workspace.statisticsBytes == fused * 2 * 4,
+              "prefill split dispatch and exact scratch disagree");
+      const auto bound = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
+      require(bound.partialsBytes >= plan.workspace.partialsBytes &&
+                  bound.statisticsBytes >= plan.workspace.statisticsBytes,
+              "prefill arena omitted a valid shorter plan");
+    }
   const std::string verifySplit = pipelineName("verify", true, queryHeads, layout);
   const std::string verifyReduce = pipelineName("verify", false, queryHeads, layout);
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const std::array<uint32_t, 4> histories{0, 31, 16384, 131072};
     const auto plan = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout,
-                                                      std::span(histories).first(lanes));
+                                                      std::span(histories).first(lanes), kApple10Row, kBf16);
     require(plan.splitPipeline == verifySplit && plan.reducePipeline == verifyReduce,
             "verify plan runs the wrong pipelines");
     uint32_t maximum = 0;
@@ -164,7 +201,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
         uint64_t{lanes} * 8 * kv::kVerifyMaximumSplits * queryHeads;
     // The sparse split's grid is one-dimensional, KV head and then split;
     // the page loop's is two-dimensional.
-    const bool sparse = layout.valuesTokenMajor;
+    const bool sparse = selectsBlocks(layout);
     require(plan.splits == maximum &&
                 plan.workspace.partialsBytes == fused * 256 * 4 &&
                 plan.workspace.statisticsBytes == fused * 2 * 4 &&
@@ -179,34 +216,58 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 (lanes < 4 || plan.laneSplits[3] == kv::kVerifyMaximumSplits),
             "verify partition changed");
   }
+  // With int8 activations on, INT8 pages score against INT8 queries (the q8q
+  // entries) where the longest tile's or lane's splits read at least the
+  // threshold's pages each: at 8, a lane's 32 verify splits read 7 pages after
+  // 7160 tokens and 8 after 7161, a 64-row chunk's 4 splits 7 after 832 tokens
+  // and 8 after 833. BF16 pages, selected blocks and int8 activations off
+  // never do.
+  const auto int8QueriesSplit = [&](std::string name) {
+    if (layout.format == kv::Format::Int8 && !selectsBlocks(layout)) name.replace(name.find("q8_"), 3, "q8q_");
+    return name;
+  };
+  constexpr ops::AttentionCalibration fromEight = attentionRow(8);
+  const auto verifyAfter = [&](const std::vector<uint32_t> &histories, ops::Int8Activations int8) {
+    return ops::PagedAttention::verifyPlan(uint32_t(histories.size()), queryHeads, layout, histories, fromEight, int8)
+        .splitPipeline;
+  };
+  const auto prefillAfter = [&](uint32_t history, ops::Int8Activations int8) {
+    return ops::PagedAttention::prefillPlan(64, history, queryHeads, layout, fromEight, int8).splitPipeline;
+  };
+  require(verifyAfter({7160}, kInt8) == verifySplit &&
+              verifyAfter({7160, 7161}, kInt8) == int8QueriesSplit(verifySplit) &&
+              prefillAfter(832, kInt8) == prefillSplit && prefillAfter(833, kInt8) == int8QueriesSplit(prefillSplit),
+          "INT8 queries do not follow the pages the longest split reads");
+  require(verifyAfter({7160, 7161}, kBf16) == verifySplit && prefillAfter(833, kBf16) == prefillSplit,
+          "INT8 queries ran with int8 activations off");
   for (const uint32_t rows : {0U, 2049U})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, queryHeads, layout); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, 0, queryHeads, layout, kApple10Row, kBf16); },
             "invalid attention workspace rows", "a prefill plan of no rows or past the budget was accepted");
   for (const uint32_t lanes : {0U, 5U})
-    rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, zeroHistory); },
+    rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, zeroHistory, kApple10Row, kBf16); },
             "invalid attention workspace batch width",
             "a verify plan of no lanes or more than a batch was accepted");
   rejects(
       [&] {
         const std::array<uint32_t, 2> two{};
-        (void)ops::PagedAttention::verifyPlan(3, queryHeads, layout, two);
+        (void)ops::PagedAttention::verifyPlan(3, queryHeads, layout, two, kApple10Row, kBf16);
       },
       "invalid verify attention history vector", "a verify plan took fewer histories than lanes");
   rejects(
       [&] {
         const std::array<uint32_t, 4> padded{};
-        (void)ops::PagedAttention::verifyPlan(3, queryHeads, layout, padded);
+        (void)ops::PagedAttention::verifyPlan(3, queryHeads, layout, padded, kApple10Row, kBf16);
       },
       "invalid verify attention history vector", "a verify plan took more histories than lanes");
   rejects(
       [&] {
         const std::array<uint32_t, 1> beyond{kv::kMaximumPhysicalTokens};
-        (void)ops::PagedAttention::verifyPlan(1, queryHeads, layout, beyond);
+        (void)ops::PagedAttention::verifyPlan(1, queryHeads, layout, beyond, kApple10Row, kBf16);
       },
       "verify attention history exceeds physical context",
       "verify rows past the physical context were accepted");
-  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads + 1, layout, zeroHistory); },
-          layout.valuesTokenMajor ? "no sparse attention kernel for layout" : "no paged-attention kernel for layout",
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads + 1, layout, zeroHistory, kApple10Row, kBf16); },
+          selectsBlocks(layout) ? "no sparse attention kernel for layout" : "no paged-attention kernel for layout",
           "a query head count without a kernel was accepted");
 }
 
@@ -319,7 +380,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
                             ids.begin() + firstPage + pageCounts[lane]);
     firstPage += pageCounts[lane];
     data.tables[lane] = allocate(backend, uint64_t{pageCounts[lane]} * sizeof(SplashKvPage));
-    data.pool.writeTable(data.pages[lane], data.tables[lane].contents());
+    data.pool.writeTable(data.pages[lane], data.tables[lane]);
     data.stores[lane] =
         verify ? ops::PagedAttention::verifyParams(historyLengths[lane], pageCounts[lane])
                : ops::PagedAttention::prefillParams(historyLengths[lane], rows, data.stride,
@@ -566,13 +627,14 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
   constexpr bool prefill = phase == Phase::Prefill;
   const auto plan = [&] {
     if constexpr (prefill)
-      return ops::PagedAttention::prefillPlan(data.rows, data.queryHeads, data.layout);
+      return ops::PagedAttention::prefillPlan(data.rows, data.stores[0].committed_tokens, data.queryHeads,
+                                              data.layout, kApple10Row, kInt8);
     else {
       std::vector<uint32_t> histories;
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
         histories.push_back(data.stores[lane].committed_tokens);
       return ops::PagedAttention::verifyPlan(data.lanes, data.queryHeads, data.layout,
-                                            histories);
+                                            histories, kApple10Row, kInt8);
     }
   }();
   constexpr uint64_t guardBytes = 256;
@@ -731,6 +793,65 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
             << " rows=" << rows << " PASS\n";
 }
 
+// A chunk's last tile attended alone (ops::PagedAttention::prefillTail of its
+// last row), as a chunk of its own after the rows before it on the chunk's
+// splits, from the chunk's staged rows where the tail says its rows start, on
+// the chunk's params with the rows before it committed and, with `masks`, QSA
+// masks of a sparse layout, through the chunk's block lists from its tile's on,
+// writes the bits the whole chunk writes for its rows.
+void checkPrefillTail(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout, uint32_t history,
+                      uint32_t rows, bool masks = false) {
+  auto data = makeCase(backend, heads, layout, 1, rows, history, false);
+  if (masks) setQsaMasks(data);
+  const std::vector<uint16_t> whole = run<Phase::Prefill>(backend, data, false);
+  const auto chunk = ops::PagedAttention::prefillPlan(rows, history, heads, layout, kApple10Row, kInt8);
+  const uint32_t first = (rows - 1) / kv::kPrefillAttentionTileRows * kv::kPrefillAttentionTileRows;
+  const ops::PrefillAttentionTail tail = ops::PagedAttention::prefillTail(chunk, rows - 1);
+  const uint64_t rowValues = uint64_t{heads / layout.kvHeads} * layout.headDimension;
+  const kv::ChunkedPrefillParams params = tail.chunk(data.stores[0]);
+  require(tail.first == first && tail.plan.rows == rows - first && tail.plan.tiles == 1 &&
+              tail.plan.splits == chunk.splits && tail.plan.splitPipeline == chunk.splitPipeline &&
+              tail.plan.reducePipeline == chunk.reducePipeline && tail.offsetBytes(first) == first * rowValues * 2 &&
+              params.committed_tokens == data.stores[0].committed_tokens + first &&
+              params.chunk_tokens == rows - first,
+          "a prefill tail departed from its chunk's plan or staged rows");
+  rejects([&] { (void)ops::PagedAttention::prefillTail(chunk, rows); }, "a prefill tail starts within its chunk",
+          "a tail past its chunk was accepted");
+  const metal::MetalBuffer output = allocate(backend, data.queries.sizeBytes());
+  const auto from = [&](const metal::MetalBuffer &buffer) {
+    return backend.view(buffer, tail.offsetBytes(first), buffer.sizeBytes() - tail.offsetBytes(first));
+  };
+  metal::CommandGraph graph;
+  // The chunk's block lists, as the whole chunk's run makes them.
+  ops::AttentionBlocks blocks;
+  if (masks) {
+    const uint32_t lists = kv::prefillAttentionTiles(rows);
+    const uint32_t stride = (history + rows) / SPLASH_ATTENTION_BLOCK_TOKENS + 1;
+    const metal::MetalBuffer maskBuffer = allocate(backend, data.mask.size() * sizeof(uint32_t));
+    std::memcpy(maskBuffer.contents(), data.mask.data(), maskBuffer.sizeBytes());
+    blocks = {allocate(backend, uint64_t{lists} * stride * sizeof(uint32_t)),
+              allocate(backend, lists * sizeof(uint32_t)), stride, 0};
+    const std::vector<ops::BlockListRows> sequences{{0, rows, history, 0}};
+    ops::PagedAttention::addBlockLists(graph, maskBuffer, data.maskWords, sequences, blocks);
+    require(tail.blocks(blocks).list == first / kv::kPrefillAttentionTileRows,
+            "a sparse prefill tail does not take its tiles' block lists");
+  }
+  ops::PagedAttention::addPrefill(graph, data.layer, from(data.queries), from(output),
+                                  allocate(backend, tail.plan.workspace.partialsBytes),
+                                  allocate(backend, tail.plan.workspace.statisticsBytes), data.tables[0], params,
+                                  tail.plan, tail.blocks(blocks));
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  const auto *bits = static_cast<const uint16_t *>(output.contents());
+  for (uint32_t head = 0; head < layout.kvHeads; ++head)
+    for (uint32_t row = first; row < rows; ++row) {
+      const uint64_t begin = (uint64_t{head} * data.stride + row) * rowValues;
+      require(std::equal(bits + begin, bits + begin + rowValues, whole.begin() + static_cast<std::ptrdiff_t>(begin)),
+              "a prefill tail's rows differ from its chunk's");
+    }
+  std::cout << "paged prefill tail: format=" << kv::formatName(layout.format) << " q=" << heads
+            << " history=" << history << " rows=" << rows << (masks ? " (block lists)" : "") << " PASS\n";
+}
+
 // A prefill that reads its history staged, as one whose history has pages
 // that hold only their index does (ops::PagedAttention::addStageLayer): the
 // pool table it stages from has every third page of the history
@@ -757,8 +878,9 @@ void checkStagedPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout
   for (uint32_t page = 0; page < pages; ++page) stagedPages[page] = staging.pageCount() - 1 - page;
   const metal::MetalBuffer stagedTable = allocate(backend, pages * sizeof(SplashKvPage)),
                            poolTable = allocate(backend, pages * sizeof(SplashKvPage));
-  staging.writeTable(stagedPages, stagedTable.contents());
+  staging.writeTable(stagedPages, stagedTable);
   std::memcpy(poolTable.contents(), data.tables[0].contents(), poolTable.sizeBytes());
+  data.pool.reachThrough(poolTable);
   for (uint32_t page = 0; page < chunkFirst; page += 3) {
     static_cast<SplashKvPage *>(poolTable.contents())[page] = SPLASH_KV_PAGE_ABSENT;
     const auto from = data.pool.layerSpans(data.pages[0][page], kLayer);
@@ -820,7 +942,7 @@ void checkVerifyLocations(metal::MetalBackend &backend, uint32_t heads, kv::Layo
     std::vector<uint32_t> cachePages(cache->pageCount());
     std::iota(cachePages.begin(), cachePages.end(), 0U);
     cacheTable = allocate(backend, cachePages.size() * sizeof(SplashKvPage));
-    cache->writeTable(cachePages, cacheTable.contents());
+    cache->writeTable(cachePages, cacheTable);
     slots.resize(cachePages.size() * kPageBlocks);
     std::iota(slots.begin(), slots.end(), 0U);
     std::shuffle(slots.begin(), slots.end(), std::mt19937(7));
@@ -994,7 +1116,9 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
   const auto pageTable = [](const kv::ChunkedPrefillParams &chunk) {
     return uint64_t{(chunk.committed_tokens + chunk.chunk_tokens + 31) / 32} * sizeof(SplashKvPage);
   };
-  const ops::NormWeights queryNorm{allocate(backend, dimension * 2)}, keyNorm{allocate(backend, dimension * 2)};
+  // F32 norms, a GGUF's, which every geometry's projection kernels take.
+  const ops::NormWeights queryNorm{allocate(backend, dimension * 4), true},
+      keyNorm{allocate(backend, dimension * 4), true};
   using Extents = std::initializer_list<test::BufferExtent>;
   // The q/k norms of both projections, whose other buffers hold every row.
   const uint64_t rows = std::max<uint64_t>(tokens, verifyRows);
@@ -1002,10 +1126,10 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
                            staging = allocate(backend, staged(verifyHeads, stride, stride, queryWidth));
   for (const bool verify : {false, true})
     for (const bool key : {false, true}) {
-      test::requireExtent(backend, (key ? keyNorm : queryNorm).buffer, dimension * 2, 2, "norm weight",
+      test::requireExtent(backend, (key ? keyNorm : queryNorm).buffer, dimension * 4, 4, "norm weight",
                           [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
-                            const ops::NormWeights query{key ? queryNorm.buffer : view},
-                                keys{key ? view : keyNorm.buffer};
+                            const ops::NormWeights query{key ? queryNorm.buffer : view, true},
+                                keys{key ? view : keyNorm.buffer, true};
                             if (verify)
                               ops::PagedAttention::addVerifyProjection(graph, packed, query, keys, rope, rope, staging,
                                                                        staging, staging, queryHeads, layout, lanes);
@@ -1071,7 +1195,7 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
                        [&](metal::CommandGraph &graph, const Buffers &b) {
                          ops::PagedAttention::addPrefillStore(graph, {}, b[0], b[1], b[2], chunk, layout);
                        });
-  const auto prefill = ops::PagedAttention::prefillPlan(tokens, queryHeads, layout);
+  const auto prefill = ops::PagedAttention::prefillPlan(tokens, committed, queryHeads, layout, kApple10Row, kBf16);
   const uint64_t tileRows = kv::prefillAttentionTiles(tokens) * kv::kPrefillAttentionTileRows;
   test::requireExtents(backend,
                        Extents{{0, staged(kvHeads, stride, tileRows, queryWidth), 2, "attention query"},
@@ -1086,7 +1210,7 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
   std::array<kv::ChunkedPrefillParams, lanes> chunks{};
   for (uint32_t lane = 0; lane < lanes; ++lane)
     chunks[lane] = ops::PagedAttention::verifyParams(histories[lane], 64);
-  const auto verify = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories);
+  const auto verify = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories, kApple10Row, kBf16);
   std::vector<test::BufferExtent> extents{
       {0, verifyStaged(dimension), 2, "attention key"},
       {1, stagedValues(verifyHeads, kv::kVerifyChunkStride, kv::kVerifyRows), 2, "attention value"},
@@ -1096,12 +1220,23 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
       {5, verifyStaged(queryWidth), 2, "attention output"}};
   for (uint32_t lane = 0; lane < lanes; ++lane)
     extents.push_back({6 + lane, pageTable(chunks[lane]), sizeof(SplashKvPage), "page table"});
-  test::requireExtents(backend, extents, [&](metal::CommandGraph &graph, Buffers b) {
-    // A table for every lane of the batch; past the plan's lanes, unread.
-    b.resize(6 + SPLASH_MAXIMUM_BATCH_WIDTH, b[6]);
+  test::requireExtents(backend, extents, [&](metal::CommandGraph &graph, const Buffers &b) {
     ops::PagedAttention::addVerify(graph, {}, {b[0], b[1], b[2], b[3], b[4], b[5], std::span(b).subspan(6)}, chunks,
                                    verify);
   });
+  // The store writes nothing for a lane whose chunk is not a verify chunk:
+  // the host refuses it.
+  Buffers b;
+  for (const test::BufferExtent &extent : extents) b.push_back(test::sharedBuffer(backend, extent.bytes));
+  std::array<kv::ChunkedPrefillParams, lanes> strided = chunks;
+  strided[2] = ops::PagedAttention::prefillParams(0, kv::kVerifyRows, kv::kVerifyChunkStride + kv::kPageTokens, 64);
+  metal::CommandGraph graph;
+  rejects(
+      [&] {
+        ops::PagedAttention::addVerify(graph, {}, {b[0], b[1], b[2], b[3], b[4], b[5], std::span(b).subspan(6)},
+                                       strided, verify);
+      },
+      "a paged verify lane's chunk is not a verify chunk", "a verify lane of another chunk stride was encoded");
 }
 
 // The stage of a layer's pages (ops::PagedAttention::addStageLayer): a
@@ -1175,10 +1310,11 @@ void attentionBlocks(metal::MetalBackend &backend) {
   const kv::Layout dense{1, 2, 256, kv::Format::Int8};
   kv::Layout tokenMajor = dense;
   tokenMajor.valuesTokenMajor = true;
+  tokenMajor.reads = kv::Reads::SelectedBlocks;
   const std::array<uint32_t, lanes> histories{100, 2000, 0};
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(tokens, 24, dense); },
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(tokens, 100, 24, dense, kApple10Row, kBf16); },
           "no paged-attention kernel for layout", "the sparse kernels took dimension-major values");
-  rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, 16, tokenMajor, histories); },
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, 16, tokenMajor, histories, kApple10Row, kBf16); },
           "no sparse attention kernel for layout", "the page loop took token-major values");
   const auto chunk = ops::PagedAttention::prefillParams(100, tokens, stride, 8);
   std::array<kv::ChunkedPrefillParams, lanes> chunks{};
@@ -1195,8 +1331,8 @@ void attentionBlocks(metal::MetalBackend &backend) {
   for (const uint32_t queryHeads : {16U, 24U}) {
     const bool sparse = queryHeads == 24;
     const kv::Layout layout = sparse ? tokenMajor : dense;
-    const auto prefill = ops::PagedAttention::prefillPlan(tokens, queryHeads, layout);
-    const auto verify = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories);
+    const auto prefill = ops::PagedAttention::prefillPlan(tokens, 100, queryHeads, layout, kApple10Row, kBf16);
+    const auto verify = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories, kApple10Row, kBf16);
     require(prefill.sparse == sparse && verify.sparse == sparse,
             "a plan's kernels do not take block lists as its group size states");
     const metal::MetalBuffer partials =
@@ -1527,9 +1663,10 @@ int main(int argc, char **argv) {
     attentionBlocks(backend);
     stageEncoding(backend);
     blockListsMatchMasks(backend);
-    // The prepare kernels do not depend on the KV format.
+    // The prepare kernels do not depend on the KV format; their norms are of
+    // each type the geometry's families store.
     for (const Geometry geometry : kGeometries)
-      for (bool float32 : {false, true})
+      for (bool float32 : splash::test::familyNorms(geometry))
         for (bool verify : {false, true})
           checkProjection(backend, geometry.queryHeads, geometry.layout(kv::Format::Int8), float32, verify);
     if (argc == 3 && std::string_view(argv[2]) == "--long") {
@@ -1560,18 +1697,22 @@ int main(int argc, char **argv) {
                                                   {100, 77}, {8064, 130},
                                                   {6145, 2048}}})
         checkPrefill(backend, heads, layout, history, rows);
+      for (const auto [history, rows] :
+           std::array<std::array<uint32_t, 2>, 5>{{{0, 1}, {255, 17}, {4093, 1057}, {16383, 256}, {6145, 2048}}})
+        checkPrefillTail(backend, heads, layout, history, rows);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         checkVerify(backend, heads, layout, 0, lanes);
         checkVerify(backend, heads, layout, 1023, lanes);
       }
       checkVerify(backend, heads, layout, 16384, 2);
-      if (layout.valuesTokenMajor) {
+      if (selectsBlocks(layout)) {
         // The sparse kernels through the block lists of QSA masks: a chunk
-        // whose last tile holds fewer rows, and verify lanes of their own
-        // histories.
+        // whose last tile holds fewer rows, its tail, and verify lanes of
+        // their own histories.
         auto prefill = makeCase(backend, heads, layout, 1, 77, 6145, false);
         setQsaMasks(prefill);
         checkReference(prefill, run<Phase::Prefill>(backend, prefill, false));
+        checkPrefillTail(backend, heads, layout, 6145, 77, true);
         auto verify = makeCase(backend, heads, layout, 3, 8, 1023, true);
         setQsaMasks(verify);
         checkReference(verify, run<Phase::Verify>(backend, verify, false));
@@ -1580,7 +1721,7 @@ int main(int argc, char **argv) {
       }
       for (const auto [history, rows] : std::array<std::array<uint32_t, 2>, 2>{{{6145, 77}, {4096, 130}}}) {
         checkStagedPrefill(backend, heads, layout, history, rows, false);
-        if (layout.valuesTokenMajor) checkStagedPrefill(backend, heads, layout, history, rows, true);
+        if (selectsBlocks(layout)) checkStagedPrefill(backend, heads, layout, history, rows, true);
       }
     }
     std::cout << "paged attention plans: PASS\n";

@@ -1,6 +1,8 @@
 #pragma once
 
-#include "metal/MetalBackend.hpp"
+#include "metal/Allocation.hpp"
+
+#include <functional>
 
 namespace splash::model {
 
@@ -18,15 +20,26 @@ public:
   // over from.
   virtual void release() = 0;
   // Takes back the next part released, such as an image whose memory `admit`
-  // admits and which it writes again; true once none is left. A part whose
-  // memory admission or the driver refuses stays released and throws
-  // metal::MetalAllocationError with the cause. Memory a part may take back
-  // but can do without, such as an expert store's chunks above its floor
-  // (model::ExpertStore), comes back only as far as `optional` admits it,
-  // and what that refuses stays released without holding the restore back.
-  // On any other failure the weights are unusable: the engine stops.
-  [[nodiscard]] virtual bool restore(const metal::AllocationAdmission &admit,
-                                     const metal::AllocationAdmission &optional) = 0;
+  // admits and which it writes again, in one admission; true once none is
+  // left. A part whose memory admission or the driver refuses stays released
+  // and throws metal::MetalAllocationError with the cause. Memory a part can
+  // do without, such as an expert store's chunks above its floor
+  // (model::ExpertStore), does not come back: the store grows it again as
+  // memory allows. On any other failure the weights are unusable: the engine
+  // stops.
+  // A part may go on being written on a thread of its own once the call
+  // returns (WeightImages), which calls the completion notifier as it ends:
+  // writing() is true until then, and the next call, which may come only
+  // after it, throws that write's failure as the call that wrote the part
+  // would have.
+  [[nodiscard]] virtual bool restore(const metal::AllocationAdmission &admit) = 0;
+  // A part restore() took back is still being written on its thread, which
+  // may allocate and run commands on the backend meanwhile.
+  [[nodiscard]] virtual bool writing() const noexcept { return false; }
+  // Wakes the engine's loop as the write of a part on its thread ends, for
+  // the writes restore() starts from then on; a part written before restore()
+  // returns never calls it.
+  virtual void setCompletionNotifier(std::function<void()>) {}
 };
 
 } // namespace splash::model

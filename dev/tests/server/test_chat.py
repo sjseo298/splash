@@ -27,7 +27,6 @@ class Element {
     this.handlers = {};
     this.value = '';
     this.style = {};
-    this.options = [];
     this.children = [];
     this.queries = {};
     this.scrollHeight = 40;
@@ -42,6 +41,7 @@ class Element {
       },
     };
   }
+  get options() { return this.children.filter(child => child.tagName === 'OPTION'); }
   addEventListener(name, callback) { this.handlers[name] = callback; }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
@@ -67,16 +67,18 @@ function createChat(storage = new Map(), writable = true, models = null,
   const clipboard = {writeText: async text => { copied.push(text); }};
   let scrolls = 0;
   let scrollBehavior;
-  for (const id of ['chat', 'form', 'input', 'attachments', 'image-input',
+  for (const id of ['chat', 'form', 'input', 'attachments', 'file-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
                    'mobile-new', 'menu', 'scrim', 'scroll-bottom', 'sidebar',
-                   'sidebar-close', 'sidebar-open', 'credentials']) elements[id] = new Element();
+                   'sidebar-close', 'sidebar-open', 'credentials', 'thinking']) elements[id] = new Element();
   // Elements the markup hides start hidden, as in a browser.
   for (const [, id] of html.matchAll(/<\w+ id="([^"]+)"[^>]* hidden[ >]/g)) elements[id].hidden = true;
-  elements.effort.options = ['', 'xhigh', 'medium', 'low', 'none'].map(value => ({value}));
+  // The menu's options are the markup's.
+  elements.effort.children = [...html.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)]
+    .map(([, value, textContent]) => Object.assign(new Element('option'), {value, textContent}));
   class FileReader {
     readAsDataURL(file) {
-      this.result = `data:image/png;base64,${file.name}`;
+      this.result = `data:${file.type};base64,${file.data ?? file.name}`;
       reads.push(this);
     }
   }
@@ -137,6 +139,15 @@ function createChat(storage = new Map(), writable = true, models = null,
 }
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
+// What /v1/models reports of reasoning: Qwen3.6's template only switches
+// thinking on and off, Qwen3.8's tells three efforts apart, and Flint's model
+// decides itself.
+const QWEN36 = {thinks: true, efforts: [], default: null};
+const QWEN38 = {thinks: true, efforts: ['low', 'medium', 'xhigh'], default: 'xhigh'};
+const FLINT = {thinks: null, efforts: [], default: null};
+const served = (modalities = ['text', 'image', 'pdf'], reasoning = QWEN36, limits = undefined) =>
+  ({ok: true, json: async () => ({data: [{input_modalities: modalities, reasoning, limits}]})});
+const effortMenu = chat => chat.elements.effort.options.map(option => [option.value, option.textContent]);
 const submit = chat => chat.elements.form.handlers.submit({preventDefault() {}});
 const enter = chat => chat.elements.input.handlers.keydown({
   key: 'Enter', keyCode: 13, shiftKey: false, isComposing: false,
@@ -146,24 +157,26 @@ function setText(chat, value) {
   chat.elements.input.value = value;
   chat.elements.input.handlers.input();
 }
-function pasteImages(chat, ...names) {
+function pasteFiles(chat, ...files) {
   const start = chat.reads.length;
   chat.elements.input.handlers.paste({
     clipboardData: {
-      items: names.map(name => ({type: 'image/png', getAsFile: () => ({type: 'image/png', name})})),
+      items: files.map(file => ({type: file.type, getAsFile: () => file})),
       getData: () => '',
     },
     preventDefault() {},
   });
   return chat.reads.slice(start);
 }
+const pasteImages = (chat, ...names) => pasteFiles(chat, ...names.map(name => ({type: 'image/png', name})));
 const pasteImage = (chat, name) => pasteImages(chat, name)[0];
-function selectImages(chat, ...names) {
+function selectFiles(chat, ...files) {
   const start = chat.reads.length;
-  chat.elements['image-input'].files = names.map(name => ({type: 'image/png', name}));
-  chat.elements['image-input'].handlers.change();
+  chat.elements['file-input'].files = files;
+  chat.elements['file-input'].handlers.change();
   return chat.reads.slice(start);
 }
+const selectImages = (chat, ...names) => selectFiles(chat, ...names.map(name => ({type: 'image/png', name})));
 const imagePart = name => ({type: 'image_url', image_url: {url: `data:image/png;base64,${name}`}});
 const draftImages = chat => chat.elements.attachments.children.flatMap(
   item => item.children.filter(child => child.tagName === 'IMG').map(image => image.src)
@@ -222,10 +235,10 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
         # chat, and the field stays once the key is entered.
         self.run_chat(r"""
 (async () => {
-  const served = () => ({ok: true, json: async () => ({data: [{input_modalities: ['text']}]})});
+  const text = () => served(['text']);
   const unauthorized = {ok: false, status: 401,
     json: async () => ({error: {message: 'invalid or missing API key', type: 'authentication_error'}})};
-  for (const [name, models] of [['served', served], ['offline', null]]) {
+  for (const [name, models] of [['served', text], ['offline', null]]) {
     const chat = createChat(new Map(), true, models);
     await flush();
     assert.equal(chat.elements.credentials.hidden, true, name);
@@ -236,7 +249,7 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
     await flush();
     assert.equal(chat.elements.credentials.hidden, true, name);
   }
-  const locked = createChat(new Map(), true, headers => headers.Authorization ? served() : unauthorized);
+  const locked = createChat(new Map(), true, headers => headers.Authorization ? text() : unauthorized);
   await flush();
   assert.equal(locked.elements.credentials.hidden, false, '/v1/models answered 401');
   locked.elements['api-key'].value = 'key';
@@ -260,7 +273,6 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
     def test_image_attachment_follows_the_served_input_modalities(self):
         self.run_chat(r"""
 (async () => {
-  const served = modalities => ({ok: true, json: async () => ({data: [{input_modalities: modalities}]})});
   for (const [modalities, accepted] of [
     [['text'], false], [['text', 'image', 'pdf'], true],
   ]) {
@@ -292,23 +304,216 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
+    def test_pdfs_attach_as_files_within_the_models_limits(self):
+        # A model that reads PDFs takes them as it takes images, chosen or
+        # pasted: shown by name, sent as file parts, and held back over the PDF
+        # limit /v1/models gives, which the server would refuse.
+        self.run_chat(r"""
+(async () => {
+  class Storage extends Map {
+    set(key, value) {
+      if (value.length > 10000) throw Object.assign(new Error('Quota exceeded'), {name: 'QuotaExceededError'});
+      return super.set(key, value);
+    }
+  }
+  const storage = new Storage();
+  const limits = {request_bytes: 1 << 27, images: 64, image_bytes: 1 << 25, pdf_bytes: 20000, pdf_pages: 64};
+  const chat = createChat(storage, true, () => served(['text', 'image', 'pdf'], QWEN36, limits));
+  await flush();
+  const plan = {type: 'application/pdf', name: 'plan.pdf', size: 12000, data: 'P'.repeat(12000)};
+  const [reading] = selectFiles(chat, plan);
+  const chip = () => chat.elements.attachments.children[0].children[0];
+  assert.equal(chip().className, 'attachment-file');
+  assert.equal(chip().children[0].textContent, 'plan.pdf');
+  assert.equal(chip().children[1].className, 'file-detail');
+  setText(chat, 'Summarize');
+  assert.ok(chat.elements.send.disabled, 'sent before the PDF was read');
+  reading.onload();
+  await flush();
+  assert.ok(!chat.elements.send.disabled, 'a read PDF held the message back');
+  submit(chat);
+  const pdfPart = {type: 'file', file: {filename: 'plan.pdf', file_data: `data:application/pdf;base64,${plan.data}`}};
+  assert.deepEqual(chat.requests[0].body.messages[0].content, [{type: 'text', text: 'Summarize'}, pdfPart]);
+  succeed(chat.requests[0]);
+  await flush();
+  // The message shows the PDF by name; storage too small for it keeps the chat without it.
+  const shown = chat.elements.chat.children.find(child => child.className === 'message user').querySelector('.user-file');
+  assert.equal(shown.children[0].textContent, 'plan.pdf');
+  assert.deepEqual(JSON.parse(storage.get('splash-chats'))[0].messages[0].content,
+    [{type: 'text', text: 'Summarize'}, {type: 'text', text: '[plan.pdf not saved]'}]);
+  // One over the limit stays unread, says so, and holds the message back
+  // until it is taken off.
+  const reads = chat.reads.length;
+  pasteFiles(chat, {type: 'application/pdf', name: 'big.pdf', size: 20001});
+  assert.equal(chat.reads.length, reads, 'read a PDF over the limit');
+  assert.ok(chat.elements.attachments.children[0].title.startsWith('big.pdf is larger than the model’s '));
+  assert.equal(chip().children[1].textContent, 'Too large');
+  assert.equal(chip().children[1].className, 'file-detail error');
+  setText(chat, 'And this?');
+  assert.ok(chat.elements.send.disabled, 'a PDF over the limit went');
+  removeImage(chat, 0);
+  assert.ok(!chat.elements.send.disabled);
+  // A model that sees images but reads no PDFs takes only the images.
+  const images = createChat(new Map(), true, () => served(['text', 'image']));
+  await flush();
+  assert.ok(!images.elements.attach.hidden);
+  assert.equal(selectFiles(images, plan).length, 0);
+  assert.equal(pasteFiles(images, plan, {type: 'image/png', name: 'pasted'}).length, 1);
+  assert.equal(images.elements.attachments.children.length, 1);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_a_reload_keeps_pdfs_and_each_question_with_its_answer(self):
+        # A chat saved with its PDFs has them again once the page reloads. A
+        # question never goes alone, which would leave two answers in a row: an
+        # attachment that can't be kept says so in its place, as one too large
+        # to store does, and an exchange that can't be read goes whole.
+        self.run_chat(r"""
+(async () => {
+  class Storage extends Map {
+    set(key, value) {
+      if (value.length > this.quota) throw Object.assign(new Error('Quota exceeded'), {name: 'QuotaExceededError'});
+      return super.set(key, value);
+    }
+  }
+  const pdfs = () => served(['text', 'image', 'pdf']);
+  async function send(chat, text, ...files) {
+    setText(chat, text);
+    selectFiles(chat, ...files).forEach(reading => reading.onload());
+    await flush();
+    submit(chat);
+    succeed(chat.requests.at(-1));
+    await flush();
+  }
+  async function reload(storage) {
+    const chat = createChat(storage, true, pdfs);
+    await flush();
+    chat.elements.recents.children[0].querySelector('.recent-open').handlers.click();
+    setText(chat, 'next');
+    submit(chat);
+    return chat.requests[0].body.messages;
+  }
+  const roles = messages => messages.map(message => message.role).join(' ');
+  for (const [quota, data, kept] of [
+    [Infinity, 'UERG', {type: 'file', file: {filename: 'plan.pdf', file_data: 'data:application/pdf;base64,UERG'}}],
+    // Storage too small for the PDF keeps the chat without it.
+    [1000, 'P'.repeat(2000), {type: 'text', text: '[plan.pdf not saved]'}],
+  ]) {
+    const storage = new Storage();
+    storage.quota = quota;
+    const chat = createChat(storage, true, pdfs);
+    await flush();
+    await send(chat, 'Hello');
+    // A PDF alone, without a word.
+    await send(chat, '', {type: 'application/pdf', name: 'plan.pdf', size: data.length, data});
+    const messages = await reload(storage);
+    assert.equal(roles(messages), 'user assistant user assistant user', `quota ${quota}`);
+    assert.deepEqual(messages[2].content, [kept], `quota ${quota}`);
+  }
+  // Saved with what this page can't read.
+  const storage = new Map([['splash-chats', JSON.stringify([{id: 'saved', title: 'Saved', updated: 1, messages: [
+    {role: 'user', content: [{type: 'file', file: {filename: 'notes.txt', file_data: 'data:text/plain;base64,TQ=='}}]},
+    {role: 'assistant', content: 'first answer'},
+    {role: 'user', content: []},
+    {role: 'assistant', content: 'second answer'},
+    {role: 'user', content: 'third question'},
+    {role: 'assistant', content: {}},
+    {role: 'user', content: [{type: 'image_url', image_url: {url: 'https://example.com/a.png'}}, {type: 'file', file: {}}]},
+    {role: 'assistant', content: 'last answer'},
+  ]}])]]);
+  assert.deepEqual(await reload(storage), [
+    {role: 'user', content: [{type: 'text', text: '[notes.txt not saved]'}]},
+    {role: 'assistant', content: 'first answer'},
+    {role: 'user', content: [{type: 'text', text: '[Image not saved]'}, {type: 'text', text: '[PDF not saved]'}]},
+    {role: 'assistant', content: 'last answer'},
+    {role: 'user', content: 'next'},
+  ]);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
     def test_restores_saved_chats_and_effort_with_read_only_storage(self):
         self.run_chat(r"""
-const saved = JSON.stringify([{id: 'saved', title: 'Saved chat', updated: 1,
-  messages: [{role: 'user', content: 'remembered message'}]}]);
-for (const writable of [true, false]) {
-  const storage = new Map([
-    ['splash-chats', saved], ['splash-thinking-effort', 'low'],
-  ]);
-  const chat = createChat(storage, writable);
-  assert.equal(chat.elements.effort.value, 'low');
-  assert.equal(chat.elements.recents.children.length, 1);
-  chat.elements.recents.children[0].querySelector('.recent-open').handlers.click();
-  setText(chat, 'continue');
-  submit(chat);
-  assert.equal(chat.requests[0].body.messages[0].content, 'remembered message');
-  assert.equal(storage.get('splash-thinking-effort'), 'low');
-}
+(async () => {
+  const saved = JSON.stringify([{id: 'saved', title: 'Saved chat', updated: 1,
+    messages: [{role: 'user', content: 'remembered message'}]}]);
+  for (const writable of [true, false]) {
+    const storage = new Map([
+      ['splash-chats', saved], ['splash-thinking-effort', 'low'],
+    ]);
+    const chat = createChat(storage, writable, () => served(undefined, QWEN38));
+    await flush();
+    assert.equal(chat.elements.effort.value, 'low');
+    assert.equal(chat.elements.recents.children.length, 1);
+    chat.elements.recents.children[0].querySelector('.recent-open').handlers.click();
+    setText(chat, 'continue');
+    submit(chat);
+    assert.equal(chat.requests[0].body.messages[0].content, 'remembered message');
+    assert.equal(chat.requests[0].body.reasoning_effort, 'low');
+    assert.equal(storage.get('splash-thinking-effort'), 'low');
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_the_effort_menu_offers_what_the_served_model_tells_apart(self):
+        self.run_chat(r"""
+(async () => {
+  // Until the server answers, and while it does not, Auto and Off: a saved
+  // effort they offer shows from the page's load, and one they do not
+  // shows as Auto.
+  for (const [saved, value] of [['none', 'none'], ['low', '']]) {
+    const offline = createChat(new Map([['splash-thinking-effort', saved]]));
+    assert.equal(offline.elements.effort.value, value, saved);
+    await flush();
+    assert.deepEqual(effortMenu(offline), [['', 'Auto'], ['none', 'Off']]);
+    assert.equal(offline.elements.effort.value, value, saved);
+    setText(offline, 'hello');
+    submit(offline);
+    assert.equal(offline.requests[0].body.reasoning_effort, value || undefined, saved);
+  }
+  // An effort picked before the menu is rebuilt, as when a server that needs
+  // a key answers /v1/models once it is entered, stays picked.
+  const locked = createChat(new Map(), true, headers => headers.Authorization
+    ? served(undefined, QWEN38) : {ok: false, status: 401, json: async () => ({})});
+  await flush();
+  locked.elements.effort.value = 'none';
+  locked.elements.effort.handlers.change();
+  locked.elements['api-key'].value = 'key';
+  locked.elements['api-key'].handlers.change();
+  await flush();
+  assert.deepEqual(effortMenu(locked).map(([value]) => value), ['', 'xhigh', 'medium', 'low', 'none']);
+  assert.equal(locked.elements.effort.value, 'none');
+  setText(locked, 'hello');
+  submit(locked);
+  assert.equal(locked.requests[0].body.reasoning_effort, 'none');
+  const levels = [['xhigh', 'Extra High'], ['medium', 'Medium'], ['low', 'Low'], ['none', 'Off']];
+  for (const [reasoning, menu, value] of [
+    [QWEN38, [['', 'Auto (Extra High)'], ...levels], 'low'],
+    // With --default-reasoning-effort none, a request that sends none does
+    // not think.
+    [{...QWEN38, thinks: false, default: null}, [['', 'Auto (Off)'], ...levels], 'low'],
+    // The saved effort is not one of Qwen3.6's; storage keeps it for a model
+    // that offers it.
+    [QWEN36, [['', 'Auto'], ['none', 'Off']], ''],
+  ]) {
+    const storage = new Map([['splash-thinking-effort', 'low']]);
+    const chat = createChat(storage, true, () => served(undefined, reasoning));
+    await flush();
+    assert.equal(chat.elements.thinking.hidden, false);
+    assert.deepEqual(effortMenu(chat), menu);
+    assert.equal(chat.elements.effort.value, value);
+    assert.equal(storage.get('splash-thinking-effort'), 'low');
+  }
+  // A model that decides itself whether to think hides the menu and gets no
+  // effort, a saved one included.
+  const flint = createChat(new Map([['splash-thinking-effort', 'low']]), true,
+    () => served(['text'], FLINT));
+  await flush();
+  assert.equal(flint.elements.thinking.hidden, true);
+  assert.deepEqual(effortMenu(flint), []);
+  setText(flint, 'hello');
+  submit(flint);
+  assert.ok(!('reasoning_effort' in flint.requests[0].body));
+})().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
     def test_default_effort_omits_reasoning_effort(self):
@@ -575,11 +780,13 @@ for (const [name, overrides, shouldSend] of [
   let content = chat.elements.chat.children.at(-1).querySelector('.content');
   assert.match(content.innerHTML, /hljs-keyword/);
   await chunk({content: '\n```\n\n```unknown-lang\n<b>literal</b>\n```\n\n' +
-    '<img src=x onerror=alert(1)>\n\n[bad](javascript:alert(1))\n\n[good](https://example.com)\n\n' +
+    '<img src=x onerror=alert(1)>\n\n[bad](javascript:alert(1))\n\n[app](x-app:open)\n\n[good](https://example.com)\n\n' +
     '![x](https://example.com/a.png)'});
   assert.match(content.innerHTML, /&lt;b&gt;literal&lt;\/b&gt;/);
-  assert.doesNotMatch(content.innerHTML, /href="javascript:/);
+  assert.doesNotMatch(content.innerHTML, /href="(javascript|x-app):/, 'only web and mail links are links');
+  assert.match(content.innerHTML, /<p>app<\/p>/, 'another link keeps its text');
   assert.doesNotMatch(content.innerHTML, /<img/, 'a reply must not load images');
+  assert.match(content.innerHTML, /<p><a href="https:\/\/example.com\/a.png"[^>]*>x<\/a><\/p>/, 'an image is a link to it');
   assert.match(content.innerHTML, /href="https:\/\/example.com" target="_blank" rel="noopener noreferrer"/,
     'a link must open in a new tab');
   const reasoning = '**thinking**\n\n```python\ndef think():\n    return 1\n```';
@@ -942,9 +1149,9 @@ class ChatPageTest(HarnessTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(content_type, "text/html; charset=utf-8")
         self.assertIn(b"/v1/chat/completions", payload)
-        for effort in (b"xhigh", b"medium", b"low", b"none"):
+        for effort in (b"", b"none"):
             self.assertIn(b'value="' + effort + b'"', payload)
-        for label in (b"Auto", b"Extra High", b"Medium", b"Low", b"Off"):
+        for label in (b"Auto", b"Off"):
             self.assertIn(b">" + label + b"</option>", payload)
         for label in (b"Splash", b"New chat", b"Recents"):
             self.assertIn(label, payload)
@@ -954,7 +1161,7 @@ class ChatPageTest(HarnessTestCase):
         self.assertIn(b"reasoning_effort", payload)
         self.assertIn(b"include_usage", payload)
         self.assertIn(b"tokens_per_second", payload)
-        self.assertIn(b"allowedEfforts.has(savedEffort)", payload)
+        self.assertIn(b"showEfforts(model.reasoning)", payload)
         self.assertIn(b"function storageGet", payload)
         self.assertIn(b"function storageSet", payload)
         self.assertIn(b"JSON.parse(storageGet(storeKey))", payload)
@@ -963,8 +1170,8 @@ class ChatPageTest(HarnessTestCase):
         )
         self.assertIn(b"function cleanMessage", payload)
         self.assertIn(b"if (input.value === '') input.value = text", payload)
-        self.assertIn(b'id="image-input"', payload)
-        self.assertIn(b'accept="image/*"', payload)
+        self.assertIn(b'id="file-input"', payload)
+        self.assertIn(b'accept="image/*,application/pdf"', payload)
         self.assertIn(b"reader.readAsDataURL(file)", payload)
         self.assertIn(b"type: 'image_url'", payload)
         self.assertIn(b"input.addEventListener('paste'", payload)

@@ -17,10 +17,13 @@ from dev.tests.server_fixtures import (
     anthropic_body,
     byte_backend,
     chat_body,
+    console_written,
     response_events,
     responses_body,
 )
 from server import server as api
+from server.dialects import responses as responses_dialect
+from server.dialects import scoring
 
 
 class EndFailTokenizer(FakeTokenizer):
@@ -53,7 +56,7 @@ class RequestFailureTests(HarnessTestCase):
         blocking = Plan([[4]], block=True)
         runtime = FakeRuntime(blocking)
         harness = self.harness(runtime)
-        with mock.patch.object(api.FrontendHandler, "_sse", side_effect=TimeoutError):
+        with mock.patch.object(api.FrontendHandler, "sse", side_effect=TimeoutError):
             status, _, _ = harness.request(
                 "POST",
                 "/v1/chat/completions",
@@ -237,8 +240,8 @@ class RequestFailureTests(HarnessTestCase):
             "could not allocate KV target: engine memory budget exceeded "
             "(additional_pages=12, free_pages=0); the request does not fit in the "
             "memory this server may use, even after every cached prefix was "
-            "evicted: restart the server with a larger --max-memory or a smaller "
-            "--max-context"
+            "evicted: restart the server with a smaller --max-context, or with a "
+            "larger --max-memory where one lowered it"
         )
         records = []
         capacity = [
@@ -297,7 +300,7 @@ class RequestFailureTests(HarnessTestCase):
             "POST", "/v1/chat/completions", chat_body()
         )
         error = json.loads(payload)["error"]
-        # Retrying fails the same way, and memory is not what it lacks.
+        # Retrying fails the same way while memory and the quota stay as they are.
         self.assertEqual(status, 400)
         self.assertEqual(error["code"], "kv_disk_quota")
         self.assertEqual(error["message"], native)
@@ -361,6 +364,45 @@ class RequestFailureTests(HarnessTestCase):
             "plain answer\n",
         )
 
+    def test_a_failure_the_backend_logged_has_one_console_line(self):
+        """A request the engine took ends in one line, the backend's, which
+        names its id; the HTTP handler does not add an id-less one."""
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                records = []
+                harness = self.harness(
+                    FakeRuntime(Plan(exception=RuntimeError("boom"))),
+                    request_logger=records.append,
+                )
+                with mock.patch.object(api, "print_status") as console:
+                    status, _, _ = harness.request(
+                        "POST", "/v1/chat/completions", chat_body(stream=stream)
+                    )
+                self.assertEqual(status, 200 if stream else 500)
+                (end,) = [r for r in records if r["outcome"] != "started"]
+                self.assertEqual(
+                    (end["outcome"], end["error_code"], end["request_id"]),
+                    ("error", "runtime_error", 1),
+                )
+                console.assert_not_called()
+
+    def test_a_failure_after_the_engine_took_the_request_names_it(self):
+        """The handler's own failure of a request the engine took, as its
+        deadline, names the engine's id, as the backend's lines do."""
+        blocking = Plan([[4]], block=True)
+        harness = self.harness(FakeRuntime(blocking))
+        with mock.patch.object(api, "print_status") as console:
+            status, _, _ = harness.request(
+                "POST", "/v1/chat/completions", chat_body(timeout=0.03)
+            )
+        blocking.release.set()
+        self.assertEqual(status, 504)
+        console.assert_called_once()
+        self.assertEqual(
+            console.call_args.args[0],
+            "Error · request 1 · request_timeout · POST /v1/chat/completions",
+        )
+
     def test_unexpected_handler_error_cancels_and_is_structured(self):
         harness = self.harness(FakeRuntime(Plan([[4]], block=True)))
         stderr = io.StringIO()
@@ -369,7 +411,7 @@ class RequestFailureTests(HarnessTestCase):
                 harness.backend, "cancel", wraps=harness.backend.cancel
             ) as cancel,
             mock.patch.object(
-                api.FrontendHandler, "_complete", side_effect=RuntimeError("boom")
+                api.FrontendHandler, "collect", side_effect=RuntimeError("boom")
             ),
             mock.patch.object(api.sys, "stderr", stderr),
         ):
@@ -379,11 +421,13 @@ class RequestFailureTests(HarnessTestCase):
         self.assertEqual(status, 500, payload)
         self.assertEqual(json.loads(payload)["error"]["code"], "internal_server_error")
         cancel.assert_called_once()
-        # Where the server last had the error, and not its message.
+        console_written()
+        # Where the server, in a subpackage too, last had the error, and not
+        # its message.
         self.assertRegex(
             stderr.getvalue(),
             r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "
-            r"server/server\.py:\d+\n$",
+            r"server/dialects/openai\.py:\d+\n$",
         )
         self.assertNotIn("boom", stderr.getvalue())
 
@@ -400,12 +444,16 @@ class RequestFailureTests(HarnessTestCase):
         for error in (ValueError("late"), RecursionError()):
             for path, body, target, name in (
                 ("/v1/chat/completions", chat_body(), "app", "prepare"),
-                ("/v1/systemone", systemone, "app", "prepare_systemone"),
-                ("/v1/chat/completions", chat_body(), "handler", "_complete"),
+                ("/v1/systemone", systemone, "scoring", "prepare_systemone"),
+                ("/v1/chat/completions", chat_body(), "handler", "collect"),
             ):
                 with self.subTest(error=type(error).__name__, path=path, name=name):
                     harness = self.harness(FakeRuntime(Plan([[4]], block=True)))
-                    owner = harness.app if target == "app" else api.FrontendHandler
+                    owner = {
+                        "app": harness.app,
+                        "scoring": scoring,
+                        "handler": api.FrontendHandler,
+                    }[target]
                     with (
                         mock.patch.object(owner, name, side_effect=error),
                         mock.patch.object(
@@ -433,7 +481,9 @@ class RequestFailureTests(HarnessTestCase):
             mock.patch.object(
                 harness.backend, "cancel", wraps=harness.backend.cancel
             ) as cancel,
-            mock.patch.object(api, "responses_item", side_effect=RuntimeError("boom")),
+            mock.patch.object(
+                responses_dialect, "output_item", side_effect=RuntimeError("boom")
+            ),
             mock.patch.object(api.sys, "stderr", stderr),
         ):
             status, _, payload = harness.request(
@@ -448,11 +498,12 @@ class RequestFailureTests(HarnessTestCase):
             events[-1]["response"]["error"]["code"], "internal_server_error"
         )
         cancel.assert_called_once()
-        self.assertTrue(plan.cancelled.is_set())
+        self.assertTrue(plan.ended.is_set())
+        console_written()
         self.assertRegex(
             stderr.getvalue(),
             r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "
-            r"server/server\.py:\d+\n$",
+            r"server/dialects/responses\.py:\d+\n$",
         )
 
     def test_streamer_end_error_does_not_kill_backend(self):

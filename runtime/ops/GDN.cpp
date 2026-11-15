@@ -27,7 +27,10 @@ static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 8);
 
 // The compiled GDN shapes (kernels/prefill/gdn.metal, kernels/decode/gdn.metal),
 // of either gate, and their kernels' name suffix. The scan reads no packed
-// rows, so shapes of one head layout share its kernel (scanSuffix).
+// rows, so shapes of one head layout share its kernel (scanSuffix). The
+// kernels that read the norm take the norm types the shape's families store
+// (normKernel): F32 and bf16, or F32 alone for Qwen3.8-Flash-Next's, which
+// loads from GGUFs only.
 struct CompiledGdn final {
   GdnShape shape;
   std::string_view suffix;
@@ -196,6 +199,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
   requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
   requireBytes(buffers.hidden, rows * valueWidth(shape) * 2, "GDN hidden");
+  requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "GDN verify rows");
   GDNDecodeBatchParams params{headFlags(shape, order),
                               layer,
                               state.convolutionLayerBytes,
@@ -237,12 +241,12 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
                         lanes * SPLASH_TARGET_VERIFY_ROWS);
-  bindings.reserve(prepare ? 17 : 15);
+  bindings.reserve(prepare ? 18 : 16);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   requireStates(shape, state, layer, lanes, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
                   {buffers.tape, buffers.decayWeights, buffers.timeBias, buffers.mixerNorm.buffer,
-                   buffers.hidden});
+                   buffers.hidden, buffers.verifyRows});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
   const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + std::string(kernel.suffix);

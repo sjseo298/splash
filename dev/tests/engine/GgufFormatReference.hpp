@@ -5,10 +5,11 @@
 // notice in THIRD_PARTY_NOTICES), MLX's for the affine formats, or those of
 // NVFP4's and FP8's definitions in the kernels' order of operations, and the
 // planes the load-time repack writes,
-// and the fp64 bound a GGUF projection's result lies within. Shared by the
-// GGUF tests.
+// and the fp64 bound a GGUF projection's result lies within, and Prism ML's
+// input rotation. Shared by the GGUF tests.
 
 #include "LinearNumerics.hpp"
+#include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
 #include "metal/abi/QuantTables.h"
 
@@ -41,7 +42,10 @@ inline Fmt fmtNamed(const std::string &name) {
 }
 inline uint16_t f2h(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
 inline float h2f(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
+// A row of K values as a GGUF stores it: BF16's and F16's two bytes a value,
+// at any K; any other format's native blocks.
 inline uint32_t rowBytes(Fmt f, uint32_t K) {
+  if (f == BF16 || f == F16) return K * 2;
   const QuantFormat &i = kQuantFormats[f];
   return K / i.block_elements * i.block_bytes;
 }
@@ -736,5 +740,20 @@ inline double projectionBound(const Dot &d, bool staged) {
   const double accumulation = std::ldexp(d.inputs * d.largest, -16);
   return staged ? accumulation + std::ldexp(d.magnitude, -11) + std::ldexp(d.inputs, -25) : accumulation;
 }
+
+// Prism ML's input rotation (kernels/shared/gguf_rotation.metal): the
+// unnormalized transform of one block of GGUF_ROTATION_BLOCK values, stage by
+// stage as the kernels compute it, and its normalization.
+template <class T> void rotationButterflies(T *v) {
+  for (uint32_t stride = 1; stride < GGUF_ROTATION_BLOCK; stride *= 2)
+    for (uint32_t a = 0; a < GGUF_ROTATION_BLOCK; ++a)
+      if (!(a & stride)) {
+        const T x = v[a], y = v[a + stride];
+        v[a] = x + y;
+        v[a + stride] = x - y;
+      }
+}
+inline constexpr float kRotationScale = 1.0f / 32.0f;
+static_assert(GGUF_ROTATION_BLOCK == 1024, "kRotationScale is 1 / sqrt(GGUF_ROTATION_BLOCK)");
 
 } // namespace gguf_reference

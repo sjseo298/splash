@@ -7,10 +7,12 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import tomllib
 import unittest
+import urllib.request
 from contextlib import contextmanager
 from itertools import product
 from pathlib import Path
@@ -18,10 +20,14 @@ from unittest import mock
 
 import yaml
 
+from dev.tests.server_fixtures import console_written, full_pipe
 from install import clients, launcher
 from server import serve_options
 
 MODEL = "mlx-community/Qwen3.6-35B-A3B-4bit"
+# What a launch under an environment's proxy adds to the hosts a client
+# reaches without it.
+LOOPBACK_HOSTS = "127.0.0.1,localhost,::1"
 
 
 def hermes_profile_create(argv, *, env, **options):
@@ -33,6 +39,21 @@ def hermes_profile_create(argv, *, env, **options):
     seed = {"model": {"default": "cloud-model", "api_key_env": "CLOUD_API_KEY"}}
     (home / "config.yaml").write_text(yaml.safe_dump(seed))
     return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def pi_command_output(value, env):
+    """What Pi sends for a models.json value that begins with "!": the
+    command's output in /bin/sh, trimmed; None when the command fails. Popen,
+    since the tests replace subprocess.run."""
+    with subprocess.Popen(
+        ["/bin/sh", "-c", value[1:]],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ) as process:
+        output = process.stdout.read()
+    return output.strip() if process.returncode == 0 else None
 
 
 class ClientTests(unittest.TestCase):
@@ -104,9 +125,17 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(env["SPLASH_API_KEY"], "test-server-key")
                     self.assertNotIn("test-server-key", self.pi_models.read_text())
                     config = json.loads(self.pi_models.read_text())
-                    self.assertEqual(
-                        config["providers"]["splash"]["apiKey"], "$SPLASH_API_KEY"
-                    )
+                    api_key = config["providers"]["splash"]["apiKey"]
+                    # Pi runs a value that begins with "!" in the shell and
+                    # sends its output, in every version: Pi before 0.79.4
+                    # reads a bare variable name, later versions "$NAME".
+                    self.assertTrue(api_key.startswith("!"), api_key)
+                    for key in ("test-server-key", "!test-$HOME 'key'"):
+                        self.assertEqual(
+                            pi_command_output(api_key, {"SPLASH_API_KEY": key}), key
+                        )
+                    # Without the variable it fails, and Pi sends no key.
+                    self.assertIsNone(pi_command_output(api_key, {}))
                 else:
                     # Hermes expands the profile's reference from its
                     # environment.
@@ -152,6 +181,9 @@ class ClientTests(unittest.TestCase):
 
     def test_default_environment_is_a_copy_of_the_process_environment(self):
         with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "process-key"}):
+            for name in list(os.environ):
+                if name.lower() in clients.PROXY_VARIABLES:
+                    os.environ.pop(name)
             before = dict(os.environ)
             _, env = clients.command(
                 "codex",
@@ -163,6 +195,66 @@ class ClientTests(unittest.TestCase):
             )
             self.assertEqual(dict(os.environ), before)
         self.assertEqual(env, before)
+
+    def test_every_client_reaches_the_server_without_a_proxy(self):
+        """Where the environment names a proxy, loopback, where the server
+        is, joins the hosts each client reaches without it, so no proxy
+        receives the server's key. A client reads NO_PROXY or no_proxy, and
+        the other where its own is unset or empty: each keeps the hosts a client found
+        there, and one exempting loopback already, or "*", stays. An
+        environment naming no proxy, whose clients take the system proxy, is
+        left as it is."""
+        proxy = "http://proxy.example:3128"
+        for proxies, no_proxy, expected in (
+            (
+                {"HTTPS_PROXY": proxy},
+                {},
+                (LOOPBACK_HOSTS, LOOPBACK_HOSTS),
+            ),
+            (
+                {"http_proxy": proxy},
+                {"NO_PROXY": "corp.example"},
+                (f"corp.example,{LOOPBACK_HOSTS}", f"corp.example,{LOOPBACK_HOSTS}"),
+            ),
+            (
+                {"all_proxy": proxy},
+                {"NO_PROXY": "", "no_proxy": "corp.example, localhost"},
+                (
+                    "corp.example,localhost,127.0.0.1,::1",
+                    "corp.example,localhost,127.0.0.1,::1",
+                ),
+            ),
+            (
+                {"ALL_PROXY": proxy},
+                {"no_proxy": f"{LOOPBACK_HOSTS},corp.example"},
+                (None, f"{LOOPBACK_HOSTS},corp.example"),
+            ),
+            ({"HTTP_PROXY": proxy}, {"NO_PROXY": "*"}, ("*", None)),
+            ({"https_proxy": proxy}, {"NO_PROXY": "*", "no_proxy": "*"}, ("*", "*")),
+            ({}, {}, (None, None)),
+            ({"http_proxy": ""}, {"NO_PROXY": "corp.example"}, ("corp.example", None)),
+        ):
+            for name in clients.INSTALL_URLS:
+                with self.subTest(client=name, proxies=proxies, no_proxy=no_proxy):
+                    _, env = self.command(name, env=proxies | no_proxy)
+                    self.assertEqual(
+                        (env.get("NO_PROXY"), env.get("no_proxy")), expected
+                    )
+                    self.assertEqual({key: env[key] for key in proxies}, proxies)
+
+    def test_a_system_proxy_alone_stays_the_clients_proxy(self):
+        """Without a proxy variable, Python's urllib takes the macOS system
+        proxy; a NO_PROXY in the agent's environment would make it drop that
+        proxy, so the launch adds none."""
+        system = {"http": "http://sysproxy.example:3128"}
+        _, env = self.command("codex", env={"PATH": "/bin"})
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                urllib.request, "getproxies_macosx_sysconf", return_value=system
+            ),
+        ):
+            self.assertEqual(urllib.request.getproxies(), system)
 
     def test_claude_launch_selects_the_local_server_for_every_model_alias(self):
         # A shell configured for a cloud provider keeps its unrelated
@@ -1144,6 +1236,93 @@ class ClientLifecycleTests(unittest.TestCase):
             self.assertEqual(result.exception.code, 0)
             request.assert_not_called()
 
+    def test_the_launch_lines_come_before_the_clients_output(self):
+        # The client the launcher executes replaces it: the launcher's lines
+        # are written before, never dropped with it.
+        with tempfile.TemporaryDirectory() as directory:
+            client = Path(directory) / "claude"
+            client.write_text("#!/bin/sh\necho client\n")
+            client.chmod(0o755)
+            program = "\n".join(
+                (
+                    "from unittest import mock",
+                    "from install import launcher",
+                    "model = {'id': 'm', 'owned_by': 'splash', 'context_length': 8192}",
+                    "listing = {'data': [{**model, 'input_modalities': ['text']}]}",
+                    "with mock.patch.object(launcher, '_request_json') as request:",
+                    "    request.return_value = listing",
+                    "    launcher.main(['claude'])",
+                )
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", program],
+                cwd=launcher.ROOT,
+                env={**os.environ, "PATH": f"{directory}:/usr/bin:/bin"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "Starting claude: m · 8,192 context tokens",
+                "Claude hosted WebSearch is unavailable. "
+                "WebFetch, local tools and MCP are unchanged.",
+                "client",
+            ],
+            result.stderr,
+        )
+
+    def test_a_stalled_console_holds_up_the_clients_launch_1_s_at_most(self):
+        # The launcher's stdout is a pipe nobody reads, full already: its
+        # lines wait for it until it executes the client, which drops them,
+        # the console's second later.
+        unread, written, filler = full_pipe()
+        self.addCleanup(os.close, unread)
+        with tempfile.TemporaryDirectory() as directory:
+            client = Path(directory) / "claude"
+            client.write_text("#!/bin/sh\nexit 7\n")
+            client.chmod(0o755)
+            elapsed = Path(directory) / "elapsed"
+            program = "\n".join(
+                (
+                    "import os, time",
+                    "from unittest import mock",
+                    "from install import launcher",
+                    "model = {'id': 'm', 'owned_by': 'splash', 'context_length': 8192}",
+                    "listing = {'data': [{**model, 'input_modalities': ['text']}]}",
+                    "execute = os.execvpe",
+                    "def timed(*arguments):",
+                    f"    with open({str(elapsed)!r}, 'w') as seconds:",
+                    "        seconds.write(str(time.monotonic() - started))",
+                    "    execute(*arguments)",
+                    "with (",
+                    "    mock.patch.object(launcher, '_request_json', return_value=listing),",
+                    "    mock.patch.object(os, 'execvpe', timed),",
+                    "):",
+                    "    started = time.monotonic()",
+                    "    launcher.main(['claude'])",
+                )
+            )
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", program],
+                    cwd=launcher.ROOT,
+                    env={**os.environ, "PATH": f"{directory}:/usr/bin:/bin"},
+                    stdout=written,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                )
+            finally:
+                os.close(written)
+            self.assertEqual(result.returncode, 7, result.stderr)
+            self.assertLess(float(elapsed.read_text()), 3.0)
+        held = b""
+        while chunk := os.read(unread, 65536):
+            held += chunk
+        self.assertEqual(held, b"x" * filler)
+
     def test_missing_client_is_checked_before_connection(self):
         with (
             mock.patch.object(clients.shutil, "which", return_value=None),
@@ -1152,6 +1331,7 @@ class ClientLifecycleTests(unittest.TestCase):
         ):
             self.assertEqual(launcher.main(["claude"]), 1)
         request.assert_not_called()
+        console_written()
         self.assertIn("claude is not installed", error.getvalue())
 
     def test_ready_server_is_source_of_model_and_context(self):
@@ -1235,6 +1415,7 @@ class ClientLifecycleTests(unittest.TestCase):
             if reported is None:
                 # A server started by an older Splash reports only vision.
                 self.assertEqual(result, 1)
+                console_written()
                 self.assertIn(
                     "restart it with this version of Splash", error.getvalue()
                 )
@@ -1300,6 +1481,7 @@ class ClientLifecycleTests(unittest.TestCase):
                 mock.patch("sys.stderr", io.StringIO()) as error,
             ):
                 self.assertEqual(launcher.main(["claude", *payload]), 1)
+            console_written()
             self.assertIn("splash serve", error.getvalue())
             execute.assert_not_called()
             install.assert_not_called()

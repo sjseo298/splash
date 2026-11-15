@@ -15,14 +15,15 @@
 // instead of device memory, issue their device loads before their stores
 // (the scan loads the next rows' state before storing the current rows'),
 // and the gate runs one simdgroup per row without barriers: over the 27B's 48
-// layers with DRAM-cold states that takes 11-28% less time at one to four
-// lanes than the same phases through device memory (40-core M3 Max, 16-core
-// M5 Pro), with the same bits.
+// layers with DRAM-cold states that takes 11-28% less time than the same
+// phases through device memory, with the same bits.
 //
 // Which of a step's rows a lane retains is known only after the step, so the
 // state a step writes is the one before its rows: it leaves the rows on the
 // lane's tape, and the lane's next step folds the retained ones into the
-// state before its own rows. A step reads and writes the state once.
+// state before its own rows. A step reads and writes the state once. Its
+// rows past the lane's verify rows are never retained or read: the scan
+// skips them and their recurrent output is zero.
 constant uint kDecodeSimdgroups = 8;
 
 // The threadgroup operands of one value head: the rows' prepared q/k, the
@@ -70,13 +71,14 @@ inline GdnTape gdn_tape(device uchar *tape, ulong offset) {
 // conv_state_out. q/k/v and the gates go to threadgroup memory for the scan,
 // beside the pending rows' k, v and gates from their tape; the rows'
 // convolution inputs, k, v and gates go to this step's tape, from which the
-// lane's next step folds in the rows the lane retains.
+// lane's next step folds in the rows the lane retains. Rows from `verified`
+// on get zero recurrent output.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth>
 inline void gdn_decode_prologue(
     device const bfloat *packed, device const bfloat *conv_weights,
     GdnConvHistory history, device bfloat *conv_state_out,
-    GdnTape pending_tape, uint pending, GdnTape step_tape,
+    GdnTape pending_tape, uint pending, GdnTape step_tape, uint verified,
     device const float *a_scale, device const bfloat *dt_bias,
     threadgroup GdnDecodeShared<HeadDim> &shared, uint value_head, uint lane,
     uint simd_group) {
@@ -154,6 +156,8 @@ inline void gdn_decode_prologue(
     shared.queries[token * HeadDim + dim] = query;
     shared.keys[token * HeadDim + dim] = key;
     shared.values[token * HeadDim + dim] = v[g];
+    if (token >= verified)
+      shared.rows[token * HeadDim + dim] = bfloat(0.0f);
     step_tape.inputs[token * ConvDim + v_channel + 32 * g] =
         inputs[v_channel + 32 * g];
     step_tape.kv[token * KvWidth + v_column + 32 * g] = v[g];
@@ -187,18 +191,18 @@ inline void gdn_decode_prologue(
 // Delta-rule recurrence over 128 state rows, four fp32 columns per lane.
 // RowsInFlight rows advance together to overlap their reductions and
 // arithmetic. The pending rows advance the incoming state to the committed
-// one, which goes to state_out; the step's own rows then advance it only for
-// their outputs, which go to threadgroup memory for the gate. Each row
-// preserves the decay, memory, delta, update, output operation order. The
-// next rows' state is loaded before these rows' state is stored. State is the
-// stored element: float, or bfloat, widened as it is loaded and rounded to
-// nearest even as it is stored; the arithmetic is fp32 with either.
+// one, which goes to state_out; the step's first `verified` rows then advance
+// it only for their outputs, which go to threadgroup memory for the gate.
+// Each row preserves the decay, memory, delta, update, output operation
+// order. The next rows' state is loaded before these rows' state is stored.
+// State is the stored element: float, or bfloat, widened as it is loaded and
+// rounded to nearest even as it is stored; the arithmetic is fp32 with either.
 template <uint HeadDim, uint RowsInFlight, class State>
 inline void gdn_decode_scan(device const State *state_in,
                             device State *state_out,
                             threadgroup GdnDecodeShared<HeadDim> &shared,
-                            uint pending, uint value_head, uint lane,
-                            uint simd_group) {
+                            uint pending, uint verified, uint value_head,
+                            uint lane, uint simd_group) {
   constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
@@ -247,6 +251,8 @@ inline void gdn_decode_scan(device const State *state_in,
       for (uint i = 0; i < 4; ++i)
         state_out[base(batch, r) + i] = State(state[r][i]);
     for (uint token = 0; token < Tokens; ++token) {
+      if (token == verified)
+        break;
       const float d = shared.decay[token];
       const float b = float(shared.beta[token]);
       threadgroup const bfloat *key = shared.keys + token * HeadDim + lane * 4;
@@ -344,7 +350,7 @@ inline void gdn_decode_batch_phase(
     device uchar *next3, device uchar *tape, device const float *a_scale,
     device const bfloat *dt_bias,
     device const W *gdn_norm_weight, device bfloat *gdn_hidden,
-    constant GDNDecodeBatchParams &params,
+    device const uint *verify_rows, constant GDNDecodeBatchParams &params,
     uint2 group, uint lane, uint simd_group,
     threadgroup GdnDecodeShared<HeadDim> &shared,
     device bfloat *table, device float *sums) {
@@ -367,6 +373,7 @@ inline void gdn_decode_batch_phase(
       ulong(params.layer) * params.recurrent_layer_bytes);
 
   const uint pending = params.pending_rows[batch];
+  const uint verified = verify_rows[batch];
   const GdnTape pending_tape =
       gdn_tape<KeyHeads, ValueHeads, HeadDim, ConvDim>(tape, params.pending_tape[batch]);
   const GdnTape step_tape =
@@ -377,11 +384,11 @@ inline void gdn_decode_batch_phase(
   device bfloat *lane_hidden = gdn_hidden + ulong(batch) * Rows * ValueWidth;
   gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
       packed, conv_weights, history, conv_state_out, pending_tape, pending,
-      step_tape, a_scale, dt_bias, shared, group.x, lane, simd_group);
+      step_tape, verified, a_scale, dt_bias, shared, group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   gdn_decode_scan<HeadDim, RowsInFlight, State>(state_in, state_out, shared,
-                                                pending, group.x, lane,
-                                                simd_group);
+                                                pending, verified, group.x,
+                                                lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool tiled = (params.flags & GDN_TILED_HEADS) != 0;
   gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
@@ -403,6 +410,7 @@ inline void gdn_decode_batch_phase(
 }
 
 // W: the norm weights' stored type (float: a GGUF's F32 norms, _f32).
+// verify_rows: each lane's verify rows.
 #define GDN_DECODE_BUFFERS(W) \
     device const bfloat *packed [[buffer(0)]], \
     device const bfloat *conv_weights [[buffer(1)]], \
@@ -412,7 +420,7 @@ inline void gdn_decode_batch_phase(
     device uchar *next2 [[buffer(8)]], device uchar *next3 [[buffer(9)]], \
     device uchar *tape [[buffer(10)]], device const float *a_scale [[buffer(11)]], \
     device const bfloat *dt_bias [[buffer(12)]], device const W *gdn_norm_weight [[buffer(13)]], \
-    device bfloat *gdn_hidden [[buffer(14)]]
+    device bfloat *gdn_hidden [[buffer(14)]], device const uint *verify_rows [[buffer(15)]]
 #define GDN_DECODE_THREADS \
     uint2 group [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
@@ -421,19 +429,19 @@ inline void gdn_decode_batch_phase(
     gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2, Layout, W, State>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, tape, a_scale, dt_bias, \
-        gdn_norm_weight, gdn_hidden, params, group, lane, simd_group, shared, \
+        gdn_norm_weight, gdn_hidden, verify_rows, params, group, lane, simd_group, shared, \
         table, sums);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      constant GDNDecodeBatchParams &params [[buffer(15)]], GDN_DECODE_THREADS) { \
+      constant GDNDecodeBatchParams &params [[buffer(16)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, gguf_sg::Table16, W, State) \
   }
 // The out-projection's table (Layout: gguf_sg::Table16).
 #define GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      device bfloat *table [[buffer(15)]], device float *sums [[buffer(16)]], \
-      constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
+      device bfloat *table [[buffer(16)]], device float *sums [[buffer(17)]], \
+      constant GDNDecodeBatchParams &params [[buffer(18)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \
   }
 // Each entry over an fp32 state and, as Name_bf16_state, a bf16 one.
@@ -459,10 +467,9 @@ GDN_DECODE_ENTRY(verify_gdn_fused_vh64, 16, 64, 128, 12288, 20736, bfloat)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh64_f32, 16, 64, 128, 12288, 20736, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh64, 16, 64, 128, 12288, 20736, gguf_sg::Table16, bfloat)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh64_f32, 16, 64, 128, 12288, 20736, gguf_sg::Table16, float)
-// Qwen3.8-Flash-Next (16512-column rows).
-GDN_DECODE_ENTRY(verify_gdn_fused_p16512, 16, 48, 128, 10240, 16512, bfloat)
+// Qwen3.8-Flash-Next (16512-column rows), which loads from GGUFs only, whose
+// norms are F32.
 GDN_DECODE_ENTRY(verify_gdn_fused_p16512_f32, 16, 48, 128, 10240, 16512, float)
-GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512, 16, 48, 128, 10240, 16512, gguf_sg::Table16, bfloat)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512_f32, 16, 48, 128, 10240, 16512, gguf_sg::Table16, float)
 #undef GDN_DECODE_ENTRY
 #undef GDN_DECODE_TABLE_ENTRY

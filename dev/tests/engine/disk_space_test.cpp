@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -40,9 +41,29 @@ DiskVolume localVolume(uint64_t availableBytes, uint64_t sizeBytes = 1000 * kGiB
   return {"/Volumes/Test", availableBytes, sizeBytes, true};
 }
 
-// The floor is 10 GiB, or 5% of a volume smaller than 200 GiB; the automatic
-// quota's limit is a quarter of what the volume has beyond it, the tier's own
-// blocks counted, at most the quota and never below zero.
+// A tier's reader of its volume that reads `volume` at every measure, so the
+// test Mac's own free space never sets a limit.
+std::function<std::optional<DiskVolume>()> reads(const DiskVolume &volume) {
+  return [volume] { return std::optional(volume); };
+}
+
+// A volume the test changes between a tier's measures: its reader reads what
+// the test last set.
+class TestVolume final {
+public:
+  explicit TestVolume(std::optional<DiskVolume> volume)
+      : volume_(std::make_shared<std::optional<DiskVolume>>(std::move(volume))) {}
+  [[nodiscard]] std::function<std::optional<DiskVolume>()> reader() const {
+    return [volume = volume_] { return *volume; };
+  }
+  void set(std::optional<DiskVolume> volume) const { *volume_ = std::move(volume); }
+
+private:
+  std::shared_ptr<std::optional<DiskVolume>> volume_;
+};
+
+// The floor is 10 GiB, or 5% of a volume under 200 GiB; the automatic limit is a quarter of the
+// room beyond it, capped by the quota.
 void testTheRule() {
   require(diskFloorBytes(1000 * kGiB) == 10 * kGiB && diskFloorBytes(100 * kGiB) == 5 * kGiB &&
               diskFloorBytes(12 * kGiB) == 12 * kGiB / 20,
@@ -59,9 +80,8 @@ void testTheRule() {
           "the limit below the floor is not what the tier holds beyond it");
 }
 
-// Automatic tiers sharing a volume, each measuring in turn and filling or
-// giving up to its limit, settle at (available - floor) / (tiers + 3) each,
-// and the free space they leave stays above the floor.
+// Automatic tiers sharing a volume settle at (available - floor) / (tiers + 3) each, above the
+// floor.
 void testTiersOnOneVolumeConverge() {
   const uint64_t floor = 10 * kGiB, before = 100 * kGiB;
   for (uint32_t tiers = 1; tiers <= 4; ++tiers) {
@@ -82,10 +102,7 @@ void testTiersOnOneVolumeConverge() {
   }
 }
 
-// Blocks a snapshot keeps when an automatic tier frees them return nothing
-// to the volume. Each measure then lowers the limit by a quarter of what the
-// last one freed: the tier gives up at most a third more than it first
-// freed, and keeps the rest.
+// Blocks a snapshot keeps cost an automatic tier at most a third more than it first freed.
 void testSnapshotCostsAtMostAThird() {
   const uint64_t floor = 10 * kGiB;
   uint64_t available = 50 * kGiB, held = 0;
@@ -107,11 +124,8 @@ void testSnapshotCostsAtMostAThird() {
           "a snapshot that keeps freed blocks drained the tier");
 }
 
-// Active KV may take all of the room beyond the floor, at most the quota,
-// while the automatic quota's cached copies keep a quarter of it: on a Mac
-// mini's 460 GiB volume with 16 GiB free, 6 GiB against 1.5; with 24 GiB
-// free, 14 GiB. Off a local volume both are the quota; a hidden limit caps
-// both at what the tier holds.
+// Active KV may take all the room beyond the floor, up to the quota, while cached copies keep a
+// quarter of it.
 void testActiveKvTakesTheRoom() {
   const uint64_t floor = 10 * kGiB;
   require(diskActiveLimitBytes(kQuota, 30 * kGiB, 0, floor) == 20 * kGiB &&
@@ -125,46 +139,47 @@ void testActiveKvTakesTheRoom() {
           "a volume's active limit is not its room, or the quota off a volume the tier follows");
   auto budget = std::make_shared<model::DiskBudget>(kQuota);
   auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
-  DiskSpace space(budget, kAutomatic, {file});
+  const TestVolume volume(localVolume(500 * kGiB));
+  DiskSpace space(budget, kAutomatic, {file}, volume.reader());
   for (const auto [available, active, cached] :
        {std::array{16 * kGiB, 6 * kGiB, 3 * kGiB / 2}, std::array{24 * kGiB, 14 * kGiB, 7 * kGiB / 2}}) {
-    space.measure(localVolume(available, 460 * kGiB));
+    volume.set(localVolume(available, 460 * kGiB));
+    space.measure();
     require(space.heldBytes() == 0 && budget->activeLimitBytes() == active && budget->limitBytes() == cached,
             "a Mac mini's free space did not give active KV its room and cached copies a quarter of it");
   }
-  space.measure(DiskVolume{"/Volumes/Share", kGiB, 1000 * kGiB, false});
+  volume.set(DiskVolume{"/Volumes/Share", kGiB, 1000 * kGiB, false});
+  space.measure();
   require(budget->activeLimitBytes() == kQuota && budget->limitBytes() == kQuota,
           "a volume the tier does not follow did not leave both limits at the quota");
   const std::shared_ptr<model::SlotFile::Slot> held = file->acquire();
+  volume.set(localVolume(100 * kGiB));
   for (int write = 0; write < 2; ++write) {
     budget->reportFull();
-    space.measure(localVolume(100 * kGiB));
+    space.measure();
   }
   require(budget->activeLimitBytes() == kHostPageBytes && budget->limitBytes() == kHostPageBytes,
           "a hidden limit did not cap active KV at what the tier holds");
 }
 
-// --max-cache-disk auto holds a quarter of its volume's room, at most 32 GiB;
-// a size is held as given while its volume has room for it beyond the floor,
-// and holds that room, as active KV may, when it has less (#446). On a 2000
-// GiB volume with 730.8 GiB beyond the floor, a size of 500 GiB holds 500,
-// where a quarter of the room would leave 182.7, and auto its 32; with 72
-// GiB beyond it, the size holds the 72 and auto a quarter, 18; below the
-// floor neither holds anything.
+// A --max-cache-disk size is held as given while the volume has room beyond the floor, else that
+// room; auto holds a quarter, at most 32 GiB.
 void testSizeIsHeldAsGiven() {
   const uint64_t size = 500 * kGiB, floor = 10 * kGiB;
   auto automaticBudget = std::make_shared<model::DiskBudget>(kAutomaticCacheDiskBytes);
   auto sizeBudget = std::make_shared<model::DiskBudget>(size);
+  const TestVolume volume(localVolume(500 * kGiB));
   DiskSpace automatic(automaticBudget, kAutomatic,
-                      {std::make_shared<model::SlotFile>(kHostPageBytes, automaticBudget)});
-  DiskSpace sized(sizeBudget, kSize, {std::make_shared<model::SlotFile>(kHostPageBytes, sizeBudget)});
+                      {std::make_shared<model::SlotFile>(kHostPageBytes, automaticBudget)}, volume.reader());
+  DiskSpace sized(sizeBudget, kSize, {std::make_shared<model::SlotFile>(kHostPageBytes, sizeBudget)},
+                  volume.reader());
   for (const auto [available, automaticLimit, sizeLimit] :
        {std::array{floor + 7308 * kGiB / 10, kAutomaticCacheDiskBytes, size},
         std::array{floor + 72 * kGiB, 18 * kGiB, 72 * kGiB},
         std::array{9 * kGiB, uint64_t{0}, uint64_t{0}}}) {
-    const DiskVolume volume = localVolume(available, 2000 * kGiB);
-    automatic.measure(volume);
-    sized.measure(volume);
+    volume.set(localVolume(available, 2000 * kGiB));
+    automatic.measure();
+    sized.measure();
     require(automatic.heldBytes() == 0 && automaticBudget->limitBytes() == automaticLimit,
             "auto's limit is not a quarter of its volume's room, at most 32 GiB");
     require(sized.heldBytes() == 0 && sizeBudget->limitBytes() == sizeLimit &&
@@ -195,19 +210,13 @@ void testAutomaticStart() {
           "a volume with room, or the room the tier's own files hold, refused the tier");
 }
 
-// A measure of a real file sets the limit by the rule from what it read and
-// leaves the write budget alone: there is none unless the user sets one, so
-// nothing is held back. A write that found the volume full while it shows
-// none lowers the limit by the rule. One that found it full while it shows
-// room may have met a volume that filled and freed again, and changes
-// nothing; a second met a limit the measure cannot see: the tier keeps
-// within what it holds then, replacing within that, until another such write
-// lowers it again; its files go on taking writes. Off a local volume a
-// second write that found it full does the same.
+// Measuring real files on the temporary directory's volume sets the limit by the rule; a full-volume
+// write lowers it only when the volume shows no room.
 void testMeasureOfRealFiles() {
   auto budget = std::make_shared<model::DiskBudget>(kQuota);
   auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
-  DiskSpace space(budget, kAutomatic, {file});
+  const TestVolume measured(volumeOf(std::filesystem::temp_directory_path()));
+  DiskSpace space(budget, kAutomatic, {file}, measured.reader());
   const std::optional<DiskVolume> &volume = space.volume();
   require(volume && volume->local && space.followed() && volume->sizeBytes &&
               budget->volumeAvailableBytes() == volume->availableBytes,
@@ -220,31 +229,34 @@ void testMeasureOfRealFiles() {
           "a measure set a write budget nobody asked for");
 
   budget->reportFull();
-  space.measure(localVolume(kGiB));
+  measured.set(localVolume(kGiB));
+  space.measure();
   require(file->writable() && !budget->writesStopped() && !budget->limitBytes() &&
               !budget->fullReported(),
           "a full volume stopped the files or kept the limit");
-  space.measure(localVolume(100 * kGiB));
+  measured.set(localVolume(100 * kGiB));
+  space.measure();
   std::vector<std::shared_ptr<model::SlotFile::Slot>> slots{file->acquire(), file->acquire()};
   const uint64_t ruled = budget->limitBytes();
   budget->reportFull();
-  space.measure(localVolume(100 * kGiB));
+  space.measure();
   require(ruled > 2 * kHostPageBytes && budget->limitBytes() == ruled,
           "one write that found the volume full while it shows room capped the tier");
   budget->reportFull();
-  space.measure(localVolume(100 * kGiB));
+  space.measure();
   require(file->writable() && !budget->writesStopped() &&
               budget->limitBytes() == 2 * kHostPageBytes && !file->acquire(),
           "a second write that found the volume full while it shows room did not keep the tier "
           "within what it held");
-  space.measure(localVolume(500 * kGiB));
+  measured.set(localVolume(500 * kGiB));
+  space.measure();
   slots.pop_back();
   slots.push_back(file->acquire());
   require(budget->limitBytes() == 2 * kHostPageBytes && slots.back() && !file->acquire(),
           "the tier did not replace within what it held, or grew past it");
   slots.pop_back();
   budget->reportFull();
-  space.measure(localVolume(500 * kGiB));
+  space.measure();
   require(budget->limitBytes() == kHostPageBytes,
           "another write that met the hidden limit did not lower it to what the tier held");
 
@@ -252,18 +264,17 @@ void testMeasureOfRealFiles() {
   // the volume full keeps the tier within what it holds.
   auto other = std::make_shared<model::DiskBudget>(5 * kGiB);
   auto shared = std::make_shared<model::SlotFile>(kHostPageBytes, other);
-  DiskSpace network(other, kSize, {shared});
   const DiskVolume share{"/Volumes/Share", kGiB, 1000 * kGiB, false};
-  network.measure(share);
+  DiskSpace network(other, kSize, {shared}, reads(share));
   require(!network.followed() && other->limitBytes() == 5 * kGiB,
           "a network volume's free space set the limit");
   const std::shared_ptr<model::SlotFile::Slot> held = shared->acquire();
   other->reportFull();
-  network.measure(share);
+  network.measure();
   require(other->limitBytes() == 5 * kGiB,
           "one write that found a network volume full capped the tier");
   other->reportFull();
-  network.measure(share);
+  network.measure();
   require(shared->writable() && other->limitBytes() == kHostPageBytes,
           "a full network volume did not keep the tier within what it held");
 }
@@ -290,29 +301,42 @@ std::vector<CacheDirectory::Idle> otherCaches(const std::filesystem::path &root)
   return others;
 }
 
-// One limit bounds a persistent cache's root, and the tier may use all of
-// it: the other caches nobody holds count among what the tier holds, and
-// while the root holds more than its limit they go, the oldest first,
-// before a copy of the tier's own. A shrinking volume makes them go.
+// Other caches nobody holds in a persistent root count against the limit and go first, oldest
+// first.
 void testOtherCachesGoFirst() {
   const test::TemporaryDirectory root("splash-disk-space-root");
   const std::vector<CacheDirectory::Idle> others = otherCaches(root.path());
   auto budget = std::make_shared<model::DiskBudget>(kQuota);
   auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
-  DiskSpace space(budget, kAutomatic, {file}, others);
+  const TestVolume volume(localVolume(500 * kGiB));
+  DiskSpace space(budget, kAutomatic, {file}, volume.reader(), others);
   require(space.othersBytes() == others[0].bytes + others[1].bytes,
           "the other caches were not counted");
   // A volume that leaves the root a limit of what the others hold less half
   // a MiB: the oldest goes, the newer one stays.
   const uint64_t floor = diskFloorBytes(100 * kGiB);
   const uint64_t rootLimit = space.othersBytes() - kMiB / 2;
-  space.measure(
-      DiskVolume{"/Volumes/Test", floor + 4 * rootLimit - space.heldBytes(), 100 * kGiB, true});
+  volume.set(DiskVolume{"/Volumes/Test", floor + 4 * rootLimit - space.heldBytes(), 100 * kGiB, true});
+  space.measure();
   require(!std::filesystem::exists(others[0].path / "kv.slots") &&
               std::filesystem::exists(others[1].path / "kv.slots") &&
               space.othersBytes() == others[1].bytes &&
               budget->limitBytes() == rootLimit,
           "the oldest other cache did not go first, or the tier did not get the root's limit");
+}
+
+// Another cache removed by someone else stops counting at the next measure.
+void testRemovedCachesStopCounting() {
+  const test::TemporaryDirectory root("splash-disk-space-root");
+  const std::vector<CacheDirectory::Idle> others = otherCaches(root.path());
+  auto budget = std::make_shared<model::DiskBudget>(kQuota);
+  auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
+  const DiskVolume volume{"/Volumes/Test", 500 * kGiB, 1000 * kGiB, true};
+  DiskSpace space(budget, kSize, {file}, reads(volume), others);
+  std::filesystem::remove_all(others[1].path);
+  space.measure();
+  require(space.othersBytes() == others[0].bytes && space.heldBytes() == others[0].bytes,
+          "a removed cache still counted among what the root holds");
 }
 
 // The tier growing within the quota makes them go as well, on a volume
@@ -324,9 +348,8 @@ void testOtherCachesGoAsTheTierGrows() {
     const uint64_t quota = others[0].bytes + others[1].bytes + kMiB + kMiB / 2;
     auto budget = std::make_shared<model::DiskBudget>(quota);
     auto file = std::make_shared<model::SlotFile>(kMiB, budget);
-    DiskSpace space(budget, kSize, {file}, others);
     const DiskVolume volume{"/Volumes/Test", 500 * kGiB, 1000 * kGiB, local};
-    space.measure(volume);
+    DiskSpace space(budget, kSize, {file}, reads(volume), others);
     require(budget->limitBytes() == quota && space.othersBytes() == quota - kMiB - kMiB / 2,
             "the tier did not get the root's whole quota");
     const std::vector<std::byte> payload(kMiB, std::byte{1});
@@ -335,7 +358,7 @@ void testOtherCachesGoAsTheTierGrows() {
       slots.push_back(file->acquire());
       require(slots.back() && file->write(slots.back(), {payload}, {})->wait(),
               "the tier could not write within its limit");
-      space.measure(volume);
+      space.measure();
     };
     grow();
     require(std::filesystem::exists(others[0].path / "kv.slots") &&
@@ -362,6 +385,7 @@ int main() {
     testAutomaticStart();
     testMeasureOfRealFiles();
     testOtherCachesGoFirst();
+    testRemovedCachesStopCounting();
     testOtherCachesGoAsTheTierGrows();
     std::cout << "Disk space tests passed\n";
   } catch (const std::exception &error) {

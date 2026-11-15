@@ -66,7 +66,13 @@ ENTRY_STAGING = ".loading-"
 
 
 class ModelError(RuntimeError):
-    pass
+    """A refusal or failure the installers report without a traceback;
+    `kind` classes a Hub or network failure for the app
+    (hub.failure_kind), None for any other."""
+
+    def __init__(self, message, kind=None):
+        super().__init__(message)
+        self.kind = kind
 
 
 class VisionError(ModelError):
@@ -77,6 +83,16 @@ class VisionError(ModelError):
 def warn(message):
     """Report something the user may need to act on, on stderr."""
     print(f"Warning: {message}", file=sys.stderr, flush=True)
+
+
+@contextmanager
+def freeing():
+    """Run a block that only frees space, removing what no installation
+    uses: an OSError ends the block with a warning, and the caller goes on."""
+    try:
+        yield
+    except OSError as error:
+        warn(f"could not remove what no installation uses: {error}")
 
 
 def run_engine(arguments, check):
@@ -359,7 +375,7 @@ def parse_args(argv=None):
         "--draft-model",
         type=parse_draft_model,
         help="the DFlash2 draft's repository or local directory, in place of the "
-        "family's released one (required for a family without one)",
+        "family's released one",
     )
     parser.add_argument(
         "--language-only",
@@ -374,6 +390,10 @@ def parse_args(argv=None):
     )
     commands.add_parser("verify").add_argument("--full", action="store_true")
     commands.add_parser("link", help="print the selection link")
+    commands.add_parser(
+        "remove",
+        help="remove the model's installations and the Hub cache files no other uses",
+    )
     return parser.parse_args(argv)
 
 
@@ -399,7 +419,13 @@ def main(argv=None):
         if args.command == "prepare":
             if args.json_progress:
                 hub.report_json_progress()
-            upstream.prepare(selection)
+            outcome = upstream.prepare(selection)
+            if args.json_progress:
+                # What it did, last, which the app words.
+                print(json.dumps({"event": "prepared", "outcome": outcome}), flush=True)
+        elif args.command == "remove":
+            freed = upstream.remove(selection)
+            print(json.dumps({"event": "removed", "bytes": freed}), flush=True)
         else:
             kind = installation_kind(selection.link)
             if kind == PACKAGE:
@@ -416,6 +442,14 @@ def main(argv=None):
                 f"({'full' if args.full else 'quick'})."
             )
     except (ModelError, OSError) as error:
+        if args.command in ("prepare", "remove"):
+            # The app and the launcher word the failure by it, beside any
+            # progress and messages.
+            kind = error.kind if isinstance(error, ModelError) else None
+            print(
+                json.dumps({"event": "error", "kind": kind, "message": str(error)}),
+                flush=True,
+            )
         print(f"error: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

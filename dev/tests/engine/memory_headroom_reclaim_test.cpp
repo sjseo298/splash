@@ -1,33 +1,22 @@
+#include "TestMetalMemory.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "engine/MemoryLedger.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
-
-// The governor reads nothing from the backend but its memory statistics, so
-// this stand-in satisfies the linker without a GPU.
-namespace splash::metal {
-namespace {
-MetalMemoryStats statistics;
-} // namespace
-
-struct MetalBackend::Impl {};
-MetalBackend::MetalBackend(std::string, double, double)
-    : impl_(std::make_unique<Impl>()) {}
-MetalBackend::~MetalBackend() = default;
-MetalMemoryStats MetalBackend::memoryStats() const noexcept {
-  return statistics;
-}
-MetalMemoryStats MetalBackend::refreshMemoryStats() const noexcept {
-  return statistics;
-}
-} // namespace splash::metal
+#include <vector>
 
 using namespace splash;
 using namespace splash::engine;
 
 namespace {
+
+constexpr uint64_t kMiB = 1024ULL * 1024;
+constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 
 void require(bool condition, const char *msg) {
   if (!condition) {
@@ -35,6 +24,49 @@ void require(bool condition, const char *msg) {
     std::exit(1);
   }
 }
+
+class CacheVictimSource final : public VictimSource {
+public:
+  struct Entry {
+    uint64_t key = 0;
+    uint64_t bytes = 0;
+    ReclaimClass cls = ReclaimClass::Ordinary;
+  };
+
+  std::vector<Entry> entries;
+  uint64_t releasedBytes = 0;
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "cache"; }
+
+  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &query, const Victim *after) const override {
+    bool seenAfter = after == nullptr;
+    for (const Entry &entry : entries) {
+      if (!seenAfter) {
+        if (entry.key == after->key)
+          seenAfter = true;
+        continue;
+      }
+      if (entry.cls == ReclaimClass::InUse && !query.rights.inUse)
+        continue;
+      return Victim{.key = entry.key, .bytes = entry.bytes, .cls = entry.cls, .kind = VictimKind::Memory};
+    }
+    return std::nullopt;
+  }
+
+  FreeResult take(const VictimQuery &, const Victim &victim) override {
+    auto it = std::ranges::find(entries, victim.key, &Entry::key);
+    if (it == entries.end())
+      return {.outcome = FreeOutcome::Short};
+    const uint64_t bytes = it->bytes;
+    entries.erase(it);
+    releasedBytes += bytes;
+    if (test::metalStatistics().allocatedBytes >= bytes)
+      test::metalStatistics().allocatedBytes -= bytes;
+    if (test::metalStatistics().deviceCurrentAllocatedBytes >= bytes)
+      test::metalStatistics().deviceCurrentAllocatedBytes -= bytes;
+    return {.outcome = FreeOutcome::Met, .nowBytes = bytes};
+  }
+};
 
 // 1. Test del Bypass de presión de memoria del Host
 void testHostPressureBypass() {
@@ -48,73 +80,88 @@ void testHostPressureBypass() {
   ::setenv("SPLASH_IGNORE_HOST_PRESSURE", "1", 1);
   require(ignoreHostPressure(), "ignoreHostPressure() debe ser true con SPLASH_IGNORE_HOST_PRESSURE=1");
 
-  std::cout << "   ✓ ignoreHostPressure() conmuta correctamente con la variable de entorno." << std::endl;
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  // Even when host available memory is below hostReserveBytes, constructor proceeds with bypass.
+  MemoryGovernor governor(
+      backend, 8 * kGiB, 2 * kGiB, 2 * kGiB,
+      [] { return std::optional<HostMemory>(HostMemory{512 * kMiB, 512 * kMiB}); }, 0);
+
+  governor.setPressure(MemoryPressure::Warning);
+  const MemoryGovernorSnapshot warnSnap = governor.evaluate();
+  require(warnSnap.pressure == MemoryPressure::Normal,
+          "Con bypass activo, Warning del sistema debe reportarse como Normal");
+  require(warnSnap.hostGrowthAllowed && governor.admits(ClaimClass::Growth),
+          "Con bypass activo, el crecimiento debe seguir permitido bajo Warning del host");
+
+  const ClaimId growthClaim = governor.ledger().open({.cls = ClaimClass::Growth});
+  {
+    const MemoryGovernor::Scope scope(governor, growthClaim);
+    const metal::AllocationResult res = governor.allocationAdmission()(64 * kMiB, [] {});
+    require(static_cast<bool>(res),
+            "Con bypass activo, una reserva de crecimiento bajo Warning debe ser admitida");
+  }
+  governor.ledger().close(growthClaim);
+
+  governor.setPressure(MemoryPressure::Critical);
+  const MemoryGovernorSnapshot critSnap = governor.evaluate();
+  require(critSnap.pressure == MemoryPressure::Critical && !critSnap.hostGrowthAllowed,
+          "Bajo presión Critical del sistema, incluso con bypass debe rechazarse crecimiento");
+
+  ::unsetenv("SPLASH_IGNORE_HOST_PRESSURE");
+  std::cout << "   ✓ ignoreHostPressure() conmuta correctamente y protege Critical del SO." << std::endl;
 }
 
 // 2. Test de política de desalojo bajo consumo alto de memoria Metal
 void testEngineHeadroomReclaim() {
-  std::cout << "[TEST 2] Verificando política de desalojo con margen bajo en Metal..." << std::endl;
+  std::cout << "[TEST 2] Verificando desalojo proactivo con margen bajo en Metal..." << std::endl;
 
-  // Simular el escenario exacto reportado en los logs:
-  // Metal Limit: 28.27 GB (28,271,624,192 bytes)
-  // Consumo actual: 28.24 GB (28,246,425,600 bytes)
+  // Simular el escenario reportado con bypass activo:
+  // Metal Limit: 28,271,624,192 bytes (~26.33 GiB)
+  // Consumo actual: 28,246,425,600 bytes
   // Margen libre restante: ~25 MB (25,198,592 bytes)
+  ::setenv("SPLASH_IGNORE_HOST_PRESSURE", "1", 1);
   const uint64_t limit = 28271624192ULL;
   const uint64_t resident = 28246425600ULL;
-  const uint64_t headroom = limit - resident; // 25 MB
+  const uint64_t headroom = limit - resident; // ~25 MB
 
-  MemoryGovernorSnapshot snap;
-  snap.limitBytes = limit;
-  snap.chargedBytes = resident;
-  snap.headroomBytes = headroom;
-  snap.pressure = MemoryPressure::Normal; // Presión host reportada normal por el bypass
-  snap.systemPressure = MemoryPressure::Normal;
-  snap.hostMeasurementValid = true;
-  snap.hostGrowthAllowed = true;
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = resident;
+  test::metalStatistics().deviceCurrentAllocatedBytes = resident;
 
-  MemoryPressurePolicy policy;
+  metal::MetalBackend backend("unused");
+  MemoryGovernor governor(
+      backend, limit, 2 * kGiB, 2 * kGiB,
+      [] { return std::optional<HostMemory>(HostMemory{64 * kGiB, 64 * kGiB}); }, 0);
 
-  // Escenario A: Petición en curso pero no bloqueada, margen bajo (< 1 GiB)
-  const double t0 = 1000.0;
-  auto directiveA = policy.update(snap, t0, /*requestWaiting=*/false);
+  CacheVictimSource cache;
+  // Add 16 ordinary 64 MiB units (1 GiB) and 1 in-use unit that must NOT be touched.
+  for (uint64_t i = 1; i <= 16; ++i)
+    cache.entries.push_back({.key = i, .bytes = 64 * kMiB, .cls = ReclaimClass::Ordinary});
+  cache.entries.push_back({.key = 99, .bytes = 64 * kMiB, .cls = ReclaimClass::InUse});
+  governor.ledger().addSource(cache);
 
-  require(directiveA.has_value(),
-          "Debe ordenar un pase de desalojo cuando el margen en Metal es < 1 GiB");
-  require(!directiveA->critical,
-          "No debe purgar indiscriminadamente toda la caché si no hay presión crítica");
-  require(directiveA->targetBytes > 0,
-          "El volumen objetivo de bytes a desalojar debe ser positivo");
+  // Escenario A: Margen de Metal bajo (< 1 GiB) con bypass activo
+  static_cast<void>(governor.controlPass(1000.0));
+  const uint64_t expectedMinTarget = kGiB - headroom;
+  require(cache.releasedBytes >= expectedMinTarget,
+          "Debe desalojar caché ordinaria hasta recuperar el margen objetivo de 1 GiB en Metal");
+  require(std::ranges::any_of(cache.entries, [](const CacheVictimSource::Entry &e) { return e.key == 99; }),
+          "No debe desalojar entradas en uso durante un pase proactivo de margen");
 
-  // El objetivo debe ser restaurar el margen objetivo de 1 GiB
-  const uint64_t expectedTarget = (1ULL << 30) - headroom; // 1 GiB - 25 MB = ~999 MB
-  require(directiveA->targetBytes == expectedTarget,
-          "El objetivo a desalojar debe cubrir exactamente el déficit para recuperar 1 GiB");
-  require(directiveA->keepResumePoint,
-          "Debe intentar conservar el punto de reanudación si la petición no está esperando");
+  std::cout << "   ✓ Desalojo activado: recuperados "
+            << (cache.releasedBytes / kMiB) << " MiB para restaurar el margen de Metal." << std::endl;
 
-  std::cout << "   ✓ Desalojo activado: solicita recuperar "
-            << (directiveA->targetBytes / (1024 * 1024)) << " MB para restaurar el margen de Metal." << std::endl;
-
-  // Escenario B: Petición atascada esperando recursos (requestWaiting = true)
-  const double t1 = 2000.0;
-  auto directiveB = policy.update(snap, t1, /*requestWaiting=*/true);
-
-  require(directiveB.has_value(),
-          "Debe ordenar desalojo cuando hay una petición esperando");
-  require(!directiveB->keepResumePoint,
-          "Cuando hay una petición esperando (requestWaiting=true), debe ceder el punto de reanudación para priorizar la petición");
-
-  std::cout << "   ✓ Priorización de solicitud: cede puntos de reanudación ociosos para dar paso al prompt." << std::endl;
-
-  // Escenario C: Memoria con margen amplio (> 1 GiB) y sin peticiones esperando
-  MemoryGovernorSnapshot healthySnap = snap;
-  healthySnap.chargedBytes = 20ULL << 30; // 20 GiB usados de 28 GiB
-  healthySnap.headroomBytes = healthySnap.limitBytes - healthySnap.chargedBytes; // 8 GiB libres
-
-  auto directiveC = policy.update(healthySnap, 3000.0, /*requestWaiting=*/false);
-  require(!directiveC.has_value(),
+  // Escenario B: Memoria con margen amplio (> 1 GiB)
+  const uint64_t beforeHealthy = cache.releasedBytes;
+  test::metalStatistics().allocatedBytes = 20ULL * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 20ULL * kGiB;
+  cache.entries.push_back({.key = 100, .bytes = 64 * kMiB, .cls = ReclaimClass::Ordinary});
+  static_cast<void>(governor.controlPass(3000.0));
+  require(cache.releasedBytes == beforeHealthy,
           "Con margen de Metal holgado (> 1 GiB), no debe disparar desalojos innecesarios");
 
+  ::unsetenv("SPLASH_IGNORE_HOST_PRESSURE");
   std::cout << "   ✓ En estado saludable (> 1 GiB libre), la caché permanece intacta sin desalojos espurios." << std::endl;
 }
 

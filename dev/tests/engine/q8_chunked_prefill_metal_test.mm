@@ -3,8 +3,10 @@
 
 #include "HostKvExtents.hpp"
 #include "TestChecks.hpp"
+#include "TestFamilies.hpp"
 #include "ops/PagedAttention.hpp"
 #include "Q8PageFormatReference.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -288,7 +290,8 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
                      const AttentionPipelines &pipelines, const Case &data,
                      const PrefillAttentionParams *overrideParams = nullptr) {
   const auto plan = splash::ops::PagedAttention::prefillPlan(
-      data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension});
+      data.params.chunk_tokens, data.params.committed_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
+      splash::ops::kApple10Attention, splash::ops::Int8Activations::Off);
   require(plan.workspace.partialsBytes <= data.partials.length &&
               plan.workspace.statisticsBytes <= data.statistics.length,
           "attention splits exceed the shared arena");
@@ -694,7 +697,8 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
                                 const AttentionPipelines &attention) {
   Case data = makeCase(device, 33, 17, 32);
   const auto plan = splash::ops::PagedAttention::prefillPlan(
-      data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension});
+      data.params.chunk_tokens, data.params.committed_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
+      splash::ops::kApple10Attention, splash::ops::Int8Activations::Off);
   const PrefillAttentionParams valid{
       data.params.committed_tokens, data.params.chunk_tokens,
       data.params.chunk_stride, data.params.page_table_entries,

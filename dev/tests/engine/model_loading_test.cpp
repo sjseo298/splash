@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +27,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <variant>
@@ -199,8 +202,8 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
         require(!retained.contents() && backend.memoryStats().allocatedBytes == baseline,
                 "released image memory remains");
         rejects([&] { (void)readBack(); }, "binds released memory", "a command bound released image memory");
-        require(images.restore(splash::test::admitAll, splash::test::admitAll) && !images.released() &&
-                    backend.memoryStats().allocatedBytes >= baseline + fileBytes && readBack(),
+        splash::test::restoreWeights(images);
+        require(!images.released() && backend.memoryStats().allocatedBytes >= baseline + fileBytes && readBack(),
                 "GPU read of a restored image section was incorrect");
         images.release();
         descriptor = open(validPath.c_str(), O_WRONLY | O_CLOEXEC);
@@ -209,8 +212,8 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
                     pwrite(descriptor, &edit, sizeof(edit), kWeightFileAlignment) == sizeof(edit),
                 "unable to write the loaded file");
         close(descriptor);
-        rejects([&] { static_cast<void>(images.restore(splash::test::admitAll, splash::test::admitAll)); },
-                "written while the model is loaded", "a restore read a file written since it was opened");
+        rejects([&] { splash::test::restoreWeights(images); }, "written while the model is loaded",
+                "a restore read a file written since it was opened");
     }
     retained = MetalBuffer{};
     require(backend.memoryStats().allocatedBytes == baseline,
@@ -298,7 +301,7 @@ void testRestoreAdmission(MetalBackend &backend, const std::filesystem::path &ro
 
     images.release();
     require(holdsNone(), "released images hold memory");
-    require(!images.restore(splash::test::admitAll, splash::test::admitAll) && !images.contents()[0].bytes.empty() &&
+    require(!images.restore(splash::test::admitAll) && !images.contents()[0].bytes.empty() &&
                 images.contents()[1].bytes.empty(),
             "a restore did not write back the first image alone");
     const uint64_t firstBack = backend.memoryStats().allocatedBytes;
@@ -309,23 +312,115 @@ void testRestoreAdmission(MetalBackend &backend, const std::filesystem::path &ro
     const splash::metal::AllocationAdmission refuse = [](uint64_t, const std::function<void()> &) {
         return splash::metal::AllocationResult{splash::metal::AllocationFailure::HostPressure};
     };
-    rejects([&] { static_cast<void>(images.restore(refuse, refuse)); }, "host memory reserve protected",
+    splash::test::awaitWritten(images);
+    rejects([&] { static_cast<void>(images.restore(refuse)); }, "host memory reserve protected",
             "an image admission refused was restored");
     require(keepsTheFirst(), "an image admission refused holds memory, or the image before it went");
     writerRefused = true;
-    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll, splash::test::admitAll)); },
-            "writer refused memory", "an image whose writer was refused memory was restored");
+    rejects([&] { splash::test::restoreWeights(images); }, "writer refused memory",
+            "an image whose writer was refused memory was restored");
     require(keepsTheFirst(), "an image whose writer was refused memory holds its own, or the image before it went");
     writerRefused = false;
     images.release();
     require(holdsNone(), "a release during a restore kept an image it wrote back");
-    while (!images.restore(splash::test::admitAll, splash::test::admitAll)) {
-    }
+    splash::test::restoreWeights(images);
     for (size_t index = 0; index < loaded.size(); ++index) {
         const auto restored = images.contents()[index].bytes;
         require(std::equal(restored.begin(), restored.end(), loaded[index].begin(), loaded[index].end()),
                 "a restore that started over wrote an image other than it was loaded");
     }
+}
+
+// A restore writes each image on a thread of its own, so that the engine's
+// loop goes on answering while one is written: restore() returns while the
+// writer runs, and until it ends the images stay released, writing() holds and
+// no restore() may follow. The writer's thread calls the completion notifier
+// once the write is over, so that the restore() it wakes the loop for goes
+// on; a writer's failure comes from that restore(). A release during a write
+// waits for it and gives its image back too.
+void testRestoreWritesEachImageOnItsThread(MetalBackend &backend, const std::filesystem::path &root) {
+    const uint64_t baseline = backend.memoryStats().allocatedBytes;
+    const std::array<uint64_t, 1> sections{kWeightFileAlignment};
+    const auto path = root / "threaded.bin";
+    writeWeightFile(path, "TEST0001", 0, 9, sections);
+    const std::vector<uint8_t> payload(kWeightFileAlignment, 0x5A);
+    const int descriptor = open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    require(descriptor >= 0 &&
+                pwrite(descriptor, payload.data(), payload.size(), kWeightFileAlignment) ==
+                    static_cast<ssize_t>(payload.size()),
+            "unable to write the threaded image's payload");
+    close(descriptor);
+    // While `hold` is set the writer waits for `go`, at most 10 s, and notes
+    // whether restore() had returned by then; while `fail` is set it fails.
+    std::atomic<bool> hold{false}, go{false}, returned{false}, returnedFirst{false}, fail{false};
+    const auto await = [](const std::atomic<bool> &flag) {
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!flag && std::chrono::steady_clock::now() < limit)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return flag.load();
+    };
+    splash::model::WeightImages images(backend, "fixture");
+    splash::model::ImagePlan image = fileImage(path, "test/threaded.bin", "TEST0001", 0, 9);
+    image.write = [&, write = std::move(image.write)](std::span<uint8_t> bytes, const MetalBuffer &buffer) {
+        if (hold) {
+            static_cast<void>(await(go));
+            returnedFirst = returned.load();
+        }
+        if (fail)
+            throw std::runtime_error("the writer failed");
+        write(bytes, buffer);
+    };
+    WeightFile file = images.load(std::move(image));
+    static_cast<void>(file.section(kWeightFileAlignment, "payload"));
+    file.finish();
+    const std::vector<uint8_t> loaded(images.contents()[0].bytes.begin(), images.contents()[0].bytes.end());
+    std::atomic<int> writtenCalls{0};
+    std::atomic<bool> writtenAfterEnd{false}, writtenOnItsThread{false}, writtenSeen{false};
+    const std::thread::id caller = std::this_thread::get_id();
+    images.setCompletionNotifier([&] {
+        writtenAfterEnd = !images.writing();
+        writtenOnItsThread = std::this_thread::get_id() != caller;
+        ++writtenCalls;
+        writtenSeen = true;
+    });
+
+    images.release();
+    hold = true;
+    const bool restoredAtOnce = images.restore(splash::test::admitAll);
+    returned = true;
+    require(!restoredAtOnce && images.writing() && images.released(),
+            "restore() waited for the image's write, or did not report it under way");
+    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll)); },
+            "while an image is being written", "a restore went on while an image was written");
+    go = true;
+    require(await(writtenSeen) && returnedFirst && writtenCalls == 1 && writtenAfterEnd && writtenOnItsThread,
+            "the write did not run after restore() returned, or did not call the notifier on its thread once over");
+    require(images.restore(splash::test::admitAll) && !images.released() &&
+                std::ranges::equal(images.contents()[0].bytes, loaded) && writtenCalls == 1,
+            "the restore after the write did not end with the image as it was loaded");
+
+    hold = false;
+    fail = true;
+    images.release();
+    require(!images.restore(splash::test::admitAll), "a restore wrote its image before it returned");
+    splash::test::awaitWritten(images);
+    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll)); }, "the writer failed",
+            "a writer's failure did not come from the restore after it");
+    fail = false;
+
+    images.release();
+    hold = true;
+    go = false;
+    require(!images.restore(splash::test::admitAll) && images.writing(), "the image was not being written");
+    std::thread opener([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        go = true;
+    });
+    images.release();
+    opener.join();
+    require(!images.writing() && images.released() && images.contents()[0].bytes.empty() &&
+                backend.memoryStats().allocatedBytes == baseline,
+            "a release during a write kept the image being written");
 }
 
 // One tensor of a GGUF image: its descriptor, then its sections.
@@ -345,7 +440,8 @@ std::filesystem::path writeGgufTensor(const std::filesystem::path &path,
 }
 
 // GGUF image readers hold a tensor to the sizes the layout expects, read F16
-// and BF16 token rows as their formats' native rows, read a quantized
+// and BF16 token rows as stored, also of Flash-Next's 160 PLE values, which
+// are no whole native block, read a quantized
 // tensor's native rows as a float segment only where one is read (the MoE
 // router), never as a projection, and a token gather writes only into
 // buffers holding its rows.
@@ -422,18 +518,18 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
             (void)splash::model::readFloatSegment(file, "router");
         },
         "GGUF rows are inconsistent", "GGUF planes were read as a float segment");
-    // A GGUF's F16 and BF16 token rows read as the native rows of their formats.
+    // A GGUF's F16 and BF16 token rows read as their formats' rows as stored.
     for (const auto &[type, format] : {std::pair{splash::model::ggml::kF16, GGUF_FMT_F16},
-                                       std::pair{splash::model::ggml::kBF16, GGUF_FMT_BF16}}) {
-        WeightFile file = loaded(writeGgufTensor(root / ("embedding-" + std::to_string(type) + ".bin"),
-                                                 {.type = type,
-                                                  .outputSize = rows,
-                                                  .inputSize = columns,
-                                                  .plane0Bytes = uint64_t{rows} * columns * 2}));
-        const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
-        file.finish();
-        require(table.blocks().formatId == format, "GGUF 16-bit embedding did not read as its format's rows");
-    }
+                                       std::pair{splash::model::ggml::kBF16, GGUF_FMT_BF16}})
+        for (const uint32_t width : {columns, 160u}) {
+            WeightFile file = loaded(writeGgufTensor(
+                root / ("embedding-" + std::to_string(type) + "-" + std::to_string(width) + ".bin"),
+                {.type = type, .outputSize = rows, .inputSize = width, .plane0Bytes = uint64_t{rows} * width * 2}));
+            const auto table = splash::model::readBlockEmbedding(file, rows, width, "embedding");
+            file.finish();
+            require(table.rows().formatId == format,
+                    "GGUF 16-bit embedding did not read as its format's rows at " + std::to_string(width) + " values");
+        }
     WeightFile file = loaded(embedding);
     const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
     file.finish();
@@ -619,11 +715,10 @@ void testSyntheticModel(MetalBackend &backend,
                         declaredBytes(model.draft.files) - declaredBytes(model.vision.files),
                 "released weights remain in backend accounting");
         // They come back an image at a time, in load order.
-        require(!model.images->restore(splash::test::admitAll, splash::test::admitAll) &&
+        require(!model.images->restore(splash::test::admitAll) &&
                     !model.images->contents()[0].bytes.empty() && model.images->contents()[1].bytes.empty(),
                 "a restore wrote back other than the next image");
-        while (!model.images->restore(splash::test::admitAll, splash::test::admitAll)) {
-        }
+        splash::test::restoreWeights(*model.images);
         const auto restored = model.images->contents();
         require(restored.size() == loaded.size() &&
                     std::equal(restored.begin(), restored.end(), loaded.begin(),
@@ -709,7 +804,7 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
                 segmentFormats(weights.layers[1].upProjection) == std::vector<uint32_t>{format("up_proj")} &&
                 segmentFormats(weights.layers[1].downProjection) == std::vector<uint32_t>{format("down_proj")} &&
                 segmentFormats(weights.logitsProjection) == std::vector<uint32_t>{format("lm_head")} &&
-                weights.tokenEmbedding.blocks().formatId == format("embed_tokens"),
+                weights.tokenEmbedding.rows().formatId == format("embed_tokens"),
             "a block FFN, head or token table did not keep its module's format");
     require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
             "streamableWeights is not what an MLX block target loads");
@@ -746,7 +841,7 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
             "missing source tensor: language_model.lm_head.weight",
             "a checkpoint without language_model.lm_head was accepted");
     unquantized("language_model.model.embed_tokens");
-    require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).tokenEmbedding.blocks().formatId ==
+    require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).tokenEmbedding.rows().formatId ==
                 GGUF_FMT_BF16,
             "a bf16 token table did not load as its bf16 rows");
 }
@@ -790,7 +885,7 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
                 segmentFormats(weights.layers[1].upProjection) == nvfp4 &&
                 segmentFormats(weights.layers[1].downProjection) == nvfp4 &&
                 segmentFormats(weights.logitsProjection) == fp8 &&
-                weights.tokenEmbedding.blocks().formatId == GGUF_FMT_BF16,
+                weights.tokenEmbedding.rows().formatId == GGUF_FMT_BF16,
             "a " + name + " target did not keep its modules' formats and its bf16 token table");
     // Every stored norm weight is zero: 1 + w is 1, the gated norm's w 0.
     const auto first = [](const splash::ops::NormWeights &norm) {
@@ -942,6 +1037,7 @@ int main(int argc, const char *argv[]) {
         TempDirectory temporary;
         testWeightImages(backend, temporary.path());
         testRestoreAdmission(backend, temporary.path());
+        testRestoreWritesEachImageOnItsThread(backend, temporary.path());
         testGgufImageLayout(backend, temporary.path());
         // Block images are repacked by the production library's kernel.
         MetalBackend production(argv[2]);

@@ -6,6 +6,7 @@
 #include "model/ModelFactory.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
+#include "model/WorkFormulas.hpp"
 
 #include "Checked.hpp"
 #include "metal/MetalBackend.hpp"
@@ -57,6 +58,8 @@ struct RuntimeGeometry final {
   // The chunks of a prefill command: a group's for a target whose experts
   // stream or whose K/V spills, otherwise one.
   uint32_t prefillChunks = 1;
+  // Whether the target's experts stream from the SSD.
+  bool streamedExperts = false;
   // The step scratch the target keeps itself beside the arenas.
   QwenTargetScratchBytes targetScratch{};
 
@@ -80,9 +83,10 @@ struct RuntimeGeometry final {
     result.target.stateLayout = model.stateLayout(stateFormat).target;
     result.target.ropeScaling = model.descriptor.ropeScaling;
     if (parts.kv) result.spilledKv = model.descriptor.capabilities.sparseKv;
+    result.streamedExperts = parts.experts;
     if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
-        (parts.kv && (!result.spilledKv || !result.target.kvLayout.spillable())) ||
+        (parts.kv && !result.target.kvLayout.spillable()) ||
         result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
@@ -105,6 +109,75 @@ struct RuntimeGeometry final {
     return maskWordsPerToken(target.vocabularySize);
   }
 };
+
+// What one prefill command of a runtime of `geometry` may hold: its chunks'
+// rows; passes over the target's layers, at most one a layer, or with the
+// Neural Engine's FFN split one, as the split takes a chunk's layers whole
+// (QwenTarget::requirePrefill), and at the rate of its larger commands from
+// the least rows of a chunk the split takes (`aneFfnRows`,
+// ops::AneFfn::minimumRows; 0 without the split); one lane whose rows run
+// past a chunk, as a prefill group passes each lane's state between its
+// parts through its one scratch cell (PrefillArena::groupCell); the history
+// of one lane streamed (KvHistoryStream) where K/V spills, none where it
+// stays in memory; whether its experts stream; and in one attention layer
+// the pairs of a full chunk at the end of the native window.
+[[nodiscard]] inline CommandLimits commandLimits(const RuntimeGeometry &geometry, uint32_t aneFfnRows) noexcept {
+  return {.commandRows = geometry.prefillChunks * kPrefillRows,
+          .layers = geometry.target.layers,
+          .maximumPasses = aneFfnRows ? 1u : geometry.target.layers,
+          .minimumUnitRows = aneFfnRows ? aneFfnRows : 1u,
+          .lanesPastChunk = 1,
+          .indexPageLanes = geometry.spilledKv ? 1u : 0u,
+          .streamsWeights = geometry.streamedExperts,
+          .attentionPairs = denseAttentionPairs(geometry.target.nativeContextTokens - kPrefillRows, kPrefillRows)};
+}
+
+// The attention layers of `target` before its layer `layer`.
+[[nodiscard]] inline uint32_t attentionLayersBefore(const QwenTargetGeometry &target, uint32_t layer) noexcept {
+  uint32_t attention = 0;
+  for (uint32_t before = 0; before < layer; ++before)
+    attention += target.isFullAttentionLayer(before);
+  return attention;
+}
+
+// How far the rows of attention layer `attention` of `target` reach back: a
+// sliding layer's window, the row's own key included (the window's other
+// keys are kv::Layout::windowTokens); a block-sparse target's indexer
+// selection; else every key.
+[[nodiscard]] inline AttentionReach attentionReach(const QwenTargetGeometry &target, uint32_t attention) noexcept {
+  if (const uint32_t window = target.attentionVariant(attention).windowTokens)
+    return {.windowTokens = window + 1};
+  if (target.kvLayout.reads == kv::Reads::SelectedBlocks)
+    return {.denseHistoryTokens = target.indexerTokens(),
+            .selectedTokens = target.indexerTokens(),
+            .blockTokens = target.indexerBlockTokens};
+  return {};
+}
+
+// What a pass from layer `first` with `passesLeft` passes left (passLayers)
+// of a prefill command of `lanes` computes on `target` (Model::prefillWork):
+// each attention layer's pairs over the lanes' rows at its reach, the most of
+// them over every attention layer whatever the pass (a pass does not split a
+// layer), and their sum over the pass's layers. What the pass reads is the
+// runtime's to add.
+[[nodiscard]] inline CommandWork prefillCommandWork(const QwenTargetGeometry &target,
+                                                    std::span<const PrefillLane> lanes, uint32_t first,
+                                                    uint32_t passesLeft) noexcept {
+  const LayerRange run = passLayers(first, passesLeft, target.layers);
+  CommandWork work;
+  for (uint32_t layer = 0, attention = 0; layer < target.layers; ++layer) {
+    if (!target.isFullAttentionLayer(layer))
+      continue;
+    const AttentionReach reach = attentionReach(target, attention++);
+    uint64_t pairs = 0;
+    for (const PrefillLane &lane : lanes)
+      pairs += attentionPairs(reach, lane.position, lane.rows);
+    work.layerAttentionPairs = std::max(work.layerAttentionPairs, pairs);
+    if (layer >= run.first && layer < run.end)
+      work.attentionPairs += pairs;
+  }
+  return work;
+}
 
 template <class T> constexpr uint64_t bytesFor(uint64_t elements) noexcept {
   return elements * sizeof(T);
@@ -152,6 +225,9 @@ enum class PrefillTensor : uint32_t {
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
   LinearPartials,
   LinearCounters,
+  // The int8 prefill tile's codes and scales (ops::LinearScratch::input, sums).
+  LinearTable,
+  LinearSums,
   // The rotated input of a rotated projection (ops::LinearScratch::rotated).
   LinearRotated,
   // A prefill group's scratch GDN cell, which carries the state from a chunk
@@ -403,7 +479,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 // holes; only whole tensor boundaries are aligned.
 [[nodiscard]] uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
                                             const ops::ExecutionPlans &operators);
-// The arena's base, its gate and linear scratch.
+// The arena's base and its gate and linear scratch buffers, each in whole
+// host pages.
 [[nodiscard]] uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
                                         const ops::ExecutionPlans &operators);
 // The arena's and the target's own decode scratch (qwenTargetScratchBytes).
@@ -442,17 +519,15 @@ public:
         batchSlice(DecodeTensor::TargetVocabularyArrivals, kLaneCount);
     std::memset(arrivals.contents(), 0, arrivals.sizeBytes());
 
-    const uint64_t denseScratchBytes = gateScratchBytes(geometry_, operators);
-    if (denseScratchBytes) {
-      gateScratch_ = backend_.allocateBuffer(
-          denseScratchBytes, metal::BufferStorage::Private, "qwen-gate-scratch");
-    }
+    // Each scratch buffer takes whole host pages (decodeArenaBytes).
+    const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {
+      return bytes ? backend_.allocateBuffer(alignUp(bytes), storage, label) : metal::MetalBuffer{};
+    };
+    gateScratch_ = allocate(gateScratchBytes(geometry_, operators), metal::BufferStorage::Private,
+                            "qwen-gate-scratch");
     // Each field exists only when some plan uses it (split-only plans have
     // partials and counters but no activation table).
     const auto linearSize = linearScratchSize(geometry_, operators);
-    const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {
-      return bytes ? backend_.allocateBuffer(bytes, storage, label) : metal::MetalBuffer{};
-    };
     linearScratch_.input = allocate(linearSize.input, metal::BufferStorage::Private, "linear-input");
     linearScratch_.sums = allocate(linearSize.sums, metal::BufferStorage::Private, "linear-sums");
     linearScratch_.partials =

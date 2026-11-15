@@ -13,8 +13,9 @@ from pathlib import Path
 from unittest import mock
 
 import httpx
-from huggingface_hub.errors import IncompleteSnapshotError
+from huggingface_hub.errors import IncompleteSnapshotError, RepositoryNotFoundError
 
+from dev.tests.install.test_cached import vision_target
 from dev.tests.installer_fixtures import (
     CONFIGS,
     DENSE,
@@ -24,15 +25,21 @@ from dev.tests.installer_fixtures import (
     MOE,
     PROCESSOR,
     FakeHub,
+    blob_bytes,
     cached_snapshot,
     draft_dir,
     fake_hub,
     family_config,
+    fixture,
     http_error,
     listing,
+    missing_repository,
+    missing_revision,
     mlx_target,
     pins,
     selection,
+    tensor_table,
+    write_target,
 )
 from install import assembly, families, hub, models, paths, upstream
 
@@ -62,7 +69,7 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_every_family_names_its_own_draft_repository(self):
-        repos = [family.draft_repo for family in families.FAMILIES if family.draft_repo]
+        repos = [family.draft_repo for family in families.FAMILIES]
         for repo in repos:
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
@@ -83,14 +90,23 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
-        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config and
-        # metadata the installer derives from it name the family, with and
+
+        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config the
+        # installer derives from it and its header name the family, with and
         # without its draft (Flint's flat config, its release's keys, and a
         # test draft naming one of its reserved tokens as its mask), and
         # another family's draft is refused.
+        def headers(family):
+            directory = self.root / family.name / "target"
+            directory.mkdir(parents=True, exist_ok=True)
+            write_target(
+                directory / "model.gguf", fixture(family=family), tensor_table(family)
+            )
+            return {"gguf_headers": directory}
+
         for family in GGUF_ONLY:
             configs = CONFIGS / family.name.lower()
-            gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}
+            gguf_check = headers(family)
             for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
                 self.assertIs(
                     upstream.check_model(
@@ -104,7 +120,7 @@ class UpstreamTest(unittest.TestCase):
                 )
         flash = families.named("Qwen3.8-Flash-Next")
         configs = CONFIGS / flash.name.lower()
-        gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}
+        gguf_check = headers(flash)
         with self.assertRaisesRegex(
             models.ModelError, "draft config hidden_size mismatch: checkpoint 5120"
         ):
@@ -208,12 +224,34 @@ class UpstreamTest(unittest.TestCase):
             upstream.select_gguf(files, "Q4_K_M"),
             (["Qwen3.8-27B-UD-Q4_K_M.gguf"], True),
         )
+        # The one file ending so is the only target :VARIANT selects: an MTP
+        # head's folder is none.
+        self.assertEqual(
+            upstream.select_gguf(
+                {"Qwen3.8-27B-UD-Q4_K_M.gguf", "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"},
+                "Q4_K_M",
+            ),
+            (["Qwen3.8-27B-UD-Q4_K_M.gguf"], False),
+        )
+        # A refusal lists the targets :VARIANT selects: a folder that holds a
+        # whole split GGUF, not an incomplete one, nor an MTP head's folder,
+        # which :MTP cannot select.
         with self.assertRaisesRegex(
             models.ModelError,
-            "no single GGUF matches :Q4_K_M .*Qwen3.8-27B-UD-Q4_K_M.gguf, "
-            "Qwen3.8-27B-XL-Q4_K_M.gguf",
+            "no single GGUF matches :Q4_K_M .*Qwen3.8-27B-UD-Q4_K_M, "
+            r"Qwen3.8-27B-XL-Q4_K_M\)$",
         ):
             upstream.select_gguf(files | {"Qwen3.8-27B-XL-Q4_K_M.gguf"}, "Q4_K_M")
+        with self.assertRaisesRegex(
+            models.ModelError,
+            "^no single GGUF matches :IQ2_XXS .*Qwen3.8-27B-UD-Q4_K_M, "
+            r"BF16 \(split, 2 parts\)\)$",
+        ):
+            upstream.select_gguf(
+                files | {"BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf"}, "IQ2_XXS"
+            )
+        with self.assertRaisesRegex(models.ModelError, "is not one part of"):
+            upstream.select_gguf(files, "MTP")
         # A projector is never a target, however its publisher names it.
         self.assertEqual(
             upstream.select_gguf({"Model-PQ2_0.gguf", "Model-mmproj-BF16.gguf"}, None),
@@ -235,15 +273,46 @@ class UpstreamTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(models.ModelError, "incomplete"):
             upstream.select_gguf(files, "BF16")
+        # The folder :VARIANT names exactly wins over a root name that only
+        # ends in -VARIANT, beside one root name or several; a choice by that
+        # ending among several targets, folders included, is reported.
+        folder = [f"Q4_K_M/Qwen3.8-27B-Q4_K_M-0000{n}-of-00002.gguf" for n in (1, 2)]
+        for repository in (files | {*folder}, {"Qwen3.8-27B-UD-Q4_K_M.gguf", *folder}):
+            with self.subTest(files=sorted(repository)):
+                self.assertEqual(
+                    upstream.select_gguf(repository, "Q4_K_M"), (folder, False)
+                )
+        bf16 = [f"BF16/Qwen3.8-27B-BF16-0000{n}-of-00002.gguf" for n in (1, 2)]
+        self.assertEqual(
+            upstream.select_gguf({"Qwen3.8-27B-UD-Q4_K_M.gguf", *bf16}, "Q4_K_M"),
+            (["Qwen3.8-27B-UD-Q4_K_M.gguf"], True),
+        )
         # Two files of one part number are not one GGUF's parts.
         parts = {
             "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
-            "BF16/Qwen3.8-27B-BF16-copy-00001-of-00002.gguf",
+            "BF16/Qwen3.8-27B-BF16-00001-of-00003.gguf",
         }
         with self.assertRaisesRegex(
             models.ModelError, "are both part 1 of the split GGUF in BF16/"
         ):
             upstream.select_gguf(files | parts, "BF16")
+        # Nor are the parts of several names, in whichever order their names
+        # and numbers sort; the engine refuses them alike (findTargetGgufs).
+        for first, second in (("A", "B"), ("B", "A")):
+            parts = {
+                f"BF16/{first}-00001-of-00002.gguf",
+                f"BF16/{second}-00002-of-00002.gguf",
+            }
+            with (
+                self.subTest(parts=sorted(parts)),
+                self.assertRaisesRegex(
+                    models.ModelError,
+                    "^the split GGUF in BF16/ mixes the parts of several split "
+                    r"GGUFs \(A, B\); a split GGUF is the parts of one name, "
+                    r"NAME-0000K-of-0000N\.gguf$",
+                ),
+            ):
+                upstream.select_gguf(parts, "BF16")
         # A repository of one GGUF has no shared name to strip, and needs no
         # variant.
         for variant in ("UD-Q4_K_M", "Q4_K_M", None):
@@ -254,16 +323,94 @@ class UpstreamTest(unittest.TestCase):
         for variant in (None, "Q4", "missing"):
             with (
                 self.subTest(variant=variant),
-                self.assertRaisesRegex(models.ModelError, "Qwen3.8-27B-Q8_0.gguf"),
+                self.assertRaisesRegex(models.ModelError, "Qwen3.8-27B-Q8_0, "),
             ):
                 upstream.select_gguf(files, variant)
         # The native loader finds a target by its .gguf extension alone.
         for variant in ("Q4_K_M", None):
             with (
                 self.subTest(variant=variant),
-                self.assertRaisesRegex(models.ModelError, "repository root: none"),
+                self.assertRaisesRegex(models.ModelError, r"\(GGUF targets: none\)$"),
             ):
                 upstream.select_gguf({"Qwen3.8-27B-Q4_K_M.GGUF"}, variant)
+        # A refusal lists the folder targets too, which are all of a
+        # repository that keeps every variant in a folder.
+        iq3 = [f"IQ3_S/Model-IQ3_S-0000{n}-of-00002.gguf" for n in (1, 2)]
+        folders = {*iq3, "IQ3_S/mmproj-F16.gguf", "mmproj-F16.gguf", "README.md"}
+        self.assertEqual(upstream.select_gguf(folders, "IQ3_S"), (iq3, False))
+        for variant, choice in (
+            ("Q2_0", "no single GGUF matches :Q2_0"),
+            (None, "select a GGUF with OWNER/REPO:VARIANT"),
+        ):
+            with (
+                self.subTest(variant=variant),
+                self.assertRaisesRegex(
+                    models.ModelError,
+                    f"^{re.escape(choice)} "
+                    r"\(GGUF targets: IQ3_S \(split, 2 parts\)\)$",
+                ),
+            ):
+                upstream.select_gguf(folders, variant)
+
+    def test_a_root_split_gguf_is_one_target(self):
+        parts = [f"Model-Q1_0-0000{n}-of-00003.gguf" for n in (1, 2, 3)]
+        files = {*parts, "mmproj-BF16.gguf", "README.md"}
+        whole = "Model-Q4_K_M.gguf"
+        # Its parts are one target, named by its model's name or not at all.
+        for repository, variant in (
+            (files, None),
+            (files, "Q1_0"),
+            (files | {whole}, "Q1_0"),
+        ):
+            with self.subTest(files=sorted(repository), variant=variant):
+                self.assertEqual(
+                    upstream.select_gguf(repository, variant), (parts, False)
+                )
+        # Several targets are refused by their names, not their files; a
+        # split GGUF's name says so.
+        with self.assertRaisesRegex(
+            models.ModelError,
+            "select a GGUF with OWNER/REPO:VARIANT "
+            r"\(GGUF targets: Model-Q1_0 \(split, 3 parts\), "
+            r"Model-Q4_K_M\)",
+        ):
+            upstream.select_gguf(files | {whole}, None)
+        one = "Model-Q2_0-00001-of-00001.gguf"
+        with self.assertRaisesRegex(
+            models.ModelError, r"Model-Q2_0 \(split, 1 part\), Model-Q4_K_M\)"
+        ):
+            upstream.select_gguf({one, whole}, None)
+        # Every part of the selected target must be there; a target selected
+        # beside an incomplete one is whole.
+        incomplete = files - {parts[1]}
+        with self.assertRaisesRegex(
+            models.ModelError,
+            f"the split GGUF Model-Q1_0 is incomplete: {parts[0]}, {parts[2]}",
+        ):
+            upstream.select_gguf(incomplete, None)
+        self.assertEqual(
+            upstream.select_gguf(incomplete | {whole}, "Q4_K_M"), ([whole], False)
+        )
+        # A whole file of the model beside its parts, such as their merge, is
+        # a target of its own, which its name selects before the parts, by
+        # :VARIANT or as the only name without one. Both are of one name, so
+        # beside no other name it is no choice by its ending to report.
+        merge = "Model-Q1_0.gguf"
+        for repository, variant in (
+            (files | {merge}, "Q1_0"),
+            (files | {merge}, None),
+            (files | {merge, whole}, "Q1_0"),
+        ):
+            with self.subTest(files=sorted(repository), variant=variant):
+                self.assertEqual(
+                    upstream.select_gguf(repository, variant), ([merge], False)
+                )
+        with self.assertRaisesRegex(
+            models.ModelError,
+            r"\(GGUF targets: Model-Q1_0, "
+            r"Model-Q1_0 \(split, 3 parts\), Model-Q4_K_M\)",
+        ):
+            upstream.select_gguf(files | {merge, whole}, None)
 
     def test_architecture_is_checked_before_weight_downloads(self):
         # Another architecture, and fine-tunes of a supported one the engine
@@ -731,9 +878,11 @@ class UpstreamTest(unittest.TestCase):
             self.assertEqual(
                 (chosen.link / "tokenizer" / name).readlink(), snapshot / name
             )
-        # The paths the native loaders and the tokenizer read (assembly.py).
-        for name in ("config.json", "target/config.json", "tokenizer/config.json"):
+        # The paths the native loaders and the tokenizer read (assembly.py),
+        # and no other copy of the configuration.
+        for name in ("config.json", "tokenizer/config.json"):
             self.assertEqual((chosen.link / name).readlink(), snapshot / "config.json")
+        self.assertFalse((chosen.link / "target/config.json").exists())
         self.assertEqual(
             (chosen.link / "draft/model.safetensors").read_bytes(), b"draft"
         )
@@ -766,11 +915,11 @@ class UpstreamTest(unittest.TestCase):
         self.assertFalse((chosen.link / "processor").exists())
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "vision").iterdir()),
-            ["config.json", "model-00001-of-00002.safetensors"],
+            ["model-00001-of-00002.safetensors"],
         )
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "target").iterdir()),
-            ["config.json", *sorted(set(shards.values()))],
+            sorted(set(shards.values())),
         )
         # A checkpoint without the tower cannot serve images, nor can a
         # text-only conversion that keeps the processor but drops the tower's
@@ -874,11 +1023,7 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(chosen)
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "target").iterdir()),
-            [
-                "config.json",
-                "model-00001-of-00002.safetensors",
-                "model-00002-of-00002.safetensors",
-            ],
+            ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
         )
         self.assertNotIn(f"{MODEL}/optiq/optiq_vision.safetensors", fake.downloads)
 
@@ -955,7 +1100,7 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(chosen)
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "vision").iterdir()),
-            ["config.json", "model.safetensors"],
+            ["model.safetensors"],
         )
         fake.publish(
             "someone/text", "c" * 40, checkpoint(["language_model.lm_head.weight"])
@@ -991,7 +1136,8 @@ class UpstreamTest(unittest.TestCase):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
         output, _ = self.prepare(chosen)
-        self.assertIn("Fetching 4 file(s), 0.00 GB, from " + MODEL, output)
+        # config.json downloaded first, for the inspection.
+        self.assertIn("Fetching 3 file(s), 0.00 GB, from " + MODEL, output)
         old = chosen.link.resolve()
         fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
         fake.requests.clear(), fake.downloads.clear()
@@ -1047,6 +1193,50 @@ class UpstreamTest(unittest.TestCase):
         )
         assembly.verify(chosen.link)
 
+    def test_collection_removes_only_the_directories_installations_write(self):
+        # Finder leaves a .DS_Store in each folder it shows.
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        first = chosen.link.resolve()
+        others = [
+            chosen.models_root / ".resolved/.DS_Store",
+            chosen.models_root / ".metadata/.DS_Store",
+        ]
+        for path in others:
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(b"\0\0\0\1Bud1")
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        _, warnings = self.prepare(chosen)
+        self.assertEqual(warnings, "")
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["target"]["revision"], "b" * 40
+        )
+        self.assertFalse(first.exists())
+        self.assertTrue(all(path.is_file() for path in others))
+
+    def test_what_collection_cannot_remove_leaves_the_update_published(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        # An assembly nothing uses, with a folder this account cannot write.
+        locked = chosen.models_root / ".resolved" / ("0" * 64) / "locked"
+        locked.mkdir(parents=True)
+        (locked / "file").write_bytes(b"")
+        locked.chmod(0o555)
+        self.addCleanup(locked.chmod, 0o755)
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        _, warnings = self.prepare(chosen)
+        self.assertRegex(
+            warnings,
+            "^Warning: could not remove what no installation uses: .*"
+            + re.escape(str(locked)),
+        )
+        self.assertNotIn("keeping the installed", warnings)
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["target"]["revision"], "b" * 40
+        )
+
     def test_unreachable_hub_starts_the_installed_assembly(self):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
@@ -1076,14 +1266,52 @@ class UpstreamTest(unittest.TestCase):
                 self.assertEqual(fake.requests, [(MODEL, None)])
 
     def test_unreachable_hub_without_an_installation_is_the_error(self):
+        """Classed as the Hub's failure is, which the app words: no such
+        repository, which the Hub answers with 401 when anonymous, or no
+        connection; a revision the repository lacks is named by the
+        message."""
         fake = fake_hub(self, self.cache)
-        fake.failure = http_error(404)
+        missing = RepositoryNotFoundError(
+            "401 Client Error. Repository Not Found", response=http_error(401).response
+        )
+        offline = httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        for failure, kind in (
+            (missing_repository(), "not_found"),
+            (missing, "not_found"),
+            (missing_revision(), None),
+            (offline, "offline"),
+        ):
+            fake.failure = failure
+            reason = re.escape(hub.reason(failure))
+            with self.subTest(failure=failure):
+                with self.assertRaisesRegex(
+                    models.ModelError,
+                    f"cannot resolve someone/other: {reason}; neither this "
+                    "installation nor the Hub cache records a commit for the "
+                    "default branch",
+                ) as raised:
+                    self.prepare(selection(self.root, "someone/other"))
+                self.assertEqual(raised.exception.kind, kind)
+
+    def test_a_draft_the_cache_lacks_fails_as_the_hub_did_for_the_target(self):
+        """Offline, a target the Hub cache holds as `hf download` leaves it
+        installs without the Hub; the draft the cache lacks fails classed as
+        the target's request did, with no request of its own."""
+        fake = fake_hub(self, self.cache)
+        cached_snapshot(self.cache, MODEL, "a" * 40, lambda p: mlx_target(p, DENSE))
+        refs = self.cache / hub.folder_name(MODEL) / "refs"
+        refs.mkdir()
+        (refs / "main").write_text("a" * 40)
+        fake.failure = httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        reason = re.escape(hub.reason(fake.failure))
         with self.assertRaisesRegex(
             models.ModelError,
-            "cannot resolve someone/other: 404 Client Error.*; neither this "
+            f"cannot resolve {DENSE.draft_repo}: {reason}; neither this "
             "installation nor the Hub cache records a commit for the default branch",
-        ):
-            self.prepare(selection(self.root, "someone/other"))
+        ) as raised:
+            self.prepare(selection(self.root))
+        self.assertEqual(raised.exception.kind, "offline")
+        self.assertEqual(fake.requests, [(MODEL, None)])
 
     def test_commit_and_offline_selections_make_no_request(self):
         fake = fake_hub(self, self.cache)
@@ -1347,25 +1575,53 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(pins(self.cache), installed)
         self.assertEqual(list(moved.iterdir()), [])
 
-    def test_a_moved_hub_cache_keeps_the_installation_an_update_needs(self):
+    def test_a_moved_hub_cache_updates_the_installation_from_its_links(self):
+        # An update assembles the installed target again from the snapshot
+        # the installation links, wherever HF_HUB_CACHE points now.
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
         self.prepare(chosen)
-        installed = chosen.link.resolve()
         moved = self.root / "moved"
         moved.mkdir()
         fake.publish(DENSE.draft_repo, "e" * 40, lambda p: draft_dir(p, DENSE))
         fake.downloads.clear()
         with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(moved)):
-            _, warnings = self.prepare(chosen)
+            output, warnings = self.prepare(chosen)
         self.assertIn(
-            f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot update it "
-            f"({DENSE.draft_repo} moved from {DRAFT_COMMIT[:12]} to {'e' * 12}): "
-            f"the Hub cache has no snapshot {'a' * 40} of {MODEL}",
-            warnings,
+            f"{DENSE.draft_repo} moved from {DRAFT_COMMIT[:12]} to {'e' * 12}", output
         )
-        self.assertEqual(chosen.link.resolve(), installed)
-        self.assertEqual(fake.downloads, [])
+        self.assertEqual(warnings, "")
+        record = assembly.verify(chosen.link)
+        self.assertEqual(record["sources"]["draft"]["revision"], "e" * 40)
+        self.assertEqual(
+            record["files"]["config.json"]["path"],
+            str(fake.snapshot(MODEL, "a" * 40) / "config.json"),
+        )
+        # Only the new draft is fetched.
+        self.assertTrue(
+            all(name.startswith(DENSE.draft_repo + "/") for name in fake.downloads)
+        )
+        self.assertEqual(list(moved.iterdir()), [])
+
+    def test_a_moved_hub_cache_keeps_the_installed_draft_from_its_links(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        moved = self.root / "moved"
+        moved.mkdir()
+        fake.publish(DENSE.draft_repo, "e" * 40, lambda p: draft_dir(p, DENSE))
+        fake.download_failure = OSError(errno.ECONNRESET, "connection reset by peer")
+        with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(moved)):
+            _, warnings = self.prepare(chosen)
+        self.assertEqual(
+            warnings,
+            f"Warning: cannot use the {DENSE.name} draft {DENSE.draft_repo}@"
+            f"{'e' * 12}; keeping the installed one: cannot fetch the {DENSE.name} "
+            f"draft: [Errno {errno.ECONNRESET}] connection reset by peer\n",
+        )
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["draft"]["revision"], DRAFT_COMMIT
+        )
         self.assertEqual(list(moved.iterdir()), [])
 
     def test_an_incompatible_draft_is_an_error_not_a_crash(self):
@@ -1400,6 +1656,333 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(
             assembly.verify(chosen.link)["sources"]["target"]["revision"], "b" * 40
         )
+
+    @staticmethod
+    def remove(chosen):
+        """upstream.remove's bytes freed, its output kept quiet."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            return upstream.remove(chosen)
+
+    def run_installer(self, *arguments):
+        """models.main's status, JSON events and warnings, for arguments after
+        the models root and MODEL, text only."""
+        argv = ["--models", str(self.root / "models"), "--model", MODEL]
+        with (
+            mock.patch.object(hub, "json_progress", False),
+            mock.patch("huggingface_hub.utils.disable_progress_bars"),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()) as warnings,
+        ):
+            status = models.main([*argv, "--language-only", *arguments])
+        events = [
+            json.loads(line)
+            for line in output.getvalue().splitlines()
+            if line.startswith("{")
+        ]
+        return status, events, warnings.getvalue()
+
+    def test_remove_frees_the_files_only_its_installation_used(self):
+        # Two models of one family share its draft: removing one leaves the
+        # other and the draft whole, freeing its own files and folder; the
+        # last one takes the draft with it.
+        fake = fake_hub(self, self.cache)
+        other = "mlx-community/Qwen3.8-27B-8bit"
+        fake.publish(other, "c" * 40, lambda p: mlx_target(p, DENSE))
+        first, second = selection(self.root), selection(self.root, other)
+        self.prepare(first)
+        self.prepare(second)
+        target = self.cache / hub.folder_name(MODEL)
+        size = blob_bytes(self.cache, MODEL)
+        self.assertEqual(self.remove(first), size)
+        self.assertFalse(first.link.is_symlink() or target.exists())
+        verified = assembly.verify(second.link)
+        self.assertEqual(verified["sources"]["target"]["repo"], other)
+        self.assertEqual(pins(self.cache), sorted(["c" * 40, DRAFT_COMMIT]))
+        size = blob_bytes(self.cache)
+        self.assertEqual(self.remove(second), size)
+        self.assertEqual(pins(self.cache), [])
+        self.assertEqual(list(self.cache.iterdir()), [])
+        self.assertEqual(list((self.root / "models" / ".resolved").glob("*")), [])
+        with self.assertRaisesRegex(models.ModelError, "is not installed"):
+            self.remove(first)
+
+    def test_remove_keeps_the_files_its_installation_never_linked(self):
+        # The snapshot holds a file another tool downloaded, or an install
+        # of another file under way, and the repository a blob no snapshot
+        # names and a download's partial file: none was the model's, so all
+        # stay, with the folders holding them; the model's own files go.
+        fake = fake_hub(self, self.cache)
+        fake.publish(
+            MODEL,
+            "a" * 40,
+            lambda p: (mlx_target(p, DENSE) / "README.md").write_text("notes"),
+        )
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        size = blob_bytes(self.cache)
+        snapshot = fake.snapshot(MODEL, "a" * 40)
+        readme = Path(fake.hf_hub_download(MODEL, "README.md", revision="a" * 40))
+        blobs = self.cache / hub.folder_name(MODEL) / "blobs"
+        orphan, partial = blobs / ("e" * 40), blobs / f"{'f' * 64}.0123abcd.incomplete"
+        orphan.write_bytes(b"orphan")
+        partial.write_bytes(b"partial")
+        self.assertEqual(self.remove(chosen), size)
+        self.assertEqual(listing(snapshot), ["README.md"])
+        self.assertEqual(readme.read_text(), "notes")
+        self.assertEqual(
+            sorted(blob.name for blob in blobs.iterdir()),
+            sorted([readme.resolve().name, orphan.name, partial.name]),
+        )
+
+    def test_an_update_leaves_the_files_it_shares_to_the_delete(self):
+        # A commit that changed only its README shares every blob with the
+        # one installed: the update removes the old snapshot's files and
+        # keeps the blobs, which the new one names, and a Delete then frees
+        # them all.
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        size = blob_bytes(self.cache, MODEL)
+        fake.publish(
+            MODEL,
+            "b" * 40,
+            lambda p: (mlx_target(p, DENSE) / "README.md").write_text("notes"),
+        )
+        self.prepare(chosen)
+        self.assertFalse(fake.snapshot(MODEL, "a" * 40).exists())
+        self.assertEqual(blob_bytes(self.cache, MODEL), size)
+        size = blob_bytes(self.cache)
+        self.assertEqual(self.remove(chosen), size)
+        self.assertEqual(list(self.cache.iterdir()), [])
+
+    def test_remove_keeps_what_a_server_or_another_models_root_holds(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        # A server holds it: refused, and left whole.
+        _, held = assembly.hold(chosen.link)
+        with self.assertRaisesRegex(models.ModelError, "is being served"):
+            self.remove(chosen)
+        held.close()
+        assembly.verify(chosen.link)
+        # An installation of another models root pins its snapshot: its
+        # files stay; the draft's, which nothing else pins, go.
+        snapshot = next((self.cache / hub.folder_name(MODEL) / "snapshots").iterdir())
+        elsewhere = hub.pinned(snapshot, self.root / "elsewhere" / "models" / MODEL)
+        elsewhere.parent.mkdir(parents=True)
+        elsewhere.write_text(snapshot.name)
+        draft = self.cache / hub.folder_name(DENSE.draft_repo)
+        size = blob_bytes(self.cache, DENSE.draft_repo)
+        self.assertEqual(self.remove(chosen), size)
+        self.assertTrue(any(snapshot.iterdir()))
+        self.assertFalse(draft.exists())
+
+    def test_removing_a_model_takes_its_other_selections(self):
+        # A start with Text only has a selection of its own, which the app's
+        # list does not show: its weights would stay with nothing to delete
+        # them. A selection named with its options goes alone.
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "d" * 40, vision_target)
+        plain = selection(self.root, language_only=False)
+        text_only = selection(self.root)
+        self.prepare(plain)
+        self.prepare(text_only)
+        self.remove(text_only)
+        self.assertTrue(plain.link.is_symlink())
+        self.assertFalse(text_only.link.is_symlink())
+        self.prepare(text_only)
+        self.assertGreater(self.remove(plain), 0)
+        self.assertFalse(plain.link.is_symlink() or text_only.link.is_symlink())
+        snapshot = fake.snapshot(MODEL, "d" * 40)
+        self.assertEqual(list(snapshot.glob("*.safetensors")), [])
+
+    def test_removing_a_model_is_refused_while_a_server_holds_any_selection(self):
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "d" * 40, vision_target)
+        plain = selection(self.root, language_only=False)
+        text_only = selection(self.root)
+        self.prepare(plain)
+        self.prepare(text_only)
+        _, server = assembly.hold(text_only.link)
+        self.addCleanup(server.close)
+        with self.assertRaisesRegex(models.ModelError, "is being served"):
+            self.remove(plain)
+        self.assertTrue(plain.link.is_symlink() and text_only.link.is_symlink())
+
+    def test_an_update_frees_the_earlier_commits_files_only_it_fetched(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        earlier = fake.snapshot(MODEL, "a" * 40)
+        self.assertTrue(earlier.exists())
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(chosen)
+        self.assertFalse(earlier.exists())
+
+    def test_an_update_leaves_whole_a_snapshot_another_tool_added_to(self):
+        # A file no assembly links says another tool downloaded this commit
+        # too, and nobody asked for its files to go, as a deletion does.
+        fake = fake_hub(self, self.cache)
+        fake.publish(
+            MODEL,
+            "a" * 40,
+            lambda p: (mlx_target(p, DENSE) / "README.md").write_text("notes"),
+        )
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        fake.hf_hub_download(MODEL, "README.md", revision="a" * 40)
+        earlier = fake.snapshot(MODEL, "a" * 40)
+        files = sorted(p.name for p in earlier.iterdir())
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(chosen)
+        self.assertEqual(sorted(p.name for p in earlier.iterdir()), files)
+
+    def test_a_commit_removed_leaves_no_reference_to_it(self):
+        # The Hub's cache scan refuses a repository with a reference to a
+        # missing commit, which would hide the commit that stays.
+        fake = fake_hub(self, self.cache)
+        fake.publish(
+            MODEL,
+            "a" * 40,
+            lambda p: (mlx_target(p, DENSE) / "README.md").write_text("notes"),
+        )
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        fake.hf_hub_download(MODEL, "README.md", revision="a" * 40)
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(chosen)
+        main = self.cache / hub.folder_name(MODEL) / "refs" / "main"
+        main.parent.mkdir(parents=True, exist_ok=True)
+        main.write_text("b" * 40)
+        self.remove(chosen)
+        self.assertFalse(main.exists())
+        self.assertTrue(fake.snapshot(MODEL, "a" * 40).exists())
+
+    def test_a_repository_folder_keeps_what_the_hub_did_not_put_there(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        folder = self.cache / hub.folder_name(MODEL)
+        (folder / "notes.md").write_text("mine")
+        self.remove(chosen)
+        self.assertEqual([p.name for p in folder.iterdir()], ["notes.md"])
+
+    def test_a_record_that_cannot_be_read_frees_nothing(self):
+        # It may link any file, which a rebuild without the Hub would need.
+        fake = fake_hub(self, self.cache)
+        other = "mlx-community/Qwen3.8-27B-8bit"
+        fake.publish(other, "c" * 40, lambda p: mlx_target(p, DENSE))
+        first, second = selection(self.root), selection(self.root, other)
+        self.prepare(first)
+        self.prepare(second)
+        size = blob_bytes(self.cache, MODEL)
+        record = second.link.resolve() / "model.json"
+        record.chmod(0o644)
+        record.write_text("{")
+        self.assertEqual(self.remove(first), 0)
+        self.assertEqual(blob_bytes(self.cache, MODEL), size)
+
+    def test_a_recorded_path_that_climbs_out_of_its_snapshot_is_never_freed(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        record = assembly.recorded(chosen.link)
+        name = next(n for n, e in record["files"].items() if "/snapshots/" in e["path"])
+        snapshot = fake.snapshot(MODEL, "a" * 40)
+        record["files"][name]["path"] = str(snapshot / ".." / ".." / ".." / "outside")
+        self.assertNotIn(
+            Path(record["files"][name]["path"]), assembly._hub_entries(record)
+        )
+        # A `..` before the snapshot is the cache's own, as HF_HOME may have.
+        self.assertTrue(
+            assembly._stays_in_its_snapshot(
+                "/x/../hub/models--a--b/snapshots/" + "a" * 40 + "/file"
+            )
+        )
+
+    def test_finders_file_is_no_sign_of_another_tool(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        earlier = fake.snapshot(MODEL, "a" * 40)
+        (earlier / ".DS_Store").write_bytes(b"finder")
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(chosen)
+        self.assertEqual([p.name for p in earlier.iterdir()], [".DS_Store"])
+
+    def test_a_removal_cut_short_can_be_asked_for_again(self):
+        # The named link goes last: it is what a second removal finds.
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "d" * 40, vision_target)
+        plain = selection(self.root, language_only=False)
+        text_only = selection(self.root)
+        self.prepare(plain)
+        self.prepare(text_only)
+        self.assertEqual(upstream._selections_of(plain), [text_only.link, plain.link])
+
+    def test_the_remove_command_reports_the_bytes_freed(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        size = blob_bytes(self.cache)
+        self.assertEqual(
+            self.run_installer("remove"), (0, [{"event": "removed", "bytes": size}], "")
+        )
+        status, events, _ = self.run_installer("remove")
+        self.assertEqual((status, [event["event"] for event in events]), (1, ["error"]))
+
+    def test_a_removal_that_cannot_free_a_file_still_removes_the_model(self):
+        # The target's snapshot cannot be written: the model is removed all
+        # the same, with a warning, and the bytes freed are the draft's.
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        snapshot = next((self.cache / hub.folder_name(MODEL) / "snapshots").iterdir())
+        snapshot.chmod(0o555)
+        self.addCleanup(snapshot.chmod, 0o755)
+        size = blob_bytes(self.cache, DENSE.draft_repo)
+        status, events, warnings = self.run_installer("remove")
+        self.assertEqual((status, events), (0, [{"event": "removed", "bytes": size}]))
+        self.assertRegex(
+            warnings,
+            "^Warning: could not remove what no installation uses: .*"
+            + re.escape(str(snapshot)),
+        )
+        self.assertFalse(chosen.link.is_symlink())
+        self.assertEqual(list((self.root / "models" / ".resolved").glob("*")), [])
+        status, events, _ = self.run_installer("remove")
+        self.assertEqual(
+            events[0]["message"],
+            f"{MODEL} is not installed in {(self.root / 'models').resolve()}",
+        )
+
+    def test_prepare_reports_what_it_did_last(self):
+        # The app words a check for updates by it: installed or updated, up
+        # to date, unable to check (the Hub unreachable, or not asked), or
+        # unable to install what moved on and keeping the installed one.
+        fake = fake_hub(self, self.cache)
+
+        def outcome():
+            status, events, _ = self.run_installer("prepare", "--json-progress")
+            self.assertEqual(status, 0)
+            self.assertEqual(events[-1]["event"], "prepared")
+            return events[-1]["outcome"]
+
+        self.assertEqual(outcome(), "updated")
+        self.assertEqual(outcome(), "up_to_date")
+        fake.failure = httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        self.assertEqual(outcome(), "unreachable")
+        fake.failure = None
+        with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
+            self.assertEqual(outcome(), "unreachable")
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        fake.download_failure = httpx.ReadTimeout("timed out")
+        self.assertEqual(outcome(), "kept")
+        fake.download_failure = None
+        self.assertEqual(outcome(), "updated")
+        # Without JSON progress, none.
+        status, events, _ = self.run_installer("prepare")
+        self.assertEqual((status, events), (0, []))
 
     def test_pins_are_required_before_publishing(self):
         fake_hub(self, self.cache)
