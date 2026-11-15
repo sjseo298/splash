@@ -63,10 +63,9 @@ One package, relative imports only. Responsibilities by module:
 | `protocol.py` | encodes client frames, decodes engine events (`runtime/engine/Protocol.*` does the reverse) |
 | `output.py` | incremental parser for generated text; one parser serves streamed and complete responses |
 | `constraints.py` | compiles token constraints (grammar masks for structured output and tool calls) |
-| `judgments.py` | finite-choice prompts, validation, typed answer math |
-| `api_shapes.py` | response shapes: OpenAI Chat/Completions/Responses, Anthropic Messages |
+| `dialects/` | protocol-specific request/response shapes (`openai.py`, `anthropic.py`, `responses.py`) and finite-choice scoring (`scoring.py`) |
 | `thinking.py`, `tokenization.py`, `images.py`, `documents.py`, `document_worker.py` | reasoning budgets, tokenizer access, image and PDF input |
-| `latency.py`, `metrics.py`, `lru.py`, `origins.py`, `http_security.py`, `crash_trace.py`, `diagnostics.py`, `schema_validation.py`, `tool_schema.py`, `json_codec.py` | request latency tracking, `/metrics`, response cache, CORS and security, crash tracing, status display, JSON Schema validation, tool-call policy |
+| `latency.py`, `metrics.py`, `lru.py`, `origins.py`, `http_security.py`, `crash_trace.py`, `diagnostics.py`, `schema_validation.py`, `tool_schema.py`, `json_codec.py`, `serve_record.py`, `supervision.py`, `chat_messages.py` | request latency tracking, `/metrics`, response cache, CORS and security, crash tracing, status display, JSON Schema validation, tool-call policy, serve-record/supervision |
 | `serve_options.py` | the options `splash serve` shares with the server; stdlib-only so the launcher can parse them before `.venv` exists |
 
 The server binds localhost without authentication by default; LAN access,
@@ -104,9 +103,10 @@ depends on test code.
   resource waits with bounded backoff.
 - `Scheduler`, `KvCache`, `KvPool`, `KvPageTier`, `KvTier` — paged KV cache
   (INT8 by default, BF16 optional) with page-level residency and extents.
-- `MemoryGovernor`, `MemoryPlan`, `MemoryControl`, `MemoryAudit`,
-  `ReleasableMemory`, `ThermalState` — automatic memory planning, host
-  growth admission, idle release (default: release after 10 minutes),
+- `MemoryGovernor`, `MemoryLedger`, `MemoryPlan`, `StreamedMemoryPlan`,
+  `MemoryControl`, `MemoryAudit`, `ReleasableMemory`, `ThermalState` — automatic
+  memory planning, claim-scoped `MemoryLedger` + `HostRule` admission, elastic
+  pool growth/reclaim, idle release (default: release after 10 minutes),
   reclaim under pressure, thermal throttling.
 - `Cache`, `CacheDirectory`, `WriteBehind`, `DiskSpace`, `DiskLabels`,
   `RecencyOrder`, `StateCache` — the SSD tier: write-behind of KV and
@@ -131,7 +131,7 @@ depends on test code.
   installation's `model.json`.
 - Execution: `Runtime` runs a prepared step; the per-family code in
   `runtime/model` (`Qwen3_8`, `Qwen3_6Moe`, upstream's `Qwen4Exp`/`Qwen4Steps`
-  and `Flint`/`FlintTarget`) implements the supported targets, `DFlashDraft`
+  and `Flint`) implements the supported targets, `DFlashDraft`
   the speculative draft,
   `QwenVision` the vision tower, `ExecutionPlans` the per-phase command
   plans; `QwenState`, `StateLayout`, `StateTransfer`, `GgufImage*`,
@@ -241,14 +241,17 @@ The additions this fork layers on top of upstream, kept in step with each
 merge:
 
 - **Host-pressure bypass.** `splash serve --ignore-host-memory-pressure`
-  (or `SPLASH_IGNORE_HOST_PRESSURE=1`) tells the `MemoryGovernor` to waive
-  macOS's dynamic host-memory admission — headroom checks and every hold but
-  a system-critical one — so a start proceeds with the model's full context
-  even while the system reports pressure (`ignoreHostPressure`).
-- **Headroom-driven reclaim.** The governor triggers cache and state reclaim
-  when engine headroom runs low, not only after a refused allocation
-  (`reclaimed` in `MemoryGovernor.cpp`), holding the recovery margin without
-  waiting for an OOM-style refusal.
+  (or `SPLASH_IGNORE_HOST_PRESSURE=1`) tells `MemoryGovernor` (`HostRule`,
+  `heldPages`, `snapshot`, `hostPass`) and `RuntimeResources` to waive
+  macOS's dynamic host-memory admission — headroom checks, warning hysteresis,
+  and every hold but a system-critical one — so a start proceeds with the
+  model's full context even while the system reports pressure
+  (`ignoreHostPressure`).
+- **Headroom-driven reclaim.** When host pressure is bypassed and no elastic
+  pool is below its cap (`!ledger_.hasPoolBelowCap()`), `MemoryGovernor::controlPass`
+  proactively runs an ordinary `hostPass` whenever Metal engine headroom falls
+  below 1 GiB (on budgets >= 2 GiB), preserving headroom without waiting for an
+  OOM-style refusal.
 - **Recovery drain timeout** *(pending re-application)*. A start that waits
   for drained resources during recovery should fail within its own wait budget
   instead of stalling the lane; this extension was superseded when a previous
