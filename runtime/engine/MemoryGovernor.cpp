@@ -549,7 +549,7 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
     if (limitBytes_ >= 2 * kEngineTargetMargin && room < kEngineTargetMargin) {
       if (const uint64_t engineDeficit =
               saturatingSubtract(kEngineTargetMargin - room, ledger_.returning().landingBytes))
-        pass = hostPass(engineDeficit);
+        pass = hostPass(engineDeficit, false);
     }
   }
   if (pass) {
