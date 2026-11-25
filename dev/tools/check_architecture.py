@@ -108,6 +108,9 @@ ENGINE_MODEL_BOUNDARY = frozenset(
 CONCRETE_MODEL_HEADERS = (
     "model/DFlashDraft.hpp",
     "model/Flint.hpp",
+    "model/Inkling2Loop.hpp",
+    "model/Inkling2LoopSteps.hpp",
+    "model/Inkling2LoopTarget.hpp",
     "model/ModelFactory.hpp",
     "model/Qwen3_6Moe.hpp",
     "model/Qwen3_8.hpp",
@@ -226,8 +229,41 @@ NOTE_ALLOWANCE: dict[str, int] = {
     "dev/tests/engine/timing_profile_test.cpp": 1,
 }
 # runtime/engine's production lines: the budget only goes down, unless the
-# owner raises it.
-ENGINE_LINE_BUDGET = 30_594
+# owner raises it. 30,746 is 1.7.0's 30,594 and 152 more, for the SSD
+# cache's off reason, its reads and a request's reuse in /status and usage,
+# the automatic budget's unwired tenth, a state at a prompt's head,
+# forgetting a lane count's step costs, and the lanes a start asks for in its
+# memory plan, warmups, scheduler, refusal, log line and /status. 30,980
+# adds 234 for the Neural Engine split's two steps: the start's second share
+# and record, each kind of command on its own evidence, and the split set up
+# as the warmup's last step, at the least memory the engine holds, with the
+# GPU time of its prefill of a full chunk, which gives the mixer without a
+# runtime of its own (the start's pending split, its resources, the warmup's
+# step, stage and second audit, and the scheduler's limits). 31,000 adds 20
+# for a recalled calibration taken on a busier Mac, which the start's mixer
+# shows and calibrates again.
+# 30,996 takes 4 away: the refit reads its own GPU alone beside its split.
+# 31,008 adds 12 for the start that calibrates the split again
+# (--ane-calibration again, splash serve --recalibrate-ane).
+# 31,035 adds 27 for a head's state that keeps the lane's last prefill
+# checkpoint cached, as the prompt's replay point does (Engine::keepsCheckpoint,
+# headBoundary), and captures the checkpoint a command reaches on its way to it.
+# 31,085 adds 50 for a Background request that ages to Normal after 10 s and
+# still yields memory and its lane as Background. 31,088 adds 3 for a
+# suspended lane's reply state, kept by an ended one's measure. 31,096 adds 8
+# for a head's state, which a persistent tier copies ahead though its
+# conversation went on. 31,103 adds 7 for the split's warmup, which holds only
+# the pages its rows use and allocates again an extent the first audit
+# released. 31,104 adds 1 for an image's patch side, which the protocol takes
+# from the model's tower (Inkling 2's 20 pixels, Qwen's 16). 31,107 adds 3 for
+# an image span's own height and width, which Inkling 2's encoder pads past as
+# its reference does, and the span's layout in the frame. 31,110 adds 3 for
+# that size in a KV block's identity, as the image cache keys it. 31,209 adds
+# 99 for the tails behind a lane, which a windowed cache gives up where the
+# budget refuses: the states that pin them leave, oldest first, and a Full
+# extent their trims empty beyond the lanes' floors pays for the Slim ones
+# (Cache::releaseTails).
+ENGINE_LINE_BUDGET = 31_209
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

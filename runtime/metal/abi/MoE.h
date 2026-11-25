@@ -8,6 +8,7 @@
 #endif
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/ShortConvolution.h"
 #include "metal/abi/VerifyTree.h"
 
 // The expert slots of the routing kernels (ops::MoE): a row's router scores
@@ -29,6 +30,16 @@ struct MoeRouteParams {
 
 static_assert(sizeof(MoeRouteParams) == 16,
               "MoE routing parameters are 16 bytes on both sides");
+
+// A biased selection's routing (ops::MoeShape::selectionBias): the scale of
+// its routing weights beside the routing's parameters.
+struct MoeBiasedRouteParams {
+  MoeRouteParams route;
+  float scale;
+};
+
+static_assert(sizeof(MoeBiasedRouteParams) == 20,
+              "biased MoE routing parameters are 20 bytes on both sides");
 
 // Every row carries top_k routed experts followed by the slices of the shared
 // expert, ids `experts` on, whose routing weight is the sigmoid of the
@@ -184,6 +195,38 @@ struct MoeGgufExpertParams {
 static_assert(sizeof(MoeGgufExpertParams) == 32,
               "MoE GGUF expert parameters are 32 bytes on both sides");
 
+// An int8 expert pass of a prefill chunk (kernels/shared/moe_int8.metal,
+// ops/MoE.cpp): the grouped rows' int8 codes and scales (the dense prefill's
+// rule, per row and 64 inputs, kernels/common/int8_activations.h), a row per
+// route, the scales' row stride, through the af4g64 or af5g64 planes of the
+// tile's expert as MoeGgufExpertParams reaches them.
+struct MoeInt8ExpertParams {
+  uint32_t input_size;
+  uint32_t output_size; // per expert
+  uint32_t experts;
+  uint32_t routed_format;
+  uint32_t shared_format;
+  uint32_t floor_slots;
+  uint32_t chunk_slots;
+  uint32_t tiles; // MOE_TILES_*
+  uint32_t routes;
+};
+
+static_assert(sizeof(MoeInt8ExpertParams) == 36,
+              "MoE int8 expert parameters are 36 bytes on both sides");
+
+// moe_gather_int8: the grouped rows' codes and scales from the chunk's
+// (rows of input_size codes, scales [input_size / 64][rows]).
+struct MoeGatherInt8Params {
+  uint32_t input_size;
+  uint32_t routes_per_row;
+  uint32_t rows;          // the chunk's, its scales' row stride
+  uint32_t routes;        // the grouped rows, their scales' row stride
+};
+
+static_assert(sizeof(MoeGatherInt8Params) == 16,
+              "MoE int8 gather parameters are 16 bytes on both sides");
+
 // The gate and up passes in one (moe_expert_gguf_m<rows>_gate_up[_mixed]):
 // their sizes, expert count, floor and chunk slots, as MoeGgufExpertParams
 // holds them, and each pass's routed and shared formats. Gate reads
@@ -206,34 +249,47 @@ static_assert(sizeof(MoeGgufGateUpParams) == 40,
 
 // One projection (gate, up or down) of the experts a load writes into their
 // slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,
-// job j's native rows of row_bytes each staged from wherever the job's source
-// names, and its plane0, plane1 and meta planes slot_bytes[i] bytes per slot
-// in the regions of the slot's chunk.
+// job j's rows staged from wherever the job's sources name, and its plane0,
+// plane1 and meta planes slot_bytes[i] bytes per slot in the regions of the
+// slot's chunk. The rows are staged as native rows of row_bytes each, or,
+// where stored_bytes[0] is not 0, as the planes an MLX affine or mxfp4
+// tensor stores them in, stored_bytes[p] bytes a row of plane p: its codes,
+// scales and biases (model/GgufPreparation.hpp storedPlanes).
 struct MoeExpertLoadProjection {
   uint32_t format;
   uint32_t rows;
   uint32_t columns;
   uint32_t row_bytes;
+  uint32_t stored_bytes[3];
+  uint32_t reserved;
   uint64_t slot_bytes[3];
 };
 
-static_assert(sizeof(MoeExpertLoadProjection) == 40,
-              "MoE expert load projections are 40 bytes on both sides");
+static_assert(sizeof(MoeExpertLoadProjection) == 56,
+              "MoE expert load projections are 56 bytes on both sides");
 
-// The gate, up and down projections of one load, and the slots of the floor
-// chunk and of each elastic chunk.
+// The gate, up and down projections of one load, the slots of the floor
+// chunk and of each elastic chunk, and the staged planes a job's sources
+// name of each projection (1, or 3 where a projection is staged as stored
+// planes): source s of job j's projection z is sources[(3 j + z) *
+// source_planes + s].
 struct MoeExpertLoadParams {
   struct MoeExpertLoadProjection projections[3];
   uint32_t floor_slots;
   uint32_t chunk_slots;
+  uint32_t source_planes;
+  uint32_t reserved;
 };
 
-static_assert(sizeof(MoeExpertLoadParams) == 128,
-              "MoE expert load parameters are 128 bytes on both sides");
+static_assert(sizeof(MoeExpertLoadParams) == 184,
+              "MoE expert load parameters are 184 bytes on both sides");
 
-// The threads of a moe_expert_load threadgroup, each of which repacks one
-// (row, 32-wide K group) pair.
+// The threads of a moe_expert_load threadgroup, and the 32-wide K groups of a
+// row it repacks: its QUANT_TILE_ROWS rows' pairs of a span of
+// MOE_EXPERT_LOAD_SPAN groups, the threads of a row taking every
+// (MOE_EXPERT_LOAD_THREADS / QUANT_TILE_ROWS)-th.
 #define MOE_EXPERT_LOAD_THREADS 256u
+#define MOE_EXPERT_LOAD_SPAN 32u
 
 struct MoeCombineParams {
   uint32_t rows;
@@ -243,3 +299,22 @@ struct MoeCombineParams {
 
 static_assert(sizeof(MoeCombineParams) == 12,
               "MoE combine parameters are 12 bytes on both sides");
+
+// A verify step's combine with the short convolution of its rows
+// (moe_combine_convolution, ops::MoeCombineConvolution): the combine's, and
+// the convolution's of static taps (heads 0) along the lanes' trees (tree 1)
+// onto an fp32 residual (residual 1, SHORT_CONVOLUTION_OUTPUT_ROUNDED_SUM),
+// its sequences the step's lanes. A threadgroup runs a lane's rows, at most
+// MOE_COMBINE_CONVOLUTION_ROWS (a verify block's), of
+// MOE_COMBINE_CONVOLUTION_CHANNELS channels, a thread a row's channel: the
+// rows its convolution taps are the lane's own, which it combined, or its
+// state's.
+#define MOE_COMBINE_CONVOLUTION_ROWS 32u
+#define MOE_COMBINE_CONVOLUTION_CHANNELS 32u
+struct MoeCombineConvolutionParams {
+  struct MoeCombineParams combine;
+  struct ShortConvolutionParams convolution;
+};
+
+static_assert(sizeof(MoeCombineConvolutionParams) == 116,
+              "MoE combine convolution parameters are 116 bytes on both sides");

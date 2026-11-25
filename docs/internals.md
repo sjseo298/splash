@@ -146,8 +146,8 @@ files they leave. A launcher run without writing bytecode (`-B` or
 `PYTHONDONTWRITEBYTECODE`) sets `PYTHONDONTWRITEBYTECODE=1` in its environment
 before `serve` starts anything, so the installer and the server write none
 either, nor do the server's PDF workers, which start with `-B` and no
-environment, and a packaged runtime inside a signed app never gains
-`__pycache__`.
+environment, and a packaged runtime inside a signed app gains no bytecode
+beside what it ships.
 
 `hub.Repository.resolve` alone decides whether a start asks the Hub
 ([Revisions](server.md#revisions)), each request within `hub.HUB_TIMEOUT`:
@@ -157,14 +157,19 @@ environment, and a packaged runtime inside a signed app never gains
   this release changed the GGUF metadata adapter, from the snapshots it links
   (`assembly.source`), wherever `HF_HUB_CACHE` points now; if the new draft
   cannot be fetched or is not the family's ([Drafts](models.md#drafts)), the
-  installed one is kept.
+  installed one is kept. One that serves text only though its family serves
+  images, and has not recorded why (`upstream._lacks_tower`: Inkling-2-Mini's
+  from 1.7.2), is assembled again from the Hub's listing of its commit, to
+  take its tower in ([Vision](models.md#vision)).
 - A new commit: only changed files are downloaded, and the new assembly
   replaces the installed one atomically once published.
 - No answer, or a new commit that cannot be installed: the installed assembly
   starts, with one line naming the Hub's reason or, on stderr, the
   installation attempt that failed.
 - A 40-hex `--revision`, or `--offline`: a verified installation starts
-  without a request.
+  without a request, but for one that lacks its family's tower and has not
+  recorded why: under a 40-hex `--revision` its start asks for that commit's
+  listing (`upstream._start_installed`).
 
 A missing assembly, or one that no longer verifies, is built again. Without the
 Hub it is built from a cached snapshot, of the commit the `--revision` names,
@@ -188,7 +193,7 @@ the Hub's listing too. The installer never rewrites upstream files.
 
 Every start writes a model's target, draft and vision tensors into weight
 images in memory, in the layouts the kernels read: any vision tower in the
-BF16 layout of the vision operator, and the target, safetensors or GGUF, and
+BF16 layout of its tower's encoder, and the target, safetensors or GGUF, and
 the DFlash2 draft in the `MDGG0001` layout of the GGUF kernels ([MLX
 targets](models.md#mlx-targets)). Each source adapter is a loader, which validates the
 source's metadata and plans its images, and a writer:
@@ -200,20 +205,48 @@ for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by
 `VisionPreparation` for a safetensors or GGUF vision tower. `GgufPreparation`
 repacks GGUF blocks ([GGUF targets](models.md#gguf-targets)) and safetensors tensors
 without requantization, but for the Q8_0 of Flash-Next's BF16 or F16
-hyper-connection projections, quantizes the draft's BF16 projections
+hyper-connection projections, of 16-bit float routed experts that neither
+MXFP8 holds exactly nor BF16's blocks tile (16-bit experts MXFP8 holds load as
+it, exactly) and of a safetensors target's BF16 or F16 projections ([MLX
+targets](models.md#mlx-targets)), quantizes the draft's BF16 projections
 ([Drafts](models.md#drafts)), and computes a safetensors target's GDN decay as
 `float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
-exponential.
+exponential. llama.cpp's NVFP4 rows are rebuilt as NVFP4's native blocks of
+256 elements, or, for a tensor whose rows are not whole 256-element blocks
+(llama.cpp's are 64), as NVFP4's own form of 64-element blocks (`nvfp464`),
+which differs from the 256 form only in its meta unit (four scales and `g`,
+two groups wide): every tile reads both through the format list, as it reads
+every format, and the planner chooses the form by a tensor's width
+(`GgufImage.cpp` `imageFormat`). Every MoE layer's image holds its routed
+experts' scales after them, F32 [3][experts] (`ImageBuilder::expertScales`):
+a GGUF experts tensor's `.scale` as stored, whatever its type, and 1 for
+experts without one, which the expert passes multiply their sums by
+([GGUF targets](models.md#gguf-targets)); a checkpoint's, planned as values
+(`ImageBuilder::ExpertScales`), its experts' global scales: Inkling 2's
+release's amax over its denominator, MLX's `global_scale` over 6 × 448 or
+`weight_scale_2` as stored ([Inkling 2's
+checkpoints](models.md#inkling-2s-checkpoints)). A checkpoint's matrix the
+image holds transposed (Inkling 2's static taps and relative bias, oMLX's
+packed message gates) is written as its transpose's F32 values
+(`Conversion::TransposeToFloat32`), its stored rows taken in reverse where it
+keeps them last first (`RowOrder::reversed`).
 
 Loading never rounds a target or vision weight but in the F32 values of
 quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
-BF16 or F16 hyper-connection projections ([GGUF targets](models.md#gguf-targets)), and
+BF16 or F16 hyper-connection projections and of such 16-bit routed experts
+([GGUF targets](models.md#gguf-targets)) and of a safetensors target's BF16 or
+F16 projections, in the F32 quotient of an expert's global scale a checkpoint
+holds as one (as llama.cpp's converter computes Inkling 2's `.scale`),
+in the BF16 values of an Inkling projector's Q8_0 matrices ([Vision](models.md#vision)), and
 in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
 target's quantized shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
 ([MLX targets](models.md#mlx-targets)) or a Model Optimizer or compressed-tensors
 target's in NVFP4 or FP8, and a GGUF's quantized alpha or beta beside one of
-another type, which the GPU decodes as GGML does. In the second conversion, a
+another type and its quantized tensors of a float projection (Inkling 2's
+message gates, which its fused gate kernels read as F32 rows, and its sink
+projections), which the GPU decodes as GGML does.
+In the second conversion, a
 Model Optimizer or compressed-tensors target's RMSNorm weight `w`, stored 1
 below the weight the norm multiplies by, loads as
 the F32 `1 + w` ([Model Optimizer targets](models.md#model-optimizer-targets)), which
@@ -236,9 +269,13 @@ is checked first. A writer writes every byte of its image, zeroing alignment
 and padding, as a new buffer's contents are undefined. Writers read their
 sources uncached (`F_NOCACHE`), so the page cache keeps no second copy of the
 model, on a thread per core (`parallelFor`); a thread stages at most 4 MiB of a
-source at a time, and a GGUF image the rows of one repack, at most 32 MiB
-(`kGgufRepackStagingBytes`), for the `gguf_repack` kernel, which writes the
-planes into the image. Once an image is written, its writer checks that no
+source at a time (1 MiB of a repack's rows, `kChunkReadBytes`, so that a chunk
+keeps enough reads in flight for the disk's rate), and a GGUF image the rows of
+one chunk of a repack, at most 32 MiB (`kGgufRepackStagingBytes`), for the
+`gguf_repack` kernel, which writes
+the planes into the image. An image's writer holds two such stagings and
+stages the next chunk while the GPU writes the last (`pipelineChunks`), so its
+reads do not wait for the GPU. Once an image is written, its writer checks that no
 source file it read was written since it was opened
 (`WeightSource::checkUnchanged`), so a source changed in place fails the load
 instead of mixing two versions. A start logs `Weights loaded in N s.`; loading
@@ -271,7 +308,16 @@ and plans the `MDGG0001` layout. A Flint GGUF's family keys hold its window,
 leading dense layers, shared expert's slices, sigmoid router and normalized,
 unscaled routing weights (`expert_weights_scale` 1) and its two layer
 patterns to the family's, and a router bias (`ffn_exp_probs_b`), which its
-blocks would not add, is refused.
+blocks would not add, is refused. A family whose layer images are not one for
+each layer the runtime runs plans through its own `ggufTargetPlan`
+(`GgufTarget.hpp`): the count of its layer images, its metadata checked key by
+key (`gguf::MetadataCheck`, which the shared check is written with), and the
+sections each image holds, which the shared planner lays out
+(`gguf::planTargetImages`, `gguf::Section`); a section of F32 values may
+gather them from rows of tensors that every layer's share
+(`Section::gathered`, one copy a part, `ImageBuilder::gather`). Inkling 2's
+(`Inkling2LoopGguf.cpp`) plans its 24 weight layers, which its steps run as 48
+applications.
 `GgufPreparation` stages rows in image order on the CPU within the
 staging bound, splitting rows wider than it into column chunks, and runs the
 `gguf_repack` kernel, which writes their planes into the image. Embeddings and
@@ -396,7 +442,33 @@ layers' FFN is dense and the others' a MoE of a sigmoid router and an ungated
 shared expert of two slices; its norms are plain, as its GGUFs store them. Its
 layer images (`GgufImage.cpp`, `FlintGguf`) hold its input norm, attention,
 sinks, the norm before its FFN and its FFN, which `loadFlintWeights` reads with
-the Qwen readers.
+the Qwen readers. Inkling 2 (`Inkling2Loop.hpp`) states the shared dimensions
+as the layers its steps run, one per layer application, every one attending,
+and keeps its weight layers, its loop's schedule (`Inkling2LoopSchedule`) and
+its own values in its layout; its own loader reads a layer image a weight
+layer, and its target (`Inkling2LoopTarget.hpp`) runs its own operators; a
+decode step's MoE combine also runs the FFN's convolution along the lanes'
+trees, in the combine's dispatch, a lane's rows a threadgroup's, which pass
+their combined values through threadgroup memory
+(`ops::MoeCombineConvolution`): the bits the combine and the convolution
+write apart. A decode step projects the keys and values of one row (a
+sliding layer's, but where messages gate its inputs apart) as one projection
+of the two tensors side by side (`keyValueProjection`,
+`ops::Projection::sideBySide`), on one tensor's own plan, so each tensor's
+columns are the bits of its own projection, in one dispatch from one prepared
+input where its tile fuses them (the column and register tiles, and the staged
+tile of one row group); and it convolves every layer's keys and values in one dispatch
+(`ops::ShortConvolution::addConvolutionPair`), each the bits of its own
+dispatch, a pair from one projection's rows reading them as views
+(`ShortConvBuffers::inputStride`, `inputColumn`). Its draft reads it as its
+producer captured it
+(`QwenTargetDimensions`'s `draftReadsLayerInputs`): the target captures, at
+an id the draft reads, the rows passed into that application, its block
+residual's partial sum before it, and at id 48 the final norm's rows the
+head reads; its draft's own rows are the token table's through the table's
+norm (`draftEmbeddingNorm`, `QwenTarget::addDraftEmbedding`); and the
+draft's logits take the head's finish, no padding row and the softcap after
+the selector's edges (`logitSoftcap`, `vocabularyTokens`, `DFlashDraft`).
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever
@@ -478,7 +550,8 @@ A decode step's target forward is the prompt forward (`QwenTarget::addPrefill`
 over a chunk whose `decode` names the step's own buffers,
 `QwenTargetDecodeBuffers`): its lanes are the chunk's sequences, each of the
 cycle's lane cap of rows at most, which the layout places, its rows the
-step's, through the same layer loop (`addPrefillLayers`), plans by its rows,
+step's, through the same layer loop (`addPrefillLayers`), plans by its rows
+(a decode step's, which take no int8 prefill path: kernel selection, rule 1),
 attention, dense FFN and MoE load and passes (a decode step's load serves a
 group of one step). It differs where the work does: its GDN layers run the
 decode scan from each lane's state along its tree into its tape, where a
@@ -581,32 +654,54 @@ every plan on every device). The KV cache keeps `--kv-format` either way.
 
 The rules:
 
-1. *Projection, past the decode tiles.* A plan's rows pick its tile, whatever
-   command runs it. A plan of more rows than the decode tiles hold (64) runs
-   the 128-row prefill tile, unsplit, or, with int8 activations on, on a row
-   with `prefillInt8` (Apple10 and Apple11) the
+1. *Projection, past the decode tiles.* A plan's rows and its command, a
+   prefill chunk's or a decode step's (`ops::StepKind`), pick its tile. A
+   plan of more rows than the decode tiles hold for its command (64 for a
+   prefill chunk; 128 for a decode step, two row groups of the staged tile,
+   rule 2) runs the 128-row prefill tile, unsplit. A default start of four
+   lanes meets 65-128 rows only in prefill chunks, where the row groups would
+   change outputs against 1.7.0 wherever the split law splits them and add
+   pipelines to every start: they serve decode steps of five to eight lanes
+   alone. With int8 activations on, a prefill chunk's plan of more than 64
+   rows on a row with `prefillInt8` (Apple10 and Apple11) runs the
    [int8-activation tile](#int8-activation-prefill) where it takes every
-   quantized segment. A gate/up pair runs there as a gate plan and an up plan
-   that applies silu(gate) (`Linear::addSwiGlu`). A projection of several
-   segments and no epilogue runs those of each format in one dispatch on the
-   128-row prefill tile; the int8 tile runs
-   a GEMM dispatch per segment beside the quantization of its input, which a
-   SwiGLU's gate and up share. (The segments of a format in one dispatch took
-   the 27B's fused inputs 6-11% less time at 65-128 rows but 1-3% more at
+   quantized segment. A decode step's plans take no int8 prefill path, the tile nor rule
+   4's int8 passes, whatever its rows (`ops::StepKind`,
+   `ExecutionPlans::decodeLinear`): a request's decode does not round its
+   activations because other requests share its step. A decode step rounds
+   only on the int8 decode tiles, a rotated PQ2_0 unit's plans of 16 rows or
+   more (rule 2). A gate/up pair of more than 64 rows runs as
+   a gate plan and an up plan that applies silu(gate) (`Linear::addSwiGlu`).
+   A projection of several segments and no epilogue runs those of each format
+   in one dispatch on the 128-row prefill tile; the int8 tile runs a GEMM
+   dispatch per segment beside the quantization of its input, which a SwiGLU's
+   gate and up share. (The segments of a format in one dispatch took the
+   27B's fused inputs 6-11% less time at 65-128 rows but 1-3% more at
    512-2048, 12-core M6.)
 2. *Projection, decode tiles.* A plan of up to 64 rows, a decode step's or a
-   prompt chunk's, runs them, its rows in table tiles of 8 (the last padded,
-   `tableTiles`). The decode tiles hold a step of four lanes of 16 on the
-   staged tile's heights; the register tile holds up to its four table tiles
+   prompt chunk's, and a decode step's of up to 128 runs them, its rows in
+   table tiles of 8 (the last padded, `tableTiles`). The decode tiles hold a
+   step of eight lanes of 16: up to 64 rows on the staged tile's heights, past
+   them on two row groups of the tile of half the rows in one dispatch
+   (`ops::stagedRowGroups`: two of 48 rows at 65-96, two of 64 at 97-128),
+   each group with its own split partials, so a row is the bits of its row on
+   any staged height at the plan's split and, unsplit, of the prefill tile. On
+   a 12-core M6 the 27B's [16640 x 5120] af4g64 projection takes 0.80 and
+   1.12 ms there against 1.07 and 1.32 on the prefill tile, and a projection
+   of several segments runs them in one dispatch up to 64 rows and in one each
+   past them; a decode step's vocabulary head keeps passes of at most 64 rows.
+   The register tile holds up to its four table tiles
    (`kMaximumRegisterRows`, 32 rows), a one-pass gate/up pair up to
    `kMaximumPairRows` (32) and the int8 tiles 16 or 32 rows
-   (`kMaximumInt8Rows`), and a plan past any of them runs the staged tile in
-   bf16 activations, a pair in two passes. A plan of at most `GGUF_COLUMN_ROWS` (2) rows runs the column
+   (`kMaximumInt8Rows`, past which they run row groups of them), and a plan
+   past the register tile or the pair runs the staged tile, a pair in two
+   passes. A plan of at most `GGUF_COLUMN_ROWS` (2) rows runs the column
    tile on every device (`kernels/decode/linear_gguf_column.metal`): each lane
    one column of a GEMV in registers over those rows alone (the MoE expert
    tiles' column tile, `kernels/common/gguf_column_tile.h`), eight simdgroups
    of a threadgroup splitting K and adding their parts in order, a gate/up
-   pair of one format in one pass; on the M5 Max a [2048 x 6144] af4g64
+   pair of one format in one pass, a fused projection's segments in one
+   dispatch, each column as its own tensor's; on the M5 Max a [2048 x 6144] af4g64
    projection at one row takes 18.4 us on the column tile and 28 us on the
    staged tile. Otherwise the register tile runs where it takes every
    quantized segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the
@@ -628,16 +723,45 @@ The rules:
    runs a staged plan that stores at least `decodeInt8FromRows` rows (16 on
    Apple10 and Apple11, a 16-row plan among them; never on Apple9) whose K
    splits keep whole PQ2_0 blocks on those tiles, at the plan's splits and
-   passes; their shortest height is 16 rows and their tallest 32.
+   passes: their shortest height is 16 rows and their tallest 32, and a
+   decode step's plan of more runs row groups of them in one dispatch
+   (`ops::int8RowGroups`: 32 rows each, 16 at 48 rows, whole 32-row groups
+   stored past 64 rows), so such a unit, its vocabulary heads among them
+   (a decode step's head and the draft's take the step's plans), decodes a
+   plan of 16 rows or more in int8 activations whatever its lanes; a plan
+   that stores fewer (one or two rows on the column tile, three to eight
+   split) keeps bf16. A prefill chunk's plan takes them at 16 or 32 rows.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
 4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
    while a step's routes average at most one row per expert (a decode step's
-   of up to 32 rows of every family) and 32-row tiles beyond. One plan per
-   step serves every block, so its router follows rule 3 in the format of
-   most blocks' routers (`ops::moeRouterFormat`). Either tile's grouped rows
-   are the step's routes', packed (`ops::MoeScratch`).
+   of up to 32 rows of every family) and 32-row tiles beyond. On the M5 Pro
+   (Apple10, 16 to 31 cores) a prefill chunk on the staged passes whose
+   routes average `ops::MoeCalibration::wideTileRoutes` or more an expert
+   runs 64-row tiles, which dequantize an expert's weights once for up to 64
+   of its rows. From 20 cores that is 64 routes: from 1024 rows on
+   Inkling-2-Mini, at 2048 on Qwen3.6-35B-A3B and Qwen3.5-122B-A10B; never
+   on Flint (48 at 2048 rows), whose routing of two shared slices has no
+   64-row passes (`ops::MoePlan` refuses them). The 16-core takes 128,
+   where 64-row tiles took the 35B's prefill 1.5-2.5% longer and Inkling's
+   1024- and 1536-row chunks no shorter: at 2048 rows on Inkling-2-Mini
+   alone. A row's result is the same bits on every tile. One
+   plan per step serves every block, so its router follows rule 3 in the
+   format of most blocks' routers
+   (`ops::moeRouterFormat`). Every tile's grouped rows are the step's
+   routes', packed (`ops::MoeScratch`). With int8 activations
+   on, a prefill chunk whose dense projections run the
+   [int8-activation tile](#int8-activation-prefill) runs its experts on int8
+   passes too where every block's experts are resident, its routing is one
+   the passes compile (one or two shared slices, SiLU) and each projection's
+   routed and shared experts share af4g64 or af5g64 (`ops::moeInt8Experts`;
+   not Q8_0, which the tile takes for dense projections alone), once its
+   routes average six or more an expert
+   (`ops::selectMoe`, `MoeConfig::int8Passes`): from 192 rows on
+   Qwen3.6-35B-A3B and Qwen3.5-122B-A10B, 256 on Flint's shape and 308 on
+   Qwen3.8-Flash-Next's. Smaller chunks and every decode step (rule 1) keep
+   the staged passes.
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's of
    up to 8 rows, takes one history split per 16 pages its rows read, between
@@ -685,18 +809,38 @@ every projection
 (`ServingRuntime::requireWarmup`):
 
 - a prefill of the most rows, 2048, and one of each class of chunk whose
-  projections run kernels of their own, of its fewest rows
+  projections or attention run kernels of their own, of its fewest rows
   (`ExecutionPlans::prefillRowClasses`): each decode tile and height a chunk
   takes, from 1 (the column tile), 3, 9, 17, 25, 33 and 49 rows, and the
-  prefill tile, from 65 rows. These need no memory the first
-  did not, and are required as it is. Every other kernel choice a chunk's
-  rows make today has one threshold (the float tiles, the MoE expert and
-  router tiles, the staged norm, the hyper-connection norm's quarters, and the
-  Neural Engine split, which takes no class's first chunk), so the chunks of
-  one row and of the most take both sides. `kernel-selection` checks that
+  prefill tile, from 65 rows; a MoE target's expert passes
+  (`ops::selectMoe`), each a class: the 32-row staged passes from the rows
+  whose routes outnumber its experts (33 on Qwen3.6-35B-A3B and
+  Qwen3.5-122B-A10B, 43 on Flint, 52 on Qwen3.8-Flash-Next), the M5 Pro's
+  64-row passes from the rows whose routes average its `wideTileRoutes` an
+  expert (from 20 cores 1024 on Inkling-2-Mini and 2048 on the 35B and the
+  122B, on the 16-core 2048 on Inkling-2-Mini; a class of 2048 rows is the
+  prefill of the most rows', which warms it, no chunk of its own repeating
+  it), and the int8 passes where they run (from 192, 256 and 308 rows); and
+  the rows from which Inkling-2-Mini's relative attention after no history,
+  in each variant its layout states (a layout's `relativeAttention`), runs a
+  kernel no class before them and no chunk of the most rows runs:
+  the direct kernel over bf16 queries, from 129 rows where INT8 pages take
+  INT8 queries (Apple10 and Apple11), so that a fresh prompt of 129 to 224
+  tokens creates none while it waits; the chunk of the most rows runs it
+  over INT8 queries, and elsewhere over the bf16 queries 129 rows take.
+  These need no memory the first did not, and are required as it is. Every other kernel choice a
+  chunk's rows make has one threshold (the float tiles, the MoE router's
+  tile, the staged norm, the hyper-connection norm's quarters, the block
+  residual mix's kernel of a threadgroup a row from 65 rows, Inkling-2-Mini's
+  message gates' `message_gate_rows` from 129 rows, where 128 and fewer run a
+  decode step's three fused kernels, and the Neural Engine split, which takes
+  no class's first chunk), so the chunks of one row and of the most take both
+  sides. `kernel-selection` checks that
   every projection, float and MoE tile a chunk of 1 to 2048 rows selects on
-  its fifteen devices, and its prefill attention after each history it plans,
-  is one of these chunks'. Each prefill also creates, without running it, the
+  its fifteen devices, and the kernels its prefill attention runs after each
+  history it plans, are these chunks', and that no class's chunk repeats the
+  most rows'. Each prefill also creates, without running them, its chunk's
+  kernels after the longest history the target serves, the
   draft rebuild a restored lane's first chunk begins with, which no other
   command runs, so a memory-limited restore warmup leaves none of its kernels
   to serving, and what a state captured inside a chunk runs, which no warmup
@@ -839,7 +983,12 @@ Apple10 and Apple11 the [int8-activation tile](#int8-activation-prefill) where i
 weights). A fused projection's staged plan runs its segments in one dispatch: a dispatch costs
 about 0.045 ms however narrow, and at 8 to 32 rows one dispatch takes 16-56% less time than one
 per segment on the 32-core M5 Max and 3-11% less on the 10-core M4 for the 27B attention and 35B
-GDN inputs.
+GDN inputs. A projection of tensors side by side (`Projection::sideBySide`: two or three
+projections of one input, each one tensor of one shape and format) takes the plan one of them
+takes alone, over all their columns (`ProjectionShape::planOutputs`, which the arena bound and
+the storage rows also follow): every tile runs a fused projection's segments at one configuration
+each as its own projection would (gguf-projection), so each tensor's columns are the bits of its
+own plan, in one dispatch where the tile fuses them.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`WaveLaw`, `runtime/ops/KernelSelection.cpp`), for decode steps and short
@@ -868,7 +1017,14 @@ per height sped no Mac without slowing some model. The floors are fitted, not me
 search over every measured case's fastest split gave 6 and 10 for `saturating` (a lone chain
 measures 5.4 and 9 threadgroups' bytes) and 2 and 3 for `following` (one threadgroup per core
 past a full wave measures 2.7-3.5 of the tile's and 6-8.5 of the pair's); they stand in for what
-the law leaves out. Floors at the measured trailing waves take as much time in total on the
+the law leaves out. From 32 cores (`kApple10LargeProjection`) a unit of 6.25 bits per weight or
+more (Q6_K, Q8_0, MLX 6- and 8-bit, FP8), whose threadgroups each stream that many more bytes a
+step, saturates from four (`WaveLaw::wideSaturating`): on the 32-core M5 Max (macOS 27.0) four
+took up to 36% less time than six on every such projection of the 35B, the 27B and
+Inkling-2-Mini measured at 8 to 64 rows where their splits differ, and nowhere more, while
+narrower formats took up to 19% more at four and the 12-core M6 25% more on a Q8_0 projection at
+56 and 64 rows, so both keep six.
+Floors at the measured trailing waves take as much time in total on the
 sweeps but leave more cases slower. The law's totals on the sweeps (1.1%, 1.6% and 0.05% less
 time than the earlier rules on the M5 Max, the M5 Pro and the M6) are in-sample, the fit's own
 records; the ABBA decode runs and a 16-core emulation are the only out-of-sample checks, and the
@@ -924,7 +1080,7 @@ slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select
 (`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
 (`moe_group_routes_s2`, `moe_expert_gguf_m8_down_s2`); the softmax router's one gated slice is the
 unsuffixed instances. The grouping packs the tiles' rows, a grouped row per route, each tile's after
-the tile before it's (`MoeTileDescriptor::first_row`): a tile's 8-, 16- or 32-row matmul reads past
+the tile before it's (`MoeTileDescriptor::first_row`): a tile's 8-, 16-, 32- or 64-row matmul reads past
 its live rows into the next tile's, or past the last tile into the `tileRows - 1` rows the scratch
 holds past the routes', and stores its live rows alone.
 The expert passes launch the live tiles alone: the grouping kernel writes each
@@ -1020,7 +1176,8 @@ up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
 experts' gate and up in one pass `moe_expert_gguf_m<rows>_gate_up` and their down pass
 `moe_expert_gguf_m<rows>_down`; the fused projections run
-`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and in prefill chunks
+`gguf_column_fused` on the column tile, `gguf_decode_fused_m<rows>` and
+`gguf_decode_sg_fused_l<lanes>` in decode and in prefill chunks
 of up to 64 rows, and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that
 format's segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize` and one
 `gguf_prefill_int8_<format>_a` per segment). A `gguf_decode_fused_m<rows>` pipeline decodes
@@ -1061,15 +1218,18 @@ split, one lane on the staged 16-row tile bitwise against the 8-row tile, and, w
 row takes int8 activations, rotated PQ2_0 on the int8 tiles within the fp32 rounding of the exact
 products of their codes, lanes and pass modes bitwise, a non-finite input's row alone not
 finite, and a plan of one or two rows on the column tile in every format and in fused
-triples within the bound, the rows past its own unread and unwritten; and
+triples within the bound, a fused triple's segments bitwise each one's projection alone, the
+rows past its own unread and unwritten; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
-plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
-against fp64, bitwise against the full grids and two gate/up passes, a decode step routing its
-lanes' rows alone, no row of no lane, and with the experts in
+plan, the staged 8-, 32- and 64-row tiles, in every format as each routed and shared expert tensor,
+against fp64, bitwise against the full grids and two gate/up passes, every row of the 64-row tiles
+bitwise its row of the 32-row tiles (also over four whole 64-row tiles an expert), a decode step
+routing its lanes' rows alone, no row of no lane, and with the experts in
 permuted slots across a floor chunk and elastic chunks of other, few slots, the last of fewer,
 bitwise as in one chunk, and refuses floor and elastic chunks one unit short, a malformed chunk list
 or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts
-and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices;
+and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices, on
+8- and 32-row tiles alone;
 and `expert-store`, streamed experts at four shapes bitwise against the resident ones, in loads
 of every kind, through a release and a restore, in a floor and three smaller elastic chunks,
 beside a size of one block, which the store reads whole into its floor
@@ -1089,15 +1249,16 @@ the walks spread also in one, `pair` and `pair16`) and every K split, and marks 
 pick; widths emulate core counts, since the policy counts threadgroups per core. Or, with a trailing
 `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row prefill tile at each
 chunk of `R` rows (more than 32), for `R` up to 64 the staged 64-row tile at every K split, and for
-`af4g64` and `af5g64` the int8-activation tile (`prefill int8`) and its GEMM alone on codes the
+`af4g64`, `af5g64` and `q80` the int8-activation tile (`prefill int8`) and its GEMM alone on codes the
 scratch holds (`int8 codes`, as a SwiGLU's up runs on its gate's); the formats `float-bf16` and
 `float-f32`, and `float-<format>` for a quantized format's native rows (such as `float-af8g64`),
 time the float projection (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles
 instead, marking `selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B
-shape, or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
-device's plans; `GGUF_MOE_ARGS='repack'` times the repack of streamed experts into their slots
-(`moe_expert_load`, 1 to 32 jobs) and of tensors into an image (`gguf_repack`) in the streamed
-formats, each plane checked bytewise against the reference repack.
+shape, or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), or at
+any other (`'HxIxExK'`), on the device's plans, each decode step also as the GB/s its layer and its
+expert passes alone stream its distinct experts at; `GGUF_MOE_ARGS='repack'` times the repack of
+streamed experts into their slots (`moe_expert_load`, 1 to 32 jobs) and of tensors into an image
+(`gguf_repack`) in the streamed formats, each plane checked bytewise against the reference repack.
 
 Target attention runs once a layer for every sequence of a command, a decode step's lanes as a
 prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k projection
@@ -1146,9 +1307,9 @@ history without.
 
 ### Int8-activation prefill
 
-On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill chunk past the
+On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill chunk past one
 staged tile (more than 64 rows) of a projection whose quantized segments are all MLX affine 4- or
-5-bit in groups of 64 (`af4g64`, `af5g64`) runs `LinearTile::GgufPrefillInt8`
+5-bit in groups of 64 (`af4g64`, `af5g64`) or Q8_0 runs `LinearTile::GgufPrefillInt8`
 (`kernels/prefill/gguf_prefill_int8.metal`) instead of the bf16 tile
 (`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never),
 with int8 activations on. With them off (`--activations bf16`) every chunk runs the bf16 tiles,
@@ -1158,14 +1319,20 @@ group of each row as int8 codes with its own scale, by the int8-activation rule
 (`LinearInput::PrefillInt8`) rather than quantizing the same rows again; the GEMM
 (`gguf_prefill_int8_<format>_<e>`, one dispatch per segment) feeds the weights' 4- or 5-bit codes
 straight from the planes into int8 `matmul2d` fragments and folds each
-group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. The weights stay
+group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. Q8_0's codes are int8
+already: its tile runs a 64-input group as two pairs of fragment steps, each pair one 32-input group
+of the weights, and folds `(sa d) sum(qa q)` per 32-group with that group's `d`. It reads the codes
+the affine tiles read, in another schedule (a lane's two steps of a 32-group take one uint2 of each
+weight column's plane record), so a fused projection of affine and Q8_0 segments (a checkpoint's
+BF16 projections, loaded as Q8_0, beside its MLX ones) and a SwiGLU of the two still quantize their
+rows once. The weights stay
 exact; only the activations round, per row and group, so an outlier channel costs only its own 64
 inputs. A group holding an infinity or a NaN, which its codes alone would round to finite values,
 takes NaN scales, so that its row's outputs are not finite, as the bf16 tile's are: a lane whose
 state went bad still fails alone. A row's prefill results therefore depend on whether its chunk,
 with the rows of the lanes prefilling beside it, has more than 64 rows, but not on its neighbours'
 values: a prefill's last layer runs its read rows alone on the chunk's tile and keeps their bits. A
-tile is two simdgroups of 32 rows by 32 columns for both formats, and threadgroups take 16 row tiles
+tile is two simdgroups of 32 rows by 32 columns for every format, and threadgroups take 16 row tiles
 down each column tile before the next (`GGUF_PREFILL_INT8_WALK`), so a column tile's weights stream
 once per 16 row tiles: walking every column tile of a row tile first left the M6's 2048-row down
 projections at 0.95-1.12x the bf16 tile's speed. The GEMM's grid is 16 threadgroups wide and takes
@@ -1174,28 +1341,66 @@ whatever the segment's column count; a grid of column tiles by row tiles kept th
 column tiles were a multiple of 16 (M6, 2048 rows: 260 column tiles took 29% longer than 256, on the
 16-wide grid 1.7%, as their columns). Over the 27B's projection shapes in `af4g64` and
 `af5g64` at 65-2048 rows the tile takes 1.13-2.4x less time than the bf16 tile on a 32-core M5 Max,
-a 16-core M5 Pro and a 12-core M6. The quantizer stores each 32-input group's codes in the GEMM's
+a 16-core M5 Pro and a 12-core M6. With its Q8_0 projections on the tile, Inkling-2-Mini
+UD-Q4_K_M prefills 1.3% faster at 512 tokens, 0.4% at 4K and 1.5% at 32K, and Qwen3.6-35B-A3B
+UD-Q4_K_M 3.8% at 512 and 4.1% at 4K (fused GPU time, 20-core M5 Pro, three alternating pairs).
+The quantizer stores each 32-input group's codes in the GEMM's
 fragment order (`prefill_int8_position`): the four inputs a lane takes in a fragment step, in the
 planes' slot order, are one word. The codes and scales are the prefill arena's
 `LinearTable` and `LinearSums`, sized for a full chunk of the target's widest projection whose
 formats the tile takes (`ProjectionShape::prefillInt8Formats`; 40 MB on Qwen3.8-27B MLX 4-bit, its
-down projection) wherever the family runs the tile; a GGUF target's arena holds none. The tile also
+down projection) wherever the family runs the tile; a GGUF target's, for its widest Q8_0 projection
+(9 MiB on Qwen3.6-35B-A3B GGUF, its 4096-input GDN and attention outputs; 7 MiB on Inkling-2-Mini,
+its attention output). The tile also
 takes the Neural Engine split's leading-input view. A DFlash2 draft, prepared `af4g64` whatever the
 target's format, prefills on the bf16 tiles (`ExecutionPlans::draftLinear`): its prefill gains
 nothing from the tile, while its context projection, the widest a prefill runs (25,600 inputs on
 the 27B), would set the tile's scratch, 38 MB on Qwen3.6-35B-A3B GGUF, enough at `--max-memory 24G`
 to stream the routed experts its plan otherwise holds whole. Over 24 real 1K-8K prefixes the
-next-token KL against bf16 prefill on the GPU alone is
-2.2e-3 on Qwen3.8-27B MLX 4-bit (median 3.6e-4) and 2.3e-3 on Qwen3.6-35B-A3B MLX 4-bit, the most
-likely token unchanged at every prefix. At default flags on a 20-core M5 Pro, where the 27B's Neural
-Engine split takes 10 of 34 units, it is 9.4e-4, against 1.1e-3 for the bf16 tiles with the split at
-its own 15 units; both change the most likely token at the same one prefix of 24. Time to the first
-token falls by a quarter at 2K and 10K tokens on the 27B (20-core M5 Pro) and by 12-13% on the 35B
-(16-core M5 Pro). `gguf-projection` checks that the tile computes the products of the inputs so
-rounded within the bf16 tile's error, also with an outlier input per row, and bounds the RMS error
-it adds over the bf16 tile on dense inputs at 1%, that a fused projection quantizes once and runs a
-GEMM per segment, and an up on its gate's codes bitwise its own run; `gguf-projection-benchmark`
-times it as `prefill int8`.
+next-token KL against bf16 prefill on the GPU alone is 2.2e-3 on Qwen3.8-27B MLX 4-bit (median
+3.6e-4) and 2.3e-3 on Qwen3.6-35B-A3B MLX 4-bit, the most likely token unchanged at every prefix. At
+default flags on a 20-core M5 Pro, where the 27B's Neural Engine split takes 10 of 34 units, it is
+9.4e-4, against 1.1e-3 for the bf16 tiles with the split at its own 15 units; both change the most
+likely token at the same one prefix of 24. Time to the first token falls by a quarter at 2K and 10K
+tokens on the 27B (20-core M5 Pro) and by 12-13% on the 35B (16-core M5 Pro). Teacher-forced over
+256 positions after a 4K- and a 32K-token prefill, the Q8_0 projections' int8 prefill keeps the bf16
+prefill's most likely token at 93-94% of Qwen3.6-35B-A3B UD-Q4_K_M's positions (mean KL 1.6e-2 and
+2.1e-2) and 92-95% of Inkling-2-Mini UD-Q4_K_M's (mean KL 0.14 and 0.29, median under 7e-4), the
+true ids' NLL within 0.04 either way. For Inkling-2-Mini that mean KL is about 1.6-1.9x what its
+INT8 attention queries alone give at the same positions (0.087 and 0.154: the build without the Q8_0
+tile, `--activations auto` against `bf16`). `gguf-projection` checks that the tile computes the
+products of the inputs so rounded within the bf16 tile's error, also with an outlier input per row,
+and bounds the RMS error it adds over the bf16 tile on dense inputs at 1%, that a fused projection
+quantizes once and runs a GEMM per segment, and an up on its gate's codes bitwise its own run;
+`gguf-projection-benchmark` times it as `prefill int8`.
+
+A MoE target's experts run on the same tile in such a chunk where every block's experts are
+resident, its routing is one the passes compile (one or two shared slices and SiLU's activation:
+not Inkling-2-Mini's softcapped one without a shared expert) and each projection's routed and
+shared experts share af4g64 or af5g64 (`ops::moeInt8Experts`, `quant_moe_int8_format`;
+Qwen3.6-35B-A3B MLX 4-bit, not Flint's af3g64 nor a set with Q8_0 shared experts beside routed
+experts of another format, as the unsloth GGUFs hold them). Q8_0 experts keep the staged passes,
+though the tile takes Q8_0 dense projections: no real model has run them on these passes, whose
+rule of six routes an expert below was measured on af4g64. `gguf_prefill_int8_quantize` rounds
+the chunk's MoE input rows once,
+`moe_gather_int8` copies each route's codes and scales into the grouping's tiles, and
+`moe_expert_int8_<format>_<gate|up|down>` (`kernels/shared/moe_int8.metal`) run the tile over them,
+each tile's expert reached as the staged passes reach it, with the SwiGLU intermediate rounded by the
+same rule before down. A chunk takes these passes once its routes average six or more an expert
+(`ops::selectMoe`, `kInt8PassRoutesPerExpert`): from 192 rows on Qwen3.6-35B-A3B and
+Qwen3.5-122B-A10B (8 of 256 experts), 256 on Flint's shape (6 of 256) and 308 on
+Qwen3.8-Flash-Next's (10 of 512). Below that the int8 passes are not shorter in every run, since
+the int8 tile runs both 16-row fragments of an expert's tile whatever its live rows; from six on
+they are (`gguf-moe-benchmark int8` on a 32-core M5 Max and a 20-core M5 Pro, measured on Apple10
+alone). Decode steps, smaller chunks, streamed experts, GGUF experts and other formats keep the
+staged passes, and Apple9 runs none of the int8 tiles. On the 35B MLX the passes take a 2,048-row
+chunk 9% less time on a 32-core M5 Max and 11% on a 20-core M5 Pro, 32K tokens of context 5% and
+8%. With `--activations bf16` every chunk's experts run the staged passes, bit for bit. Against 1.7.0, whose dense
+projections already round, the next-token KL over 96 prefixes of six greedy transcripts is 1.3e-3
+(the same prefixes scored four at a time: 6.9e-4), the most likely token unchanged at every prefix;
+at 2K and 32K tokens of real text it is about that of a cache hit against a cold prefill (1.7e-2
+against 1.3e-2 at 2K, 6.7e-2 against 6.2e-2 at 32K), and a second turn does not add to it. The
+prefill arena holds the codes, 47 MB at 2,048 rows on the 35B.
 
 ## Sparse attention
 
@@ -1320,7 +1525,7 @@ them.
 
 ## Neural Engine prefill
 
-Prefill chunks of a dense target split each layer's FFN by intermediate
+Prefill commands of a dense target split each layer's FFN by intermediate
 channel (`runtime/ops/AneFfn.cpp`), from the least rows startup finds the split
 faster at (below). The GPU runs the leading
 channels on its prefill kernels, its down projection reading a view of the
@@ -1330,12 +1535,35 @@ the residual kernel's tile on the weight planes advanced past the inputs the
 view leaves unread, or, on the int8-activation tile, through that tile's
 stride over the planes' rows. The Neural Engine runs the rest as one W8A8
 program, Hadamard-rotated int8 activations and per-row int8 weights
-(`runtime/ane/Program.mm`): a chunk takes the smallest of
-its functions that holds it, one every 128 rows from 512 to 2048, all reading
-and writing one set of surfaces sized for 2048 rows. The ANE service holds
-memory for a loaded program's intermediate values, which its functions share:
-13 programs of one function each held it 13 times (3.25 GB at the M6's share,
-against 0.67 GB for the one program). The GPU requantizes the
+(`runtime/ane/Program.mm`): a step takes the smallest of
+its functions that holds it, one every 128 rows from 512, all reading and
+writing one set of surfaces sized for 2048 rows. The program holds the
+functions of the split's shares alone (`AneFfn::programRows`): of one share,
+one step's to 2048 rows (13); of a share of each kind of command, one step's to
+1,024 rows and the halves' to 1,024 (10), which Apple9's ANE compiler takes
+where it refuses 22 (`ANECCompile() FAILED` on an M4, each time). On
+Apple11's Neural Engine and later's a function runs gate and up in blocks of
+1,024 of its channels, each block through its scales, SiLU and product
+before the next; every other family runs each projection whole (`AneFfn.cpp`,
+`gateUpInBlocks`): with Qwen3.8-27B the blocks took an M6's requests' first
+tokens 10-12% sooner from 1,024 rows, while on M5 Pros and an M5 Max they
+took the ANE alone 1-7% longer at every function the program holds, and they
+add 20-45% to the program's compile everywhere. The ANE
+service holds memory for a loaded program's intermediate values, which its
+functions share: 13 programs of one function each held it 13 times (3.25 GB at
+the M6's share, against 0.67 GB for the one program). A command queues all its
+evaluations once it is submitted, one a layer of each step but the last
+layer's, whose rows are read and which runs on the GPU alone; the ANE's client
+holds at most 127 in flight for a program (its queue depth, macOS 26.5 and
+27.0) and would make the 128th wait 10 s and fail, so two steps take a model of
+at most 64 layers (Qwen3.8-27B's 64 queue 126) and one step one of at most 128
+(`AneFfn::fits`). The ANE's driver powers it off 6-12 s after its last work;
+the next command's first evaluation then waits 56-91 ms in its enqueue while
+the ANE powers on and loads the program again, which the GPU's work up to its
+first wait overlaps: the first token after an idle came 26-94 ms sooner on
+M5 Pros, an M5 Max and an M6 than with the evaluations queued before the
+submission. An evaluation's time, which the breaker judges, starts once its
+enqueue has returned, so the wake stays out of it. The GPU requantizes the
 ANE's weights from the block planes one layer ahead into double-buffered
 IOSurfaces and adds the ANE's partial down projection to its own. Shared
 events order each evaluation between the GPU's packing and that join inside
@@ -1343,10 +1571,38 @@ the one prefill command (`metal::EventStep`); each signal ends a Metal command
 buffer, so the queue holds 512. MoE targets, the mixers and decode stay on the
 GPU.
 
+A command of 1,024 rows or more runs as two steps, its rows' halves
+(`AneFfn::firstStepRows`, each at least one step's least 512 rows), so that the Neural
+Engine runs one step's FFN while the GPU runs the other step's mixer: a step's
+mixer needs only the K/V and the state of the rows before it, which the step
+before wrote at the same layer. Each kind of command, one step or two, takes a
+share of its own (`AneFfn::Shares`), the larger for two steps, whose ANE runs
+beside the mixer too: both in the one program over the one set of surfaces,
+which hold the ANE's channels in descending 512-channel units, the last
+first, so that each share's channels are their leading rows (and down's
+leading inputs), which its functions read; down's per-row scales are each
+share's own, so that a command of one step stages the weights a split of that
+share alone stages, and computes what it computes.
+A dense target's prefill commands are two chunks of a prefill group
+(`RuntimeGeometry::prefillChunks`) whose group tensors hold one command's rows,
+the first chunk's views all of them, so that a command of one step takes them
+whole; a group's scratch cell, which carries a lane's state from a chunk to the
+next within a layer, holds one GDN layer's state (`PrefillArena::groupCell`).
+The layer loop (`QwenTarget::addPrefillLayers`) adds the first step's mixer
+and FFN, then the second's mixer, the first's join, the second's FFN, and the
+second's join once the first step's next mixer is encoded, or at once where a
+layer's output rows are read in it (the draft's captures, the last layer).
+On Qwen3.8-27B MLX 4-bit a full chunk's layer takes the GPU alone 37.0 ms, of
+which 23.6 are the FFN, and the Neural Engine's whole FFN 56 ms at 2,048 rows
+(19.5 int8 TFLOPS, 20-core M5 Pro): one step's split, the ANE idle through the
+mixer, took 31.9 ms. Every row computes what one step of the command's rows
+computes, and each share of a split of two what a split of that share alone
+computes (`ane-ffn split`).
+
 Startup decides the split on the loaded model before it allocates the KV cache
 (`runtime/engine/AneFfnStartup.cpp`), once it has built the memory governor,
-which is the same with the split or without, every step arithmetic until the
-memory plan holds a split. `--disable-ane`, a target the split does not take
+which is the same with the split or without, every step arithmetic.
+`--disable-ane`, a target the split does not take
 and a Mac whose private ANE interface does not resolve (`ane::unavailable`,
 which compiles nothing) leave the GPU alone; a dense target whose layers it
 does not take, or a Mac without the interface, says why, a MoE target says
@@ -1356,20 +1612,18 @@ ANE takes: with `--max-context` the split takes at most the channels whose plan
 still holds that context, and if even the fewest do not, the GPU runs alone and
 the start warns how much context any split leaves. The
 [SSD cache](server.md#ssd-cache)'s automatic state staging gives way to the split: where
-the fewest channels fit only without it, the cache turns off. Without
-`--max-context` the engine serves the automatic context, which while the split
-may run is what the plan holds with the split this Mac's calibration of the
-model takes (below), the GPU alone's if it found no gain, whatever the start
-then makes of it: a split that failed leaves the GPU alone at the same context,
-and the memory the split would hold stays with the KV cache. Every start of a
-model on a Mac that takes one calibration so serves the same context; one
-calibrated anew may serve another, after the split lost to the GPU alone, which
-forgets the calibration (below), after the Neural Engine refused a remembered
-split, which leaves the next start to calibrate again (below), after a start
-whose calibration failed and left none, or once macOS cleared the directory
-that keeps it. The server's
-relaunch of the engine after a failure keeps the first engine's context
-whatever it calibrates: the server passes that context
+the fewest channels fit only without it, the cache turns off. While the
+split may run, the plan holds the largest split the model could take (all its
+channel units but one, or the most whose plan holds the context asked, or with
+none asked any), whatever the split then takes, so that without
+`--max-context` every start of a model on a Mac serves the same automatic
+context, which the log line names beside the context without the split
+(`context 61,433 tokens (73,721 with --disable-ane)`); once the Neural Engine
+refused this Mac's split of the model twice the plan holds none, and the start
+serves the GPU alone's. A split that fails leaves the GPU alone at
+the same context, and the memory the split would hold stays with the KV cache.
+The server's relaunch of the engine after a failure keeps the first engine's
+context: the server passes that context
 (`serve-native --relaunch-context`) beside the first engine's `MAX_CONTEXT`,
 and the relaunch is planned as the first engine was. One of the automatic
 context decides the rest as that engine did, the SSD cache's staging among it,
@@ -1379,25 +1633,42 @@ line, not the warning a refused `--max-context` gets. A relaunch whose plan
 holds less, as once the Mac's memory budget shrank, serves that, with
 `--max-context` too, and the server serves it from then on
 ([engine restarts](server.md#engine-restarts-and-sleep)).
-Until a calibration is remembered, a start that fails assumes the largest split
-the model could take (all its channel units but one, or the most whose plan
-holds any context). The log line names it beside the context without the split
-(`context 61,433 tokens (73,721 with --disable-ane)`); `--disable-ane`, a
-target the split does not take and a Mac without the interface serve the
-latter. The start then logs `Setting up the Neural Engine FFN split (splash
-serve --disable-ane keeps the FFN on the GPU)`, so that a fault in the private
-client that ended the process would leave the way around it above, and, when it
-calibrates (below), times the split as a prefill runs it
+`--disable-ane`, a target the split does not take and a Mac without the
+interface serve the context without the split. The start sets the split up
+as its warmup's last step (`engine::finishAneFfn`), with the GPU time of the
+runtime's first warmup, a prefill of a full chunk on the GPU alone: after the
+other steps, once the memory audit has given back what the engine does not
+keep idle, so the split is calibrated and loaded at the least memory the
+engine holds, as 1.7.0's was before the KV pool and the warmup took theirs
+(on a 16 GB M4 the split's set-up after the prefill of the most rows found
+1.5 GiB reclaimable against macOS's 1.6, where 1.7.0's split started), and on
+the runtime's own prefill buffers, so that once it serves it holds no memory
+past the plan's (calibration first times a larger split, at 0.8 of the units,
+while the pools are still at their floors);
+the audit runs again with it. The runtime and the scheduler take the split
+from their next command (`RuntimeModel::setAneFfn`), and a prefill of the
+least rows it takes creates its kernels, one per GGUF format, before a
+request waits on them (skipped where memory is refused it). It logs `Setting up the Neural Engine FFN split
+(splash serve --disable-ane keeps the FFN on the GPU)` first, so that a fault
+in the private client that ended the process would leave the way around it
+above, and, when it calibrates (below), times the split as a prefill runs it
 (`runtime/ops/AneFfnMeasurement.cpp`): commands of layers through `begin()`,
 `add()`, `commit()` and the handoff, each split layer after the GPU alone's FFN
 of the same layer, a stand-in for the mixer, which the GPU's layer alone timed
-alike takes away again, the median of three. On five FFN layers spread over the
+alike right before it takes away again, the median of three: the GPU's pace
+moves as the ANE's programs compile (an M4 MacBook Air's full-chunk layer read
+352.9 ms first and 470 once it settled), and a GPU alone read before them had
+made its split layers 117 ms longer and its fit's gate 117 ms shorter, 1.2%
+short of no gain on a Mac where the split prefills 77-93% faster. The gate
+takes the GPU alone read beside the 0.8 share, last. On five FFN layers spread over the
 model's depth, with the ANE taking the 512-channel units nearest 0.4 and 0.8 of
 them in programs of one 2048-row function, which the ANE service keeps once
 compiled, it times the split layer and its GPU part alone, and the GPU's layer
 alone, each over commands of the first four full-chunk layers, the fifth
-staged. It fits `T(s) = max(A(s), G(s) + u·A(s))`
-(`runtime/ops/AneFfnCalibration.cpp`): G the line through the GPU part's
+staged; at 0.8 also the split layer of a step of 1,024 rows, the program
+holding both functions. It fits `T(s) = max(A(s), G(s) + u·A(s))`
+(`runtime/ops/AneFfnCalibration.cpp`), a full chunk's split FFN layer of one
+step: G the line through the GPU part's
 timings; A, the ANE's part, proportional to its channels through the split
 layer at 0.8, where the ANE's part takes the longer on every Mac measured; and
 u the bandwidth the ANE's part takes from the GPU's beside it, the split
@@ -1408,7 +1679,23 @@ put T's least a unit off: a unit past where the ANE's part takes the longer
 costs the ANE's time per unit, a unit short of it the GPU's, and on an M5 Max
 and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
-`--activations bf16`. It fits u at 0.4, then again at the units it chose,
+`--activations bf16`. For two steps it takes the rest of the GPU alone's
+layer of a full chunk, the mixer M, from the warmup's prefill, its GPU time
+over the layers less the FFN layer it timed, and fits
+`T(s) = max(H(s), M + G(s) + u·H(s))` from the same timings, H the ANE's two
+half steps, proportional to its channels through the step of 1,024 rows at
+0.8; it takes the units whose T is least where T gains 5% on the GPU alone's
+whole layer and a command of two steps fits the evaluations in flight (above).
+Two steps then take every command of 1,024 rows or more: on an M6, two M5 Pros
+and an M5 Max, with Qwen3.8-27B in MLX 4-bit, UD-Q4_K_M and UD-IQ3_XXS, two
+steps beat one from 1,024 rows on each, and on the M6 from 672 (the 2-4% this
+gives up there); half steps timed at each start had put the boundary at 1,541
+to 1,665 rows on the M5 Pros and the M5 Max, where two steps already won 1-10%,
+since those timings leave out what the ANE's and the GPU's work cost each other
+while they overlap, and below 896 rows the M5 Max's half steps stalled the GPU
+at random. Where two steps gain too little, as where the ANE is too slow beside
+the mixer, nothing pipelines, and the start's line says which it chose.
+It fits u at 0.4, then again at the units it chose,
 nearest T's least, from their split's full-chunk layer timed as the fit's were,
 on the same four layers (a mixed quantization can give the model's first
 layers other formats than the rest's, which would bias u); where that fit
@@ -1430,13 +1717,35 @@ while the split layer of 6 units (13.8 ms against G's 13.2: u = 0.06) chooses
 on an M5 Pro and 25-26 on an M6 with `--activations bf16`, the best each Mac's
 sweeps measured. By default the int8-activation tile makes the GPU's part
 faster, so the split takes fewer: 10 on a 20-core M5 Pro and 7 on a 32-core M5
-Max (the M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
-start calibrates the split once for a Mac, a model, a macOS version, an engine
-build, `--activations` and the most units its memory plan holds, and remembers
-what it found (`remembered-*` in the cache directory below): the units, the
-least chunk and the GPU alone's layer at 512 and 2048 rows, or that no split
-gains enough. Later starts take it untimed: they build the split, check it as
-below and serve, in 0.6 s on an M5 Max, 0.9 s on an M5 Pro and 1.4 s on an M6.
+Max. On an M6, Qwen3.8-27B UD-IQ3_XXS takes 25 units in one step from 512 rows
+and 33 in two steps; a start beside a build of four compile jobs took 22 units
+in one step. The split runs if T there gains 5% on the GPU alone. One program
+holds both kinds' functions (above): the start times its one-step functions
+(below) on a split of its own before it builds the split that serves, which
+loads the same program. A start calibrates the split once for a Mac, a model, a
+macOS version, an engine build, `--activations` and the most units its memory
+plan holds, and remembers a split it found (`remembered-*` in the cache
+directory below): the units of each kind, one step's least chunk, the GPU
+alone's FFN layer at 512 and 2048 rows and the mixer beside the latter. That no
+split gains enough is not remembered, and the next start calibrates again: an
+M3 Ultra calibrated beside two serving servers found no chunk that beat the GPU
+alone (84.0 ms a full chunk's split layer against 62.8) where a quiet one
+splits 0.41 and prefills 32-34% faster, and remembering that served every
+later server on the Mac the GPU alone. Later starts take a split untimed: they build it, check it as
+below and serve, unless it was calibrated on a busier Mac, which its mixer
+shows: where it reads more than a tenth longer than the one the start's
+prefill gives, beside its GPU alone's FFN layer, the start calibrates again. A Mac busy beside a calibration
+reads its mixer long, and its chunks too: on a 20-core M5 Pro, Qwen3.8-27B
+UD-Q4_K_M under load read 23.84 ms against 19.36 idle (+23%), its FFN 36.95
+against 36.92, and split chunks from 1,798 rows in one step and none in two
+against 512 and 1,127 idle. Where the load is another process's prefill, the
+GPU alone's FFN reads long too, and a quiet start's mixer beside it reads
+shorter still: the same Mac's MLX 4-bit under 8K prefills chose no one-step
+units and 0.65 in two steps, whose next quiet start read the record's mixer
+21.6 ms against none and calibrated again (0.29 from 770 rows, 0.41 in two
+steps). The warmup's mixer repeats within 0.7% from one start to the next on
+every Mac measured, a cold first start beside the ANE compiler's work
+included. A start busier than its calibration's never drops it.
 Beside it the start keeps how often the Neural Engine refused a split
 (`ane::Refused`: its service did not compile, load or run the program, or the
 check below failed): the first refusal of a remembered split leaves the next
@@ -1444,7 +1753,9 @@ start to calibrate again, and the second, of a split calibrated, remembered or
 calibrated again, leaves the GPU alone, uncalibrated, until the key changes.
 Any other failure to build the split, as Metal refusing memory, keeps the
 calibration: that start runs the GPU alone, and the log says what the next
-start does.
+start does. A start with `--recalibrate-ane` reads no record: it
+calibrates as a first start does and replaces the record with what it finds,
+its refusals counted from none; no gain leaves the record as it was.
 Across many starts over hours of prefill on those three Macs the timings chose
 the same units within their noise, while timing every start cost 3-8 s, and a
 start whose timings strayed could change the share, each share compiling a
@@ -1458,12 +1769,19 @@ against the leading rows of a full chunk on the GPU alone, which computes every
 row alike whatever the chunk's rows. The outputs must be finite and differ from
 the GPU's by at most 10% of what the ANE adds over the GPU's part; int8 leaves
 2.5-2.8% on Qwen3.8-27B. A start that calibrates first times the GPU's FFN
-layer alone at 512 and 2048 rows and the split layer of every function, on a
-split of its own over the four layers the fit timed, as many to a command, so
-that the splits it compares are timed where it fitted them; and it splits the
-chunks from the least rows from which every larger chunk's split layer takes at
-most 2% longer than the GPU's at the chunk's rows. Six calibrations of
-Qwen3.8-27B MLX 4-bit on the Studio (M5 Max) timed each function's split layer
+layer alone at 512 and 2048 rows and the split layer of every one-step function
+of the program that serves (to 1,024 rows beside two steps, to 2048 without),
+on a split of its own over the four layers the fit timed, as many to a command,
+so that the splits it compares are timed where it fitted them; and it splits
+the chunks from the least rows from which every larger chunk's split layer of
+one step takes at most 2% longer than the GPU's at the chunk's rows. Each kind
+stands on its own: two steps are asked whatever one step's fit chose, and
+where one step splits no chunk below two steps' 1,024 rows they serve alone
+from 1,024 where they gain (the record keeps the units that name the program,
+one step's, or two steps' where one step's fit chose none, and no least rows).
+Where neither kind gains the GPU alone serves, and nothing is remembered: the
+next start calibrates again. Six calibrations of
+Qwen3.8-27B MLX 4-bit on an M5 Max timed each function's split layer
 within a range of 3.2% of its mean for the median function, 6.1% at most,
 where over the model's first layers, about 4,096 rows of layers to a command,
 it was 3.6% and 10.9%; both chose 7 units, from 822-1,028 rows against
@@ -1489,10 +1807,15 @@ an M5 Max (27 s for calibration's share 0.8) and half a minute on an M6; the
 ANE service keeps them under a hash of their source, which stays in
 `splash-ane` of the per-user cache directory (`getconf DARWIN_USER_CACHE_DIR`),
 so later starts load them, in about 0.1 s, until macOS clears that directory.
-Startup gives the service 120 s to compile and load a program, after which the
+Startup gives the service 210 s to compile and load a program, after which the
 GPU runs alone: the private client's work for every program runs in turn on one
 queue (`runtime/ane/Program.mm`), so work queued behind a service that stopped
-answering runs out of its time too. The ANE computes in fp16, whose range
+answering runs out of its time too. Its requests run at user-initiated QoS,
+which orders the ANE's queue ahead of default, utility and background clients'
+work (media analysis, indexing) but does not cut short an inference already
+running: at default QoS, behind a client at user-initiated, each evaluation of
+a 20-core M5 Pro's split waited 234 ms instead of 12.
+The ANE computes in fp16, whose range
 (±65504) bounds a split layer's gate pre-activations and its intermediate
 values over each token's input peak; it leaves its output's token scales to the
 GPU's join, in fp32. While serving, any failure of the ANE's work stops the
@@ -1502,15 +1825,33 @@ event (Metal fails a command buffer whose wait stays unmet for 5 s), or a value
 the join reads that is not finite. The CPU then raises the event to the GPU's
 last wait, the chunk runs again on the GPU alone, which computes what it would
 have, as does every chunk after it, and the engine logs `Warning · Neural
-Engine FFN split stopped (...)`. A split that loses to the GPU alone stops the
-same way, after a chunk whose results it keeps (`ops::ane_ffn::Breaker`): over
-each 8 commands it ran, the ANE's evaluations, each from the GPU's signal to
-start it to its report, took as long as the GPU alone's FFN layers of their
-functions' rows, on the line through the timings calibration took; the start's
-calibration is then forgotten, so that the next start calibrates again. The GPU
-then waits on the ANE at every layer, so the split is slower than the GPU
-alone; another process keeping the ANE busy costs the split 2-8% and a minute
-of prefill slows the M6's ANE by a third, far short of that. A given share
+Engine FFN split stopped (...)`. A split that loses to the GPU alone pauses,
+after a chunk whose results it keeps (`ops::ane_ffn::Breaker`,
+`ops::ane_ffn::Pause`): a command whose ANE evaluations, each from the notice
+of the GPU's signal to start it to its report, took as long as the GPU alone's
+FFN layers of their functions' rows, on the line through the timings
+calibration took, or for pipelined steps its whole layers, the mixer
+calibration took added. The GPU waits on the ANE at every layer, so such a
+command was slower than the GPU alone. The GPU then runs every chunk alone for
+5 minutes and the engine logs `Warning · Neural Engine FFN split paused
+(...)`; the next command split after that probes: one that wins resumes the
+split, and a later loss pauses it for 5 minutes again, so that a server that
+meets a busy ANE now and then never pauses for longer; one that loses too
+stops the split the same way as a failure. The start's calibration is kept: a
+loss says the ANE was busy, not that the calibration is wrong, and a start
+that calibrated again beside the same client would read the ANE slow and find
+a small share or none. A record taken beside another client of the ANE, whose
+mixer reads as a quiet Mac's, serves as it is until macOS or the build changes,
+or until a start with `--recalibrate-ane` calibrates again.
+Another client of the ANE
+made a 20-core M5 Pro's split commands take 1.77 times the GPU alone's layers
+at the split's priority and 12.7 times behind a higher one, and the split
+paused after the first; a healthy split's commands come nearest the line at
+one step's least rows, where calibration lets a chunk split at up to 1.02 of
+the GPU alone but the breaker judges the ANE's part over the function's own
+rows: 0.83 of it after 15 s idle and 0.82 after minutes of prefill on that M5
+Pro, 0.77 and 0.76 on a 16-core one, 0.88-0.90 and 0.86-0.87 on an M5 Max and
+0.53 and 0.52 on an M6 (Qwen3.8-27B); two steps 0.37-0.76. A given share
 (`--ane-ffn-share`) takes no timings and never stops for it. The idle release
 (`--idle-release`) unloads the program, so that the ANE's service gives its
 buffers back while the engine is idle, and keeps the split's own, which the
@@ -1520,13 +1861,51 @@ program again after the weights (`AneFfn::restore`), in about 0.1 s, and logs
 load again within 10 s stops the split like a failure while serving, and the
 request runs on the GPU alone. A split that stopped unloads its program at the
 next idle release once the ANE has reported every evaluation, and keeps it
-unloaded. The split's logits differ from the GPU's alone (KL about 1e-4 to 7e-4
-on Qwen3.8-27B); `splash serve --disable-ane` keeps the FFN on the GPU, and
+unloaded. A split command whose longest Metal command buffer took more than 1 s
+and ten times their median stalled: the engine logs `Warning · Neural Engine
+FFN split: a buffer of a command took N s against a median of M ms; the Neural
+Engine was late` when its longest evaluation took half the excess or more,
+which the breaker counts already, and `the GPU was late` otherwise, which it
+does not, as the GPU alone would have been as late (`ane_ffn::late`). A split
+command that took the GPU three times or more what the GPU alone takes its
+layers, on its own time, not the image encodes a prompt's command runs after,
+and the breaker finding it not losing, shared the GPU with another
+process's work, which slows every buffer of it alike: the engine logs
+`Warning · Neural Engine FFN split: a command took N s on the GPU against M s
+on the GPU alone over its layers; the GPU was busy with another process's
+work` (`ane_ffn::shared`). On a 20-core M5 Pro with Qwen3.8-27B, beside
+another process's compute buffers of 1 s back to back, split commands took
+10.6-21.1 times the GPU alone's time over their layers and the GPU alone's own
+2,048-row commands 18.4-20.0 s against 2.4, while the Neural Engine's time
+over them stayed as it was; over minutes of cold prompts beside display sleep
+and wake, the screen saver, every core busy and memory at the system's
+warning, split commands took 0.80-1.33 of it.
+The split's int8 rounding moves its next-token distributions: on
+Qwen3.8-27B over prose and code prefixes of 0.8K to 8K tokens (the release
+kit's `logits/natural27.sh`), its KL from the GPU alone in bf16 activations is
+about 3e-4 for the split's own rounding at an M5 Max's 0.21 of the channels,
+9e-4 as served there (0.21, and 0.29 in two steps; MLX 4-bit, whose GPU part
+keeps its int8 activations), 9e-4 on a 16-core M5 Pro at 0.47 and 0.68 in two
+steps (UD-Q4_K_M) and 4e-3 on an M6 at 0.74 and 0.97 in two steps
+(UD-IQ3_XXS), the most likely token unchanged at every prefix whose likeliest
+token the GPU alone puts 0.1 or more ahead of the next. At default flags an
+MLX model's GPU alone rounds its own activations to int8
+([int8-activation prefill](#int8-activation-prefill)), 1e-3 from bf16 on the
+same prefixes and up to 7.5e-2 at single ones, so the split's KL from it
+measures both, and where the two differ most the split, which rotates its
+values before it rounds them, is the nearer to bf16; `splash serve
+--disable-ane` keeps the FFN on the GPU, and
 `backend-benchmark --ane-ffn-share` runs a given share over chunks of
-`--ane-ffn-minimum-rows` rows or more (512 by default), which
-`backend_regression` pins to its first round's. `make test-engine-cpu` runs
+`--ane-ffn-minimum-rows` rows or more (512 by default, below 1,024), in two
+steps from 1,024, as a calibrated split does;
+`backend_regression` pins every round to its first round's, the baseline's,
+so that the candidate runs the baseline's share in one step where the
+baseline does and in two from 1,024 rows. `make test-engine-cpu` runs
 `ane-ffn-calibration`, the fit, the choice, the least chunk, a calibration's
 line of text and the breaker on timings it is given, also under the sanitizers,
+`ane-ffn-breaker`, the breaker on commands Macs timed, healthy and beside
+another client, the pause and probe, the late party of a stalled buffer and a
+command that shared the GPU, also under the sanitizers,
 and `ane-ffn-startup`, each outcome of a start on a model it plays, a
 remembered calibration and one whose fit at the units it chose moves them among
 them, the automatic context, the same in each
@@ -1535,21 +1914,24 @@ context where a calibration made anew would serve another.
 `make test-engine-metal` runs `ane-ffn`: its kernels
 against CPU references for every image format under shader
 validation, then, without it, the split's memory and its output against the GPU
-alone, the same output once its program is unloaded and loaded again, a chunk's
+alone, the functions a split's shares give its program, a command of 127
+evaluations and one of 128, which commit() refuses, a command whose submission
+throws, which starts none of its evaluations, the same output once its program is unloaded and loaded again, a chunk's
 rows on the GPU alone as a full chunk's, `verify()` of every function and of a
 function the client's instrumented build
 (`runtime/ane/ProgramInstrumentation.hpp`) binds to another's procedure, each
 fault of an evaluation it injects at each layer, a program that does not load
-again and evaluations slower than the GPU alone, which the breaker stops after
-8 commands, telling the start to forget its calibration, and the private
+again and evaluations slower than the GPU alone, which the breaker pauses at
+the first command and stops at the probe after it, and the private
 client's failures, limits, unload and load, and cache files on a small program.
 `handoff` runs the event handoff against an agent the CPU plays in each way it
 can fail, and `ane-program-faults` checks that an Objective-C exception and a
 changed method signature fail as `std::runtime_error`. `make test-real` runs
 the model runtime oracle with the GPU alone, with the GPU alone over a BF16
-state (`--state-format bf16`), and with the split as a start makes it, which
-must not be unavailable, and whose automatic context must be what the plan
-holds with the split it runs.
+state (`--state-format bf16`), and with the split as a start makes it, once its
+runtime has prefilled a full chunk on the GPU alone, which must not be
+unavailable, and whose automatic context must be what the plan holds with the
+split it runs.
 
 ## Host steps
 
@@ -2269,6 +2651,15 @@ the 35B's). A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before.
 
+A Background request still in the engine 10 s after its first tick runs as
+Normal (`Engine::age`): in admission, prefill and decode order and in what its
+claims may take, as work that outlasts a title or a summary is a run the user
+asked for, which strict priority starved behind attended work for minutes. It
+still yields memory and its lane as Background (`Engine::yieldsAs`): it ranks
+below attended work, a Normal start refused memory suspends it, and suspended it
+holds no new Normal start back; once suspended it goes back to Background and
+ages again from then, so it does not decode beside the start it gave way to.
+
 ### Expert store and regrowth
 
 A run that can spill gets memory back from its KV instead, while each chunk
@@ -2306,17 +2697,18 @@ in use, which only the claims [above](#memory-rules) may take.
 A prefill command captures the state of each boundary it reaches, in buffers
 reserved before it runs. A junction or a checkpoint retires its lane's
 checkpoint once published, and a checkpoint the same command would capture before it is not captured at all; the prompt's
-replay point keeps the lane's checkpoint cached. Until a state retires it, that
+replay point and the head's state (below) keep the lane's checkpoint cached,
+and a command captures one before them. Until a state retires it, that
 checkpoint is the lane's recovery point, which a command that is cancelled,
 expires or fails leaves to a retry, so no state takes its buffers, or room a
 reclaim could make of it, before its command. Refused the pool and an admission
 while its lane holds a checkpoint no reader pins, a state ends its command at
 its boundary and is taken from the lane once the command has completed: a
 junction or a checkpoint in that checkpoint's buffers, which it takes first,
-the replay point in them only when refused again. A checkpoint only on disk
-gives no buffers, and stays until the state is published. A checkpoint whose
-predecessor a reader pins ends its command too, and is published only once the
-pin has gone. Refused, the replay point, a claim of its request in service that
+the replay point and the head's state in them only when refused again. A
+checkpoint only on disk gives no buffers, and stays until the state is
+published. A checkpoint whose predecessor a reader pins ends its command too,
+and is published only once the pin has gone. Refused, the replay point, a claim of its request in service that
 can wait and reaches what is in use, takes what its row allows in the fixed
 order (a cache the model rebuilds or a chunk of the store among them), waits
 for memory on its way back, the copy of uncopied cache it starts included,
@@ -2356,8 +2748,9 @@ keeps it, and a retry resumes there. One only on the SSD retires when that
 state lands.
 The last stays cached once the replay point is published: a later request that
 shares the prompt up to it, such as another conversation with the same long
-system prompt, resumes there instead of from the start. It stays only if the
-replay state fits beside it; refused memory, the replay state takes its buffers
+system prompt, resumes there instead of from the start. So does the last one
+below a prompt's head once the head's state is published (below). It stays only
+if that state fits beside it; refused memory, the state takes its buffers
 rather than another lane's checkpoint. With the SSD cache it costs a write as
 well: reclaim takes checkpoints first and writes the states it evicts to the
 SSD, this one too (47 MiB for 27B), and one published straight to the SSD,
@@ -2365,6 +2758,39 @@ when no RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
+
+A prompt's head, its system prompt and tools up to where the template opens
+another message (`head_tokens` in the request frame), gets an ordinary state at
+its end on first prefill when it lies at least a draft window past where the
+request resumes, as a junction must save that much. It is kept and evicted as
+any ordinary state, so the next conversation sharing the head resumes there,
+from RAM or from the SSD, instead of prefilling the head again. A persistent
+SSD cache copies it ahead as it copies a replay point, though its conversation
+went on from it (`WriteBehind::published`'s head, `Cache::persist`), so that a
+restart or a crash leaves it on the SSD; only a reclaim had written it there,
+and after a restart the next conversation prefilled the head again where none
+had, 17.3 s for a 9.7K-token head on Qwen3.8-27B. It costs one state's write a
+distinct head, 4.4 MiB for Inkling-2-Mini, 19.6 MiB for Qwen3.6-35B-A3B and
+46.9 MiB for Qwen3.8-27B, beside the head's KV, which the replay point's copy
+writes too.
+Only a conversation whose prompt matches the head up to that page shares it,
+and an agent's head ends in text of its own: its system prompt's environment
+block (the working directory, the git status) comes after the tools. So the
+head's state keeps the lane's last prefill checkpoint below it cached, as the
+replay point keeps the one below it: a conversation whose head first differs
+inside the head's last page, or a new session in another directory, resumes at
+that checkpoint instead of from the start. It lies at most the checkpoints'
+spacing, 4096 tokens, below the head's state, or less than 6144 where the
+prompt's replay point lies within a prefill chunk past the multiple of 4096
+below the head, which then holds no checkpoint; a head whose state lies at 4096
+tokens or below keeps none, as a cold prefill plans its first checkpoint at
+4096. It costs one more cached state a head, 4.4 MiB for Inkling-2-Mini, 19.6
+MiB for Qwen3.6-35B-A3B and 46.9 MiB for Qwen3.8-27B, and no KV: its blocks are
+the head's. It stays a checkpoint, which reclaim takes first (and, with the SSD
+cache, writes to the SSD), as the replay point's is: no lane uses it once the
+head's state is published, and it serves only a conversation whose head ends
+differently, where the ordinary states that reclaim takes after it, the head's
+among them, serve every conversation that shares their whole prefix.
 
 A cached state holds a cached cell of the target's GDN state and the draft's
 context window, not the draft's rings. The cached cell
@@ -2422,7 +2848,14 @@ cell and the codec after it would move 470 MiB), and the state's window is a
 copy of the lane's plus those rows' context; the completion seals the state only
 where the lane retained those rows. Both writes are one function of the runtime
 (`encodeDecodeCaptures`), which names the rows a lane retained: the path of its
-rows its acceptance wrote, whose first rows before the page both take. Each such state is a rolling
+rows its acceptance wrote, whose first rows before the page both take. A
+target captures in decode where its fold gives the whole state at the page
+(`QwenTarget::foldsState`): Inkling-2-Mini's state is its convolutions' input
+rows alone, which its commit writes after the retained rows from the inputs
+its verify left on its own tape, and its fold is that dispatch over the
+path's first rows into the state's auxiliary state
+(`ops::ShortConvolution::addFold`), bit for bit what the commit writes where
+the lane retained exactly those rows. Each such state is a rolling
 checkpoint of the reply that retires the one before it, which a preempted lane
 resumes from once its KV holds a token past it, and the last, once the request
 ends, is the reply's state: the point a next request whose prompt renders the
@@ -2430,7 +2863,19 @@ reply back token for token resumes from, that of a reply cancelled or ended by a
 stop sequence too, as far as the prompt renders it back. The prompt's replay
 point stays the point its conversation resumes from, the one reclaim keeps as
 the resume point and the SSD cache copies ahead, which a retry or a next prompt
-that renders the reply otherwise resumes from.
+that renders the reply otherwise resumes from. Resumed from a reply's
+state, a next turn holds the reply's rows as its decode computed them, not as
+a prefill of its prompt would: a GDN target's decode runs the recurrence a
+row at a time where a prefill scans the rows in chunks, which leaves the
+state a little off a prefill's, in its codes and in the running format
+alike. Against a cold prefill of a 309-token next turn, its next token's
+distribution lay at KL 3.0e-3 on Qwen3.6-35B-A3B UD-Q4_K_M through its codes
+(6.4e-3 in the running format, 5.8e-5 from a bf16 state) and 1.0e-5 on
+Qwen3.8-27B UD-Q4_K_M (16-core M5 Pro), where a state a prefill captured lies
+within the release logits check's noise floor (1.2e-3) and Inkling-2-Mini's,
+whose decode leaves no recurrence in its state, at 1e-6 to 7e-6.
+model-runtime-oracle's reply_state_cold holds a GDN target's to twice the
+largest of these, 1.3e-2, and every other state to 1.2e-3.
 
 A reply's state is opportunistic (`StateCache::markReply`): reclaim takes it
 among the units that free for nothing, a checkpoint first in the cache's order,
@@ -2452,18 +2897,24 @@ not leaves its reply's opportunistic again. Only a reply that holds at least
 `WriteBehind::kMinimumTokens` past its prompt's replay point is kept, as a
 shorter one recomputes faster than its state writes: kept, the 384-token
 replies of 12 agent conversations at a 27 GB limit wrote 24% more to the SSD
-to save 2.4% of their prefill. A suspended lane's checkpoints
-stay opportunistic: once they went, the lane replays its reply from its prompt's
-replay point, as one that captured none. A decoding lane's latest state retires
+to save 2.4% of their prefill. A suspended lane whose reply holds as much
+keeps its reply's newest state the same way, whatever its client: the point it
+resumes from, which a reclaim meanwhile writes, once, and which its next capture
+after the resume retires. A shorter reply's checkpoints stay opportunistic: once
+they went, the lane replays its reply from its prompt's replay point, as one
+that captured none. A lane suspended right after the cycle that captured the
+page its KV ends at resumes below that state whichever it keeps, as a resume
+replays a token at least. A decoding lane's latest state retires
 only once the next is published, beside which its cycle holds that next state's
 reservation, so once the lanes end the pool holds those reservations' cached
 cells beside the lanes' cells (`state.idle_cached_cells` 2 beside
 `idle_gdn_cells` 8 after four lanes' 300-token replies at a 22 GB limit, where
 1.6.2 leaves 8 cells), which a claim takes first (step 1 above). A target
-whose state commit writes auxiliary state after its retained rows
-(Qwen3.8-Flash-Next) captures none in decode (`Model::capturesInDecode`), and
-its decode writes the rings alone. A target without GDN layers keeps no GDN
-state: its cells have no bytes, every lane and state shares one empty cell
+whose state commit alone writes auxiliary state after its retained rows
+(Qwen3.8-Flash-Next's PLE history and its indexer's pending keys) folds none
+and captures none in decode (`Model::capturesInDecode`), and its decode writes
+the rings alone. A target without GDN layers or auxiliary state keeps no
+state in its cells: they have no bytes, every lane and state shares one empty cell
 that holds no memory, so a lane holds the draft's rings and window and a
 cached state the window alone, and `state.idle_gdn_cells` and
 `idle_cached_cells` stay 0.
@@ -2490,9 +2941,12 @@ the host mask exchange: the draft, the target forward while the server computes
 each constrained lane's masks, and the selection, in which only the constrained
 lanes read masks. A lane's mask request carries its rows as their tree,
 each row's token and its parent row, and the server's grammar walks it depth
-first in one matcher, consuming a row's token over its parent's state and
-rolling it back after the row's subtree, so each row's mask follows its own
-path; a row whose token the grammar rejects there, and every row below it,
+first and only forward, on a copy of the request's committed matcher, each row
+with several children giving each but its last a copy of its own matcher, so
+each row's mask follows its own path. No matcher takes a token back: LLGuidance
+1.8.0 keeps its last mask keyed by its lexer state and parser row index, which
+another branch can reach again after a rollback with other parser rows under it
+(#790). A row whose token the grammar rejects there, and every row below it,
 takes its parent's mask, as the target never accepts it. With the masks come
 the tokens the grammar forces after each row's path, as pairs of a row and a
 token, which the next cycle proposes as its host chain where the path the
@@ -2502,9 +2956,11 @@ unanswered for 5 s fails that request with the retryable `mask_timeout` (HTTP
 503), so a stalled grammar cannot hold the batch's command.
 
 Prefill takes the ready lanes of the most urgent priority. Within it a
-request that three prefill commands in a row served later arrivals of its
-priority and not it (`maximumBatchWidth - 1`: the other lanes of a full batch,
-each finishing one short prompt), whether it has a lane or waits for one, is
+request that its runtime's lanes less one prefill commands in a row served
+later arrivals of its priority and not it (three of the default's four lanes:
+the other lanes of a full batch, each finishing one short prompt; none at one
+lane, where every request is overdue and prompts lead in arrival order, never
+the shortest first), whether it has a lane or waits for one, is
 overdue and leads, the oldest first, until a command serves it; otherwise the
 lane of the fewest remaining rows leads, then in submission order. A command
 counts once, whatever its passes, and serves every lane it holds, a joiner
@@ -2684,8 +3140,20 @@ closer than a window share the pages of their tails. The cache keeps it so
 - Every state, in RAM or on the SSD, pins its tail (`KvCache::countState`, a
   bounded walk beside the counts of the states below); only its removal
   unpins the tail, which the next pass trims: a state written to the SSD
-  keeps its entry and its tail Full, on a request's own chain too, where the
-  plan's floor (`kvWindowFloorPages`) does not count it.
+  keeps its entry and its tail Full (`StateCache::reclaim` discards its RAM
+  copy alone), on a request's own chain too, where the plan's floor
+  (`kvWindowFloorPages`) does not count it. A conversation of turns shorter
+  than a window thus keeps every page it appends Full behind its own lane,
+  which no reclaim reaches. While the budget has room nothing changes; once
+  it refuses, the states behind the lanes leave for those pages
+  (`Cache::releaseTails`), in RAM or on the SSD with their copies, oldest
+  first: each whose tail holds a page that a running request holds a window
+  behind it and that no state that stays holds too. The resume point, what a
+  waiting request restores, a state a request uses and, of each running
+  request's chain, the head-most state (a prompt's head, which the next
+  conversation resumes at) and the newest stay. A prompt that matched a state
+  gone resumes at a state before it, or runs from its start, and computes the
+  blocks past it again.
 - A writer that computes a block again keeps its own page, which the block
   takes once no transfer moves the block's (`KvCache::insert`,
   `kv.window.upgrades`), rather than moving onto the block's page as a
@@ -2727,6 +3195,25 @@ goes (`Cache::peek`, `Cache::take`). At the memory wall, where the Slim runway
 cannot refill, no state goes for its tail, and the victims go as without a
 window, dead leaves before ordinary states. A state the SSD cache keeps unpins
 nothing. Empty Slim extents beyond the runway go for the retry to grow by.
+
+That walk is a page need's (`Cache::trims`). A KV target the budget refuses
+lacks an extent's bytes with its pages in place, a device walk, which trims
+nothing and takes a state only for its buffers; in either walk a state with a
+copy on the SSD keeps its entry, and so its tail. The cache therefore gives up
+the tails behind the lanes itself, where the budget refuses
+(`Cache::trimWindows`); a refusal of the host's, which a wait lifts, takes
+none. A lane's target refused Full pages (`Cache::ensureTokens`) first
+releases the tails that hold the pages it takes and an extent's more, before
+anything else cached goes, and trims them. A Slim runway that cannot refill
+releases those that leave an extent's Full pages free, while the runway still
+holds pages to trim them into. A Full extent the trims leave free then leaves
+(`Cache::compactExtent`) and pays for the Slim extents of the rest and the
+runway's, six for one on Inkling-2-Mini's layout, but only while the Full pool
+holds more than the lanes' floors (`CacheWindowPolicy::floorPages`): each
+refusal brings a pool that tails fattened an extent nearer the plan's shape,
+and a pool at that shape, a long prompt's between its commands, keeps its
+extents as before. The tails that stay, a head's, a lane's newest and those of
+states in use, are Full pages the plan's floor does not count.
 
 ## Disk tier
 
@@ -2832,7 +3319,9 @@ Restore points get their copies ahead of need (`WriteBehind`,
 `Cache::persist`), so that a reclaim later frees a cached conversation at once
 rather than waiting for its writes: an ordinary state published or reused at
 least 2048 tokens deep, 10 s after its publication, unless an ordinary state on
-its only branch below supersedes it by then, its conversation having gone on.
+its only branch below supersedes it by then, its conversation having gone on;
+a persistent tier copies a head's state while it stays ordinary, as new
+conversations start from it whether or not its own went on.
 Its state is written from its own buffers, which stay in RAM, out of every
 eviction order until the write lands, and then the pages of its chain that have
 no copy, root first, at most a quarter of the KV writes in flight

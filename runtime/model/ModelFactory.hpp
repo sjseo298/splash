@@ -6,7 +6,7 @@
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
-#include "QwenVision.hpp"
+#include "VisionLoader.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 
@@ -32,7 +32,8 @@ class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights>;
+using TargetWeights =
+    std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights, Inkling2LoopWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
@@ -59,7 +60,7 @@ struct LoadedModel final {
   std::shared_ptr<WeightImages> images;
   TargetWeights target;
   DFlashDraftWeights draft;
-  QwenVisionWeights vision;
+  VisionTowerWeights vision;
   std::string manifestFingerprintSha256;
 
   [[nodiscard]] const std::string &name() const noexcept {
@@ -136,9 +137,14 @@ struct RuntimeContext final {
   // What a start keeps of the step costs its decode warmups measure on this
   // Mac (Runtime::warmupDecodeBatch, StepCosts::text): the line a lane
   // count's were remembered as, if any, which the runtime reads when it is
-  // made, and remembering one; neither where every start measures them.
+  // made, remembering one and forgetting one; none where every start
+  // measures them.
   std::function<std::optional<std::string>(uint32_t lanes)> recallStepCosts{};
   std::function<void(uint32_t lanes, std::string_view line)> rememberStepCosts{};
+  std::function<void(uint32_t lanes)> forgetStepCosts{};
+  // The lanes its arenas hold, the most requests it runs at once, as its
+  // start chose them (QwenTargetGeometry::lanes).
+  uint32_t lanes = ExecutionLimits::defaultLanes;
 };
 
 // What the step costs a start's decode warmups measure follow
@@ -166,8 +172,8 @@ void requireCompatibleModel(const LoadedModel &model);
                                                              const ModelDescriptor &descriptor);
 // The vision role written by `loader`; empty weights for a model without
 // vision (no loader).
-[[nodiscard]] QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                                  const VisionLoader *loader);
+[[nodiscard]] VisionTowerWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
+                                                   const VisionLoader *loader);
 
 // Production loading is selected by the validated descriptor. There
 // is one shared engine and DFlash controller; only model execution differs.
@@ -217,18 +223,21 @@ struct StreamedParts final {
   [[nodiscard]] static StreamedParts loaded(const LoadedModel &model, bool kv = false) noexcept;
 };
 // The lane state and arenas of `model`'s geometry with `parts` streaming,
-// whatever streams of it as it loaded.
+// whatever streams of it as it loaded, of a runtime of `lanes` lanes
+// (QwenTargetGeometry::lanes).
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
-                     kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts);
+                     kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts,
+                     uint32_t lanes = ExecutionLimits::defaultLanes);
 // Those of a model of `descriptor` whose target's files give `target`
 // (plannedTargetGeometry) with `parts` streaming, before it loads: they plan
 // the stores of every part that may stream (engine::planStreamedMemory).
 [[nodiscard]] ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor,
                                                    const QwenTargetGeometry &target,
                                                    const ops::ExecutionPlans &operators, kv::Format kvFormat,
-                                                   ops::GdnStateFormat stateFormat, StreamedParts parts);
+                                                   ops::GdnStateFormat stateFormat, StreamedParts parts,
+                                                   uint32_t lanes = ExecutionLimits::defaultLanes);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

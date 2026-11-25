@@ -68,11 +68,20 @@ ENTRY_STAGING = ".loading-"
 class ModelError(RuntimeError):
     """A refusal or failure the installers report without a traceback;
     `kind` classes a Hub or network failure for the app
-    (hub.failure_kind), None for any other."""
+    (hub.failure_kind), or a disk without room ("disk"), None for any other;
+    `details` are the numbers the app words that class by, which the error
+    event carries beside it."""
 
-    def __init__(self, message, kind=None):
+    def __init__(self, message, kind=None, details=None):
         super().__init__(message)
         self.kind = kind
+        self.details = details or {}
+
+
+class EngineRefusal(ModelError):
+    """The engine's refusal of the files or configuration a check gave it
+    (run_engine), which it refuses again, not a failure to run the check:
+    one it does not know, an I/O error, a crash."""
 
 
 class VisionError(ModelError):
@@ -100,8 +109,8 @@ def run_engine(arguments, check):
     check names. A ModelError names an engine that cannot run, or that
     refuses the command line as one built before the check does, and what
     replaces it; else it gives the engine's refusal, its error: line without
-    that prefix, or the whole report of an engine that ended before main()
-    (dyld on an older macOS)."""
+    that prefix (an EngineRefusal, but for an I/O failure), or the whole
+    report of an engine that ended before main() (dyld on an older macOS)."""
     engine = paths.BINARY
     replace = "reinstall Splash" if paths.PACKAGED else "rebuild it with make"
     try:
@@ -121,6 +130,8 @@ def run_engine(arguments, check):
             for line in report.splitlines()
             if line.startswith("error: ")
         ]
+        if result.returncode in (os.EX_DATAERR, os.EX_SOFTWARE) and refusals:
+            raise EngineRefusal(refusals[-1])
         raise ModelError(
             refusals[-1]
             if result.returncode > 0 and refusals
@@ -445,9 +456,17 @@ def main(argv=None):
         if args.command in ("prepare", "remove"):
             # The app and the launcher word the failure by it, beside any
             # progress and messages.
-            kind = error.kind if isinstance(error, ModelError) else None
+            # An OSError of the installer's own, as a disk that fills while
+            # the model is put together, by the kind a download's has.
+            kind, details = (
+                (error.kind, error.details)
+                if isinstance(error, ModelError)
+                else (hub.failure_kind(error), {})
+            )
             print(
-                json.dumps({"event": "error", "kind": kind, "message": str(error)}),
+                json.dumps(
+                    {"event": "error", "kind": kind, **details, "message": str(error)}
+                ),
                 flush=True,
             )
         print(f"error: {error}", file=sys.stderr)

@@ -11,7 +11,7 @@
 namespace splash::ops {
 namespace {
 
-static_assert(kMaximumRegisterRows / GGUF_TABLE16_ROWS == SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(kMaximumRegisterRows / GGUF_TABLE16_ROWS == kRegisterTableTiles,
               "a register boundary names each count of table tiles the register tile holds");
 static_assert(kMaximumPairRows <= kMaximumDecodeTileRows && kMaximumRegisterRows <= kMaximumDecodeTileRows &&
                   kMaximumInt8Rows <= kMaximumDecodeTileRows,
@@ -85,16 +85,19 @@ uint64_t stagedTime(uint64_t groups, uint32_t steps, uint32_t splits, uint32_t r
 
 // The wave law's split of `rows` rows (a gate/up pair's two tensors when it
 // may run in one pass), and passes, of least time; ties keep fewer
-// partitions, then one pass. The law tells the pass modes apart only where a
-// last wave falls below its floor (the 27B pair's 17 one-pass threadgroups per
-// core on a 32-core M5 Max: the 17th runs a second wave alone, 333 us against
-// 245 in two passes). Elsewhere it ties, and one pass takes up to 22% less
-// time in 133 of the 152 tied cases measured. Below
+// partitions, then one pass. A `wide` unit's tile saturates from
+// law.wideSaturating threadgroups per core. The law tells the pass modes
+// apart only where a last wave falls below its floor (the 27B pair's 17
+// one-pass threadgroups per core on a 32-core M5 Max: the 17th runs a second
+// wave alone, 333 us against 245 in two passes). Elsewhere it ties, and one
+// pass takes up to 22% less time in 133 of the 152 tied cases measured. Below
 // ProjectionCalibration::onePassFromCores a pair runs two passes whatever the
 // law.
 SplitChoice waveSplits(const WaveLaw &law, uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16, uint32_t cores,
-                       Passes passes) {
+                       Passes passes, bool wide) {
   const uint32_t tileRows = stagedTileRows(rows);
+  StagedOccupancy tile = law.tile;
+  if (wide) tile.saturating = law.wideSaturating;
   SplitChoice best;
   uint64_t least = UINT64_MAX;
   for (uint32_t splits = 1; splits <= law.maximumSplits && (k / 32) % splits == 0 &&
@@ -109,7 +112,7 @@ SplitChoice waveSplits(const WaveLaw &law, uint32_t n, uint32_t k, uint32_t rows
     if (passes != Passes::One) {
       // A pair's two passes take twice one tensor's time.
       const uint64_t time =
-          (passes == Passes::Either ? 2 : 1) * stagedTime(tiles, steps, splits, tileRows, bits16, cores, law.tile);
+          (passes == Passes::Either ? 2 : 1) * stagedTime(tiles, steps, splits, tileRows, bits16, cores, tile);
       if (time < least) least = time, best = {splits, false};
     }
   }
@@ -125,10 +128,15 @@ bool registers(const RegisterBoundary &boundary, FormatClass formatClass, uint32
          4 * columnTiles * tiles < uint64_t{boundary.belowQuarters[size_t(formatClass)][tiles - 1]} * cores;
 }
 
-// The staged tile's configuration of `rows` rows.
+// The staged tile's configuration of `rows` rows. A plan of two row groups
+// (stagedRowGroups) splits as the tile of a group's rows over twice its
+// columns: its grid's threadgroups, each storing its group's partials, which
+// the laws count.
 LinearConfig staged(const ProjectionCalibration &p, uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16,
                     uint32_t cores, Passes passes) {
-  const SplitChoice choice = splitsFor(p.stagedSplits, n, k, rows, bits16, cores, passes);
+  const StagedRowGroups groups = stagedRowGroups(rows);
+  const SplitChoice choice = splitsFor(p.stagedSplits, groups.groups * n, k, groups.groups > 1 ? groups.rows : rows,
+                                       bits16, cores, passes);
   return {.tile = LinearTile::GgufStaged, .splits = choice.splits, .oneGateUpPass = choice.onePass};
 }
 
@@ -146,9 +154,21 @@ bool sixteenRowLane(const ProjectionCalibration &p, uint64_t tiles, uint32_t bit
   return waves16 <= p.sixteenRowWaves && waves16 == waves(tiles, cores, law->tile.resident);
 }
 
+// The most rows `step`'s plans run on the decode tiles: a decode step's up to
+// the staged tile's two row groups (stagedRowGroups), a prefill chunk's up to
+// one tile. A default start of four lanes meets 65-128 rows only in prefill
+// chunks, where the groups would change outputs against 1.7.0 wherever the
+// split law splits them (the order of accumulation) and add pipelines to every
+// start: they serve decode steps of five to eight lanes alone, and a chunk of
+// more than 64 rows keeps the prefill tiles.
+uint32_t decodeTileRows(StepKind step) noexcept {
+  return step == StepKind::Decode ? kMaximumStagedRows : kMaximumDecodeTileRows;
+}
+
 // A dense GGUF projection's configuration in bf16 activations. A plan of
-// more rows than the decode tiles hold runs the prefill tile unsplit. On the
-// decode tiles, a plan runs the column tile at up to GGUF_COLUMN_ROWS rows;
+// more rows than `step`'s decode tiles hold (decodeTileRows) runs the
+// prefill tile unsplit. On the decode tiles, a plan of more rows than one tile
+// holds runs the staged tile's two row groups; otherwise a plan runs the column tile at up to GGUF_COLUMN_ROWS rows;
 // else the register tile where it takes every quantized segment and the
 // class's RegisterBoundary holds for its table tiles, a one-pass-eligible
 // gate/up pair's column tiles counting both tensors', splitting by
@@ -157,12 +177,12 @@ bool sixteenRowLane(const ProjectionCalibration &p, uint64_t tiles, uint32_t bit
 // spread from spreadFromCores, and a plan of one table tile unsplit on the
 // 16-row tile where sixteenRowLane takes it, a pair's only where both its
 // tensors' own plans take it.
-LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload w, const UnitFormats &unit,
-                            std::span<const UnitFormats> pairTensors) {
+LinearConfig bf16Projection(const KernelCalibration &calibration, StepKind step, LinearWorkload w,
+                            const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
   const auto [n, k] = w.matrix;
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
-  if (w.rows > kMaximumDecodeTileRows) return {.tile = LinearTile::GgufPrefill};
+  if (w.rows > decodeTileRows(step)) return {.tile = LinearTile::GgufPrefill};
   const uint32_t tiles = tableTiles(w.rows);
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores && w.rows <= kMaximumPairRows;
@@ -184,11 +204,40 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
       tiles == 1 && config.splits == 1 &&
       (gateUp ? !pairTensors.empty() && std::all_of(pairTensors.begin(), pairTensors.end(),
                                                     [&](const UnitFormats &tensor) {
-                                                      return bf16Projection(calibration, {w.matrix, w.rows}, tensor, {})
+                                                      return bf16Projection(calibration, step, {w.matrix, w.rows}, tensor, {})
                                                           .sixteenRows;
                                                     })
               : sixteenRowLane(p, n / GGUF_TILE_COLUMNS, unit.weightBits16, cores));
   return config;
+}
+
+// Whether `step`'s plans take the int8 prefill paths, the int8 prefill tile
+// (selectProjection) and the int8 expert passes (selectMoe), where their rows
+// and formats do: a prefill chunk's, with int8 activations on, on a device
+// whose row has prefillInt8 (Apple10, Apple11). A decode step's never,
+// whatever its rows: a request's decode keeps bf16 activations however many
+// requests share its step, and its rows past one decode tile's 64 (five to
+// eight lanes) run the staged tile's two row groups (decodeTileRows) and the
+// staged expert passes. A decode step rounds where its units take the int8
+// decode tiles at any of its rows: a rotated PQ2_0 (Ternary-Bonsai) unit at
+// every plan of 16 rows or more (decodeInt8).
+bool int8PrefillPaths(const KernelCalibration &calibration, Int8Activations int8Activations,
+                      StepKind step) noexcept {
+  return int8Activations == Int8Activations::On && calibration.projection.prefillInt8 && step == StepKind::Prefill;
+}
+
+// Whether a staged `config` of `w` runs the int8 decode tiles, for a unit they
+// take: it stores at least decodeInt8FromRows rows (a 16-row plan counts 16),
+// its K splits keep whole PQ2_0 blocks, and `step`'s work takes them at its
+// rows: a decode step's at every row count from there (past 32 rows in row
+// groups of them, int8RowGroups), so that a rotated PQ2_0 unit,
+// Ternary-Bonsai's, decodes a plan of that many rows in one precision
+// whatever its lanes; a prefill chunk's at the tiles' 16 or 32 rows, as in
+// 1.7.0.
+bool decodeInt8(const ProjectionCalibration &p, StepKind step, LinearWorkload w, const LinearConfig &config) noexcept {
+  const uint32_t storage = stagedStorageRows(w.rows, config.sixteenRows);
+  return config.tile == LinearTile::GgufStaged && decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&
+         storage >= p.decodeInt8FromRows && (step == StepKind::Decode || storage <= kMaximumInt8Rows);
 }
 
 } // namespace
@@ -231,54 +280,65 @@ UnitFormats unitFormats(const ProjectionShape &shape) noexcept {
   return {.formatClass = shape.formatClass,
           .registerTakes = shape.registerFormats,
           .weightBits16 = shape.weightBits16,
+          .decodeInt8Takes = shape.rotated && shape.decodeInt8Formats,
           .prefillInt8Takes = shape.prefillInt8Formats};
 }
 
 SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16, uint32_t cores,
                       Passes passes) noexcept {
   if (const TierLaw *tiers = std::get_if<TierLaw>(&law)) return {tierSplits(n, k, cores, tiers->tiers), false};
-  return waveSplits(std::get<WaveLaw>(law), n, k, rows, bits16 ? bits16 : kMostWeightBits16, cores, passes);
+  const WaveLaw &wave = std::get<WaveLaw>(law);
+  return waveSplits(wave, n, k, rows, bits16 ? bits16 : kMostWeightBits16, cores, passes, bits16 >= wave.wideBits16);
 }
 
 // The configuration in bf16 activations (bf16Projection), then with int8
-// activations on the plan's last choice, which leaves the rest of it as it is:
-// a plan on the prefill tile runs the int8 prefill tile where the row has
-// prefillInt8 and the tile takes the unit, and a staged plan that stores at
-// least decodeInt8FromRows rows (a 16-row plan counts 16), at most the int8
-// tiles' kMaximumInt8Rows, and whose K splits keep whole PQ2_0 blocks runs
-// the int8 decode tiles where they take the unit, at the plan's rows, splits
-// and passes.
-LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations,
+// activations on the plan's last choice: a plan of more rows than one tile
+// holds runs the int8 prefill tile, unsplit, where its work takes the int8
+// prefill paths and the tile takes the unit (1.13-2.4x less time than the bf16
+// tiles over the 27B's shapes at 65-2048 rows on a 32-core M5 Max, a 16-core
+// M5 Pro and a 12-core M6; with Q8_0 units on it, Inkling-2-Mini's and
+// Qwen3.6-35B-A3B's GGUF prefills 0.4-4.1% less on a 20-core M5 Pro), and a staged
+// plan runs the int8 decode tiles where they take the unit and its plan
+// (decodeInt8), at the plan's storage rows, splits and passes.
+LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations, StepKind step,
                               LinearWorkload w, const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
-  LinearConfig config = bf16Projection(calibration, w, unit, pairTensors);
+  LinearConfig config = bf16Projection(calibration, step, w, unit, pairTensors);
   if (int8Activations == Int8Activations::Off) return config;
-  const ProjectionCalibration &p = calibration.projection;
-  if (config.tile == LinearTile::GgufPrefill && p.prefillInt8 && unit.prefillInt8Takes)
-    config.tile = LinearTile::GgufPrefillInt8;
-  const uint32_t storage = stagedStorageRows(w.rows, config.sixteenRows);
-  config.decodeInt8 = config.tile == LinearTile::GgufStaged && unit.decodeInt8Takes &&
-                      decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&
-                      storage >= p.decodeInt8FromRows && storage <= kMaximumInt8Rows;
+  if (w.rows > kMaximumDecodeTileRows && int8PrefillPaths(calibration, int8Activations, step) && unit.prefillInt8Takes)
+    return {.tile = LinearTile::GgufPrefillInt8};
+  config.decodeInt8 = unit.decodeInt8Takes && decodeInt8(calibration.projection, step, w, config);
   return config;
 }
 
 // The plan of the shape's flags; where the register tile may run (it runs a
 // unit of FourBitsOrMore), a unit of other formats or one it does not take
 // stages, of the most bits per weight, whose partials weigh least against the
-// weights: the most K partitions of each pass mode, since the law's split
-// never falls with the bits per weight and never rises with the rows (a
-// split's partials grow with its rows alone, the same in either pass mode);
+// weights, at the tile's floor, which a wide unit's lowers: the most K
+// partitions of each pass mode, since at one floor the law's split never
+// falls with the bits per weight, never falls as the floor rises and never
+// rises with the rows (a split's partials grow with its rows alone, the same
+// in either pass mode);
 // and a gate/up pair of one format in one pass where it may and the one-pass
-// tile holds its rows.
-std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration, LinearWorkload w,
-                                               bool registerTakes) {
+// tile holds its rows. With int8 activations on, a unit the int8 decode tiles
+// take also has each staged configuration's int8 form where decodeInt8 takes
+// it at its splits, or at the most fewer that keep whole PQ2_0 blocks, as a
+// plan of the unit's own bits per weight may split.
+std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration, Int8Activations int8Activations,
+                                               StepKind step, LinearWorkload w, const UnitFormats &unit) {
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores, n = w.matrix.outputSize, k = w.matrix.inputSize;
-  std::vector<LinearConfig> configurations{bf16Projection(calibration, w, {.registerTakes = registerTakes}, {})};
+  std::vector<LinearConfig> configurations{
+      bf16Projection(calibration, step, w, {.registerTakes = unit.registerTakes}, {})};
   if (registers(p.decodeRegister, FormatClass::FourBitsOrMore, tableTiles(w.rows), n / GGUF_TILE_COLUMNS, cores))
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::Two));
   if (w.epilogue == LinearEpilogue::GateUp && cores >= p.onePassFromCores && w.rows <= kMaximumPairRows)
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::One));
+  if (int8Activations == Int8Activations::On && unit.decodeInt8Takes)
+    for (LinearConfig config : std::vector(configurations)) {
+      while (config.splits > 1 && !decodeInt8TakesSplits(k, config.splits)) config.splits /= 2;
+      config.decodeInt8 = decodeInt8(p, step, w, config);
+      if (config.decodeInt8) configurations.push_back(config);
+    }
   return configurations;
 }
 
@@ -303,6 +363,21 @@ uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcep
   return *router && router < routers.end() - 1 ? uint32_t(router - routers.begin()) : QuantizedSegment::kFloat32;
 }
 
+bool moeInt8Experts(const MoeShape &shape, std::span<const BlockMoeWeights *const> blocks) noexcept {
+  // moe_int8.metal compiles the passes for a routing of one or two shared
+  // slices (slicesSuffix "" and "_s2") whose gate/up applies SiLU (no
+  // activationSuffix), in the formats quant_moe_int8_format takes.
+  const CompiledMoeRouting *routing = shape.compiledRouting();
+  if (!routing || (routing->sharedSlices != 1 && routing->sharedSlices != 2) || !routing->activationSuffix.empty())
+    return false;
+  const auto takes = [](const BlockExpertProjection &p) {
+    return p.routed.formatId == p.shared.formatId && quant_moe_int8_format(p.routed.formatId);
+  };
+  return !blocks.empty() && std::ranges::all_of(blocks, [&](const BlockMoeWeights *block) {
+    return takes(block->gate) && takes(block->up) && takes(block->down);
+  });
+}
+
 // Every GPU runs the experts on the staged tile: against the register tile, a
 // 35B-shaped layer takes 16-42% less time on a 10-core M4 at one to four
 // decode lanes of random routes; Apple9 GPUs of 11 to 40 cores are
@@ -316,12 +391,51 @@ uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcep
 // Qwen3.8-Flash-Next's (10 of 512); either tile's grouped rows are the
 // step's routes (MoeScratch). The router's float tile follows
 // selectFloatTile by its rows' format.
-MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape, uint32_t routerFormat,
-                    uint32_t rows) noexcept {
+//
+// A prefill chunk on the staged passes whose routes average
+// MoeCalibration::wideTileRoutes or more an expert (on the M5 Pro 64 from 20
+// cores and 128 on the 16-core, never elsewhere: KernelCalibration.hpp) runs
+// 64-row tiles, which stream an expert's weights once for up to 64 of its
+// rows, their tiles running 8-, 16-, 32- or 64-row matmuls by their live
+// rows; a row's bits are the same on every tile. From 20 cores Inkling-2-Mini
+// (8 of 128) takes them from 1024 rows, the 35B and the 122B (8 of 256) at
+// 2048; on the 16-core Inkling-2-Mini at 2048 alone. Flint and Flash-Next
+// never do (a 2048-row chunk averages 48 and 40 routes an expert), and
+// Flint's routing, of two shared slices, has no 64-row passes (MoePlan
+// refuses them). The int8 passes, whose tile holds 32 rows
+// (GGUF_PREFILL_INT8_ROWS), keep 32-row tiles.
+//
+// A chunk's experts run the int8 passes where its dense projections run the
+// int8 prefill tile (int8PrefillPaths: a prefill chunk's, int8 activations
+// on, Apple10 and Apple11; more rows than the decode tiles' 64) and the
+// blocks' experts take the passes (MoeShape::int8Experts: af4g64 or af5g64,
+// not Q8_0, which the dense tile alone takes), once its routes average
+// kInt8PassRoutesPerExpert (6) or more an expert: the quantity that drives
+// the passes' cost, not the chunk's rows. Below it the int8 passes are not
+// shorter in every run, as the int8 tile runs both 16-row fragments of an
+// expert's tile whatever its live rows, where the staged passes run 8-, 16-
+// or 32-row matmuls by live rows. gguf-moe-benchmark int8, af4g64 experts,
+// random routes, int8 against staged ms a layer, two runs each on a 32-core
+// M5 Max and a 20-core M5 Pro, the 35B's shape (top 8 of 256) and
+// Flash-Next's (top 10 of 512): up to 5 routes an expert from 3% shorter to
+// 0.7% longer on the M5 Max (the 35B's 4, 1.005 and 1.007; Flash-Next's 3.1,
+// 1.004 twice), 0.3-5.7% shorter on the M5 Pro; from 6 on shorter in every
+// run, by 0.7-3.0% on the M5 Max and 1.5-8.2% on the M5 Pro at 6 to 12, 4-6%
+// at 16 and 15-21% at the 35B's 2,048 rows (64). So the 35B and the 122B (8
+// of 256) take them from 192 rows, Flint (6 of 256) from 256 and Flash-Next
+// (10 of 512) from 308.
+MoeConfig selectMoe(const KernelCalibration &calibration, Int8Activations int8Activations, StepKind step,
+                    const MoeShape &shape, uint32_t routerFormat, uint32_t rows) noexcept {
+  const uint64_t routes = uint64_t{rows} * shape.expertsPerToken;
   MoeConfig config;
-  config.expertTile = uint64_t{rows} * shape.expertsPerToken > shape.experts ? MoeExpertTile::M32
-                                                                              : MoeExpertTile::M8;
   config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, routerFormat);
+  config.int8Passes = shape.int8Experts && int8PrefillPaths(calibration, int8Activations, step) &&
+                      rows > kMaximumDecodeTileRows && routes >= uint64_t{kInt8PassRoutesPerExpert} * shape.experts;
+  config.expertTile = routes <= shape.experts ? MoeExpertTile::M8
+                      : step == StepKind::Prefill && !config.int8Passes &&
+                              routes >= uint64_t{calibration.moe.wideTileRoutes} * shape.experts
+                          ? MoeExpertTile::M64
+                          : MoeExpertTile::M32;
   return config;
 }
 

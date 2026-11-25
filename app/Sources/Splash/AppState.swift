@@ -104,8 +104,10 @@ final class AppState {
     /// The model to pick once the latest listing has it (`refresh`).
     @ObservationIgnored private var picking: String?
 
-    init(runtime: Runtime, folders: Folders = .user, keychain: Keychain = .app, defaults: UserDefaults = .standard,
-         shell: @escaping () -> Shell = { .login }) {
+    /// The app on `runtime`, writing in `folders`, its API key in `keychain`, its settings in
+    /// `defaults`, its terminals running `shell`: none has a default, so that the app names the
+    /// user's at its one call site (`AppDelegate`) and no test reaches them by leaving one out.
+    init(runtime: Runtime, folders: Folders, keychain: Keychain, defaults: UserDefaults, shell: @escaping () -> Shell) {
         self.runtime = runtime
         self.keychain = keychain
         self.defaults = defaults
@@ -114,7 +116,7 @@ final class AppState {
         modelFiles = Self.keptModelFiles(defaults)
         drawer = Drawer(shell: shell)
         chats = ChatStore(folder: folders.chats)
-        draft = Draft(files: chats.attachments) { [chats] in chats.selection }
+        draft = Draft(files: chats.attachments, kept: chats.drafts) { [chats] in chats.selection }
         server = Server(runtime: runtime, log: folders.logs.appending(path: "server.log"), defaults: defaults)
         installer = Installer(runtime: runtime, log: folders.logs.appending(path: "install.log"), defaults: defaults)
         catalog = Catalog(contentsOf: runtime.suggestedModels)
@@ -258,7 +260,10 @@ final class AppState {
                               message: "Splash can’t run from the disk image. Drag it to your Applications folder, then open it from there.")
             return
         }
-        chats.adoptFiles()
+        // The drafts of chats gone since, deleted by another copy of the app, go, unless a chat
+        // that can't be read, as one a newer app wrote, may be theirs; the others' attachments stay.
+        if chats.readAll { draft.forget(draft.chats.subtracting(chats.conversations.map(\.id))) }
+        chats.adoptFiles(keeping: draft.attachmentFiles)
         runtime.shellSettings.set(await shellSettings.value)
         // Which families the runtime serves, read beside the listing and the stops, and known before
         // the window shows the models, so that it lists from the first only those it offers.
@@ -371,13 +376,13 @@ final class AppState {
 
     func download(_ model: String) {
         guard ready else { return }
-        installer.install(model)
+        installer.install(model, textOnly: settings(for: model).textOnly)
     }
 
     /// What quitting now would cut off: the requests the model answers, as its last status said
-    /// (`Server.Activity.running`), or the Chat's reply as it streams; a download, which starts
-    /// over next time; and the programs the drawer's terminals run. A model that idles, sleeps,
-    /// starts or switches is no loss: quitting stops it, as it always does.
+    /// (`Server.Activity.running`), or the Chat's reply as it streams; a download, which stops,
+    /// its finished files kept; and the programs the drawer's terminals run. A model that idles,
+    /// sleeps, starts or switches is no loss: quitting stops it, as it always does.
     struct QuitCost {
         var model: String?
         var requests = 0
@@ -392,7 +397,7 @@ final class AppState {
                 lines.append("\(model) is answering \(requests == 1 ? "a request" : "\(requests) requests").")
             }
             if let download {
-                lines.append("\(download) is still downloading. If you quit, the download starts over next time.")
+                lines.append("\(download) is still downloading. If you quit, it stops. Download it again later to go on: the files it finished are kept.")
             }
             if programs > 0 {
                 lines.append(programs == 1 ? "A terminal is running a program." : "\(programs) terminals are running programs.")
@@ -406,7 +411,8 @@ final class AppState {
         // and not ended count at once.
         let live = server.requests.count(where: \.running)
         let requests = server.phase == .ready ? max(server.activity.running, live, chats.streaming == nil ? 0 : 1) : 0
-        // A download, or a check's update, starts over; a check that has found nothing loses nothing,
+        // A download, or a check's update, stops, its finished files kept in the Hub cache for the
+        // next ask to go on from; a check that has found nothing loses nothing,
         // and a deletion, quick, ends first.
         let downloading = installer.running && (installer.work == .download || installer.progress != nil)
         return QuitCost(model: server.model.map(displayName(of:)), requests: requests,
@@ -729,17 +735,30 @@ final class AppState {
             && !findingCachedModels
     }
 
-    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses.
+    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses: every
+    /// installation of it, Text only's too, whatever the launch options; one installed with Text
+    /// only alone by that option, as the model alone names no installation then.
     func delete(_ model: String) {
         guard canDelete(model) else { return }
-        installer.remove(model)
+        installer.remove(model, textOnly: installed.first { $0.id == model }?.textOnly == true)
     }
 
     /// Asks the Hub whether `model` or its draft has moved on, and installs what has, as its
     /// download did: the starts skip that question (`--offline`).
     func checkForUpdates(_ model: String) {
         guard ready, !serving(model) else { return }
-        installer.install(model, .check)
+        installer.install(model, .check, textOnly: settings(for: model).textOnly)
+    }
+
+    /// The models installed text only, Text only off, whose family serves images: installations
+    /// made before Splash served them (Inkling-2-Mini's before 1.7.3). A check for updates takes
+    /// the vision tower in, as a start that reaches the Hub does (`_lacks_tower` in
+    /// `install/upstream.py`); the app's starts ask the Hub nothing (`--offline`).
+    var awaitingVision: [InstalledModel] {
+        installed.filter { model in
+            model.towerless && !model.textOnly && !settings(for: model.id).textOnly
+                && model.family.flatMap { families[$0] }?.uses("--language-only") == true
+        }
     }
 
     func isInstalled(_ model: String) -> Bool {

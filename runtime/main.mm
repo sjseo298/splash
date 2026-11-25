@@ -154,9 +154,11 @@ void printUsage(std::string_view executable) {
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
       " [--activations auto|bf16] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
-      " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]");
+      " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]"
+      " [--max-concurrent-requests REQUESTS]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
+  writeStderrLine("       " + command + " vision-check mlx-affine|gguf safetensors|gguf CONFIG ROOT");
   writeStderrLine("       " + command + " device-check");
   writeStderrLine("       " + command + " families");
 }
@@ -231,6 +233,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;
+  config.resources.aneFfn.recalibrate = arguments.recalibrateAne;
   config.resources.relaunchContext = arguments.relaunchContext;
   config.resources.pleMemory = arguments.pleMemory;
   config.resources.expertMemory = arguments.expertMemory;
@@ -238,6 +241,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.kvSpillAlways = arguments.kvSpillAlways;
   config.resources.kvWindowTrim = arguments.kvWindowTrim;
   config.resources.verifyRows = arguments.verifyRows;
+  config.resources.lanes = arguments.lanes;
   config.resources.int8Activations = arguments.int8Activations;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
@@ -476,6 +480,16 @@ int checkModel(int argc, char **argv) {
   return 0;
 }
 
+// The tower of an upstream model's configuration prepared once from ROOT's
+// vision/, which the installer links its downloaded files into: nothing but
+// its status, or the refusal (model::checkVisionSource).
+int checkVision(int argc, char **argv) {
+  if (argc != 6)
+    throw engine::UsageError("vision-check takes the source formats, the target's config and the tower's root");
+  model::checkVisionSource(argv[2], argv[3], argv[4], argv[5]);
+  return 0;
+}
+
 // What each family's layout gives the options a start takes
 // (model::familyFacts), as JSON by family, which the installer reports to the
 // app (install/families.py).
@@ -510,6 +524,8 @@ int main(int argc, char **argv) {
         return splash::checkDevice(argc);
       if (command == "model-check")
         return splash::checkModel(argc, argv);
+      if (command == "vision-check")
+        return splash::checkVision(argc, argv);
       if (command == "families")
         return splash::printFamilies(argc);
       if (command == "serve-native")

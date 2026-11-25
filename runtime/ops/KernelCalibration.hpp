@@ -55,6 +55,10 @@ struct WaveLaw final {
   // gguf_decode_<format>_m<rows>_gate_up: one simdgroup, 32 columns of each
   // tensor.
   StagedOccupancy gateUpPair;
+  // From wideBits16 sixteenths of a bit per weight `tile`'s first wave
+  // saturates from wideSaturating threadgroups per core, each streaming that
+  // many more bytes a step; a unit of unknown formats takes `tile`'s floor.
+  uint32_t wideBits16, wideSaturating;
   // `tile`'s residency at 16 rows, which decides only one unsplit lane's
   // height (sixteenRowLane).
   uint32_t sixteenRowResident;
@@ -66,12 +70,13 @@ using SplitLaw = std::variant<TierLaw, WaveLaw>;
 
 // Register tile against the staged tile for a plan of `tiles` table tiles
 // (8 rows each, a decode lane's verify rows where it was measured), one to
-// four, the most the register tile holds (Linear.hpp, kMaximumRegisterRows),
-// by the unit's FormatClass: register where 4 * columnTiles * tiles <
-// belowQuarters * cores (in quarter threadgroups per core); kAlways where it
-// takes the formats whatever the grid, 0 never.
+// four (kRegisterTableTiles), the most the register tile holds (Linear.hpp,
+// kMaximumRegisterRows), by the unit's FormatClass: register where
+// 4 * columnTiles * tiles < belowQuarters * cores (in quarter threadgroups
+// per core); kAlways where it takes the formats whatever the grid, 0 never.
+inline constexpr uint32_t kRegisterTableTiles = 4;
 struct RegisterBoundary final {
-  std::array<std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH>, kFormatClasses> belowQuarters;
+  std::array<std::array<uint32_t, kRegisterTableTiles>, kFormatClasses> belowQuarters;
 };
 
 struct ProjectionCalibration final {
@@ -107,6 +112,16 @@ struct FloatTileCalibration final {
   uint32_t bf16Halves, f32Halves, quantizedRowsHalves;
 };
 
+// The dense bf16 projections' tile rule (DenseLinear.cpp), its grids in half
+// 64 x 64 output tiles per core: a projection of at least wideInputs inputs
+// runs 64 x 128 tiles from wideFromHalves, and one of fewer than
+// eightBelowHalves (or of one row tile) runs 64 x 64 tiles on eight
+// simdgroups.
+struct DenseTileCalibration final {
+  uint32_t eightBelowHalves;
+  uint32_t wideInputs, wideFromHalves;
+};
+
 struct AttentionCalibration final {
   // A dense tile of a sequence of tiles, a prompt chunk's or a 9- to 16-row
   // lane's, takes one history split per this many pages its rows read.
@@ -114,6 +129,18 @@ struct AttentionCalibration final {
   // From this many pages each split of the longest tile or lane reads, a
   // dense split over INT8 pages scores INT8 queries (PagedAttention.cpp).
   uint32_t int8QueriesFromPages;
+  // The device's GPU cores (KernelCalibration::cores), which a decode step's
+  // relative attention fills (RelativeAttention::decodeSplits); 0 in a row
+  // no device made.
+  uint32_t cores = 0;
+};
+
+// The MoE expert passes' tiles (selectMoe).
+struct MoeCalibration final {
+  // A prefill chunk on the staged expert passes whose routes average at least
+  // this many an expert runs 64-row expert tiles (MoeExpertTile::M64); kNever
+  // never.
+  uint32_t wideTileRoutes;
 };
 
 // Every measured constant of kernel selection for one device.
@@ -122,7 +149,9 @@ struct KernelCalibration final {
   uint32_t cores;
   ProjectionCalibration projection;
   FloatTileCalibration floatTile;
+  DenseTileCalibration denseTile;
   AttentionCalibration attention;
+  MoeCalibration moe;
 
   [[nodiscard]] static KernelCalibration of(const DeviceCapabilities &device) noexcept;
 };
@@ -155,13 +184,16 @@ inline constexpr std::span<const SplitTier> kApple9StagedTiers = std::span(kRegi
 inline constexpr WaveLaw kApple10StagedLaw{
     .tile = {10, 6, 2},
     .gateUpPair = {16, 10, 3},
+    .wideBits16 = 100,
+    .wideSaturating = 6,
     .sixteenRowResident = 9,
     .partitionInputs = 512,
     .maximumSplits = 8,
 };
 static_assert(kApple10StagedLaw.tile.resident >= kApple10StagedLaw.tile.saturating &&
+                  kApple10StagedLaw.tile.saturating >= kApple10StagedLaw.wideSaturating &&
                   kApple10StagedLaw.gateUpPair.resident >= kApple10StagedLaw.gateUpPair.saturating,
-              "a full wave streams at DRAM's rate");
+              "a full wave streams at DRAM's rate, a wider unit's from fewer threadgroups");
 
 // Apple9 decodes on the register tile but for a unit the staged tile holds
 // unpadded whose quantized segments are all GridLookup, or Q2_K from two
@@ -261,9 +293,35 @@ inline constexpr ProjectionCalibration kApple10Projection{
     // the decode tiles runs the int8 prefill tile where it takes the formats:
     // at least 1.13x less time than the bf16 tile over the 27B's projection
     // shapes in af4g64 and af5g64 at 65-2048 rows (M5 Max, M5 Pro and M6,
-    // measured).
+    // measured); with Q8_0 projections on it, Inkling-2-Mini's GGUF
+    // prefill takes 0.4-1.5% less time at 512-32K tokens and
+    // Qwen3.6-35B-A3B's 3.8-4.1% at 512-4K (20-core M5 Pro, measured).
     .prefillInt8 = true,
 };
+
+// From 32 cores (the 32-core M5 Max) the staged tile's first wave of a unit of
+// 6.25 bits per weight or more (Q6_K, Q8_0, MLX 6- and 8-bit, FP8) saturates
+// from four threadgroups per core. On 28 projections of the 35B, the 27B and
+// Inkling-2-Mini in ten formats at 8 to 64 rows (macOS 27.0), four took up to
+// 36% less time than six where their splits differ (the 35B's 2048 x 4096 Q8_0
+// output projection on four partitions rather than eight, 18-36% less at 16 to
+// 64 rows, the same shape in MLX 8-bit 16-32% less at 16 to 64 and in Q6_K
+// 12-28% at 16 to 48; its fused Q8_0 attention input on one rather than two,
+// 12-36% less at 8 to 32 rows; Inkling's fused Q8_0 attention input, 16-24%
+// less at 8 and 16; Q6_K at 5120 x 6144, 11-21% less at 8 to 48), and nowhere
+// more. Narrower formats keep six: four took up to 19% more there (the IQ4_NL,
+// MXFP4, MLX 4-bit, Q4_K, IQ4_XS and NVFP4 down projections of 5120 x 17408 at
+// 8 and 16 rows), and the 12-core M6 keeps six, where four took 25% more on
+// Inkling's 3072 x 2304 Q8_0 projections at 56 and 64 rows. The 40-core M5 Max,
+// unmeasured, takes the 32-core one's.
+inline constexpr uint32_t kApple10LargeGpuCores = 32;
+inline constexpr ProjectionCalibration kApple10LargeProjection = [] {
+  ProjectionCalibration row = kApple10Projection;
+  WaveLaw law = kApple10StagedLaw;
+  law.wideSaturating = 4;
+  row.stagedSplits = law;
+  return row;
+}();
 
 // Apple11 takes Apple10's row but for the 16-row lane from 4.5 bits: the M6's
 // 16-row tile takes as long a wave as its 8-row tile there (5120-input Q4_K,
@@ -286,6 +344,37 @@ inline constexpr ProjectionCalibration kApple11Projection = [] {
 // decode step's 16-32 rows on the 1.6-1.8x faster simdgroup tile on 12 cores.
 inline constexpr FloatTileCalibration kApple9FloatTile{false, 16, 3, 4, 6};
 inline constexpr FloatTileCalibration kApple10FloatTile{true, 16, 3, 4, 6};
+
+// ---- Dense projections ----------------------------------------------------
+
+// Apple10 and Apple11. Measured on the 12-core M6 (dense-linear-benchmark at
+// every tower projection and the rows images of 6x8 to 64x64 patches give it):
+// from 4096 inputs a grid of 12 half tiles a core runs 64 x 128 tiles (the down
+// projection at 4096 rows 2498 us against 3091 on 64 x 64 of four, the merger
+// to 2048 at 1024 rows 1272 against 1624); a single row tile runs eight
+// simdgroups (down at 64 rows 68.2 against 78.0 on four), and so does a grid of
+// fewer than 8 half tiles a core; the rest run four (qkv at 4096 rows 1730
+// against 1841 on eight). The pick is the fastest or within 6% of it at every
+// shape (qkv at 48 rows 35.4 against 33.4). On Apple10 the two chips measured
+// disagree: the 20-core M5 Pro's and the 32-core M5 Max's benchmarks both run
+// the down projection about 4% faster on 64 x 64 of four than this row's 64 x
+// 128 tile at 1024 and 4096 rows (M5 Pro 378 against 393 us and 1566 against
+// 1606), while the M5 Max runs the merger at 1024 rows 8-21% faster on 64 x 128
+// (up 973 against 1055 us; to 5120 1045 against 1268), where the M5 Pro is
+// split (up 1851 against 1891 on 64 x 128; to 2048 670 against 708 and to 5120
+// 2107 against 2155 on 64 x 64); on the M5 Pro the tower's encode is within 1%
+// either way (a row without the 64 x 128 tile: 32x32 patches 48.09 ms against
+// 47.76 on this row, 64x64 297.2 against 297.4). A rule per device would be a
+// block of its own for about a percent of an image's encode.
+inline constexpr DenseTileCalibration kApple10DenseTile{8, 4096, 12};
+// Apple9 (10-core M4, dense-linear-benchmark at the tower's projections and
+// rows): the 64 x 128 tile never won (merger at 1024 rows 13017 us against
+// 12743 on 64 x 64 of four; down at 4096 rows 11190 against 10918), so no
+// projection runs it; one of a single row tile runs fastest on eight
+// simdgroups (the up projection at 48 rows 214.6 us against 244.8 on a
+// 64 x 128 tile of eight, down 226.7 against 253.9), every
+// other on four (qkv at 4096 rows 8646 against 8805 on eight).
+inline constexpr DenseTileCalibration kApple9DenseTile{0, kNever, 0};
 
 // ---- Attention ----------------------------------------------------------
 
@@ -316,16 +405,64 @@ inline constexpr AttentionCalibration kApple9SmallAttention = [] {
   return row;
 }();
 
+// ---- MoE experts ------------------------------------------------------------
+
+// A prefill chunk's GGUF expert passes dequantize an expert's weights once a
+// tile, on 32-row tiles for up to 32 of its rows, on 64-row tiles for up to
+// 64. The M5 Pro (Apple10, 16 to 31 cores) runs 64-row tiles where a chunk's
+// routes average 64 or more an expert from 20 cores, 128 or more on the
+// 16-core. One layer on the 20-core M5 Pro
+// (gguf-moe-benchmark tiles, random routes, macOS 27.0): at Inkling-2-Mini's
+// shape (NVFP4, 8 of 128 experts) they took 5.7% less time than 32-row tiles
+// at 1024 rows (64 routes an expert), 5.0% at 1536 and 6.5% at 2048, and 1.0%
+// more at 256 (16); at the 35B's (Q4_K/Q5_K/Q8_0, 8 of 256) 1.8% less at 2048
+// (64), 1.1% less at 1536 (48) and 0.9% more at 1024 (32). In the prefill
+// (decode-profile, ABBA rounds against the 32-row tiles) Inkling's 4K and 32K
+// tokens took 3.0-3.5% less GPU time and its 512 the same (32 routes an
+// expert: its tiles do not change), the 35B's 4K within 0.3% either way.
+// The 16-core M5 Pro gains less. One layer there (the same benchmark): at
+// Inkling's shape 0.6% less time at 1024 rows (64 routes an expert), 0.4%
+// more at 1536 (96) and 2.3% less at 2048 (128); at the 35B's 3.9% more at
+// 2048 (64), 7.3% and 6.9% more at 1024 and 1536. In the prefill
+// (decode-profile, base new new base base new, medians, macOS 27.2) Inkling's
+// 4K and 32K tokens took 1.5% and 1.2% less GPU time on 64-row tiles (2048-row
+// chunks, 128 routes an expert), but the 35B's 4K 2.3% more and its 8K
+// 1.5-2.2% more (2048-row chunks, 64 an expert). So the 16-core runs them
+// from 128 routes an expert: Inkling-2-Mini's 2048-row chunks, never the
+// 35B's or the 122B's (8 of 256 experts: 64 at most).
+// 128-row tiles took 19% more time over Inkling's 4K prefill, their passes'
+// synchronization outweighing the dequantization they save. The 12-core M6
+// keeps 32-row tiles: there 64-row ones took 3-6% more on the 35B's formats at
+// 1024 to 2048 rows, though 9-15% less at Inkling's NVFP4 shape at 768 to 2048
+// (unmeasured end to end). So does Apple9, where they gained nothing on a
+// 10-core M4, and so do the 10-core M5 and the M5 Max, unmeasured.
+inline constexpr uint32_t kApple10ProGpuCores = 16;
+// From as many cores an M5 Pro runs 64-row tiles from 64 routes an expert.
+inline constexpr uint32_t kApple10ProMoeFromCores = 20;
+inline constexpr MoeCalibration kApple10ProMoe{.wideTileRoutes = 64};
+inline constexpr MoeCalibration kApple10SixteenCoreMoe{.wideTileRoutes = 128};
+inline constexpr MoeCalibration kThirtyTwoRowMoe{.wideTileRoutes = kNever};
+
 // ---- The device's row ------------------------------------------------------
 
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
   const GpuClass gpu = device.gpuClass();
+  AttentionCalibration attention =
+      gpu != GpuClass::Apple9 ? kApple10Attention
+                              : cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention;
+  attention.cores = cores;
+  const bool pro = gpu == GpuClass::Apple10 && cores >= kApple10ProGpuCores && cores < kApple10LargeGpuCores;
+  const MoeCalibration moe = !pro                              ? kThirtyTwoRowMoe
+                             : cores < kApple10ProMoeFromCores ? kApple10SixteenCoreMoe
+                                                               : kApple10ProMoe;
   if (gpu != GpuClass::Apple9)
-    return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile,
-            kApple10Attention};
-  return {cores, kApple9Projection, kApple9FloatTile,
-          cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention};
+    return {cores,
+            gpu == GpuClass::Apple11            ? kApple11Projection
+            : cores >= kApple10LargeGpuCores ? kApple10LargeProjection
+                                              : kApple10Projection,
+            kApple10FloatTile, kApple10DenseTile, attention, moe};
+  return {cores, kApple9Projection, kApple9FloatTile, kApple9DenseTile, attention, moe};
 }
 
 } // namespace splash::ops
